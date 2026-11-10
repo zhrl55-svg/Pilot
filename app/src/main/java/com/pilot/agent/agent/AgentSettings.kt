@@ -14,6 +14,8 @@ data class AgentSettings(
     val allowSkillReplay: Boolean = true,
     /** 播报引擎：minimax（云端，默认）/ system（系统 TTS）/ off */
     val ttsEngine: String = TTS_MINIMAX,
+    /** 播报时音乐的处理：duck（降音量不断歌）/ stop（直接停） */
+    val musicPolicy: String = MUSIC_DUCK,
     val ttsVoiceId: String = "male-qn-qingse",
     val ttsModel: String = "speech-02-hd",
     // ---------- 语音唤醒与声纹 ----------
@@ -51,6 +53,11 @@ data class AgentSettings(
         const val TTS_MINIMAX = "minimax"
         const val TTS_OFF = "off"
 
+        /** 播报时音乐降音量（不断歌） */
+        const val MUSIC_DUCK = "duck"
+        /** 播报时直接停掉音乐 */
+        const val MUSIC_STOP = "stop"
+
         const val DEFAULT_WAKE_WORDS = "小派,小派小派,你好小派"
 
         /** 自建 NeteaseCloudMusicApi 地址（部署在 buntu:3001） */
@@ -65,6 +72,7 @@ data class AgentSettings(
         private const val K_CONFIRM = "confirm_money"
         private const val K_REPLAY = "allow_replay"
         private const val K_TTS_ENGINE = "tts_engine"
+        private const val K_MUSIC_POLICY = "music_policy"
         private const val K_TTS_VOICE = "tts_voice_id"
         private const val K_TTS_MODEL = "tts_model"
         private const val K_WAKE_ENABLED = "wake_enabled"
@@ -88,6 +96,7 @@ data class AgentSettings(
                 confirmMoneyActions = p.getBoolean(K_CONFIRM, true),
                 allowSkillReplay = p.getBoolean(K_REPLAY, true),
                 ttsEngine = p.getString(K_TTS_ENGINE, null) ?: TTS_MINIMAX,
+                musicPolicy = p.getString(K_MUSIC_POLICY, null) ?: MUSIC_DUCK,
                 ttsVoiceId = p.getString(K_TTS_VOICE, null) ?: "male-qn-qingse",
                 ttsModel = p.getString(K_TTS_MODEL, null) ?: "speech-02-hd",
                 wakeEnabled = p.getBoolean(K_WAKE_ENABLED, false),
@@ -112,6 +121,7 @@ data class AgentSettings(
                 .putBoolean(K_CONFIRM, s.confirmMoneyActions)
                 .putBoolean(K_REPLAY, s.allowSkillReplay)
                 .putString(K_TTS_ENGINE, s.ttsEngine)
+                .putString(K_MUSIC_POLICY, s.musicPolicy)
                 .putString(K_TTS_VOICE, s.ttsVoiceId)
                 .putString(K_TTS_MODEL, s.ttsModel)
                 .putBoolean(K_WAKE_ENABLED, s.wakeEnabled)

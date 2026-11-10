@@ -48,12 +48,23 @@ class Speaker(context: Context) {
             sys.speak(spoken, onDone = {}, onError = { m2 -> Dbg.w(TAG, "系统 TTS 兜底也失败：$m2") })
         }
 
+        // ★ 播报前抢一下音频焦点（TRANSIENT_MAY_DUCK）：系统会把音乐压低，
+        //   而不是直接停掉——「播放一会自动就停了」的另一半原因。
+        // ★ 同时占住麦克风闸门：TTS 自己的声音会被麦克风录进去，
+        //   不占闸的话 ASR 会把播报内容听成用户指令，形成自问自答循环。
+        val speechFocus = AudioFocusManager.beginSpeech(appContext)
+        val gate = AudioGate.hold("tts")
         engine.speak(
             spoken,
-            onDone = {},
+            onDone = {
+                runCatching { gate.close() }
+                runCatching { speechFocus.close() }
+            },
             onError = { msg ->
                 lastError = msg
                 Dbg.w(TAG, "播报失败：$msg")
+                runCatching { gate.close() }
+                runCatching { speechFocus.close() }
                 if (s.ttsEngine == AgentSettings.TTS_MINIMAX) {
                     Dbg.i(TAG, "云端播报失败，降级系统 TTS")
                     fallbackToSystem()

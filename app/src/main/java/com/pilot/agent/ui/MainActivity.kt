@@ -593,6 +593,7 @@ private fun SettingsDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
     var maxTurns by remember { mutableStateOf(vm.settings.maxTurns.toString()) }
     var preferOnDevice by remember { mutableStateOf(vm.settings.preferOnDevice) }
     var ttsEngine by remember { mutableStateOf(vm.settings.ttsEngine) }
+    var musicPolicy by remember { mutableStateOf(vm.settings.musicPolicy) }
     var wakeWords by remember { mutableStateOf(vm.settings.wakeWords) }
     var wakeTone by remember { mutableStateOf(vm.settings.wakeTone) }
     var showEnroll by remember { mutableStateOf(false) }
@@ -660,6 +661,20 @@ private fun SettingsDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
                         selected = ttsEngine,
                         onSelect = { ttsEngine = it },
                     )
+                    Text(
+                        "播报时音乐",
+                        fontSize = 12.sp,
+                        color = colors.onSurfaceVariant,
+                    )
+                    OptionChips(
+                        options = listOf(
+                            AgentSettings.MUSIC_DUCK to "降低音量",
+                            AgentSettings.MUSIC_STOP to "停止音乐",
+                        ),
+                        selected = musicPolicy,
+                        onSelect = { musicPolicy = it },
+                    )
+                    Hint("AI 播报时，正在播放的音乐怎么处理：降音量（不断歌，播完恢复）或直接停掉。")
                 }
 
                 // ---------------- 云端模型 ----------------
@@ -741,6 +756,7 @@ private fun SettingsDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
                         maxTurns = maxTurns.toIntOrNull()?.coerceIn(3, 60) ?: 25,
                         preferOnDevice = preferOnDevice,
                         ttsEngine = ttsEngine,
+                        musicPolicy = musicPolicy,
                         wakeWords = wakeWords.trim().ifEmpty { AgentSettings.DEFAULT_WAKE_WORDS },
                         wakeTone = wakeTone,
                         requireVoiceprint = requireVp,

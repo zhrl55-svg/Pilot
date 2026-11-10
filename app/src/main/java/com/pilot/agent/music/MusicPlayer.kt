@@ -15,6 +15,8 @@ class MusicPlayer private constructor(private val context: Context) {
 
     private var player: MediaPlayer? = null
     private var currentTitle: String? = null
+    /** 放音期间占住麦克风闸门（防 ASR 把歌误听成「你说完了」） */
+    private var audioGate: AutoCloseable? = null
 
     @Volatile
     var isPlaying: Boolean = false
@@ -36,6 +38,22 @@ class MusicPlayer private constructor(private val context: Context) {
                 it.start()
                 isPlaying = true
                 currentTitle = title
+                // 新播放器一律满音量起步：上一首可能停在 15%（被播报压低过），
+                // 不复位的话新歌一开口就是小声的。
+                runCatching { it.setVolume(1f, 1f) }
+                // ★ 放音一开始就占闸：麦克风录到的是歌不是人声，
+                //   不占闸的话 ASR 会把歌词听成「你说完了」并播报打断音乐。
+                audioGate = com.pilot.agent.voice.AudioGate.hold("music")
+                // ★ 申请音频焦点：没有焦点的话，播报(MiniMax 也是 MediaPlayer)
+                //   一出声系统就把音乐停掉——「播放一会自动就停了」的根因。
+                com.pilot.agent.voice.AudioFocusManager.requestMusicFocus(context)
+                // ★ 注册让路回调：播报期间要么降音量要么停歌（老板要求）
+                com.pilot.agent.voice.AudioFocusManager.musicVolume = { v ->
+                    runCatching { mp.setVolume(v, v) }
+                }
+                com.pilot.agent.voice.AudioFocusManager.musicStop = { stop() }
+                // 若播报刚抢过（STOP 策略：指令播报先于音乐开始），先压低
+                com.pilot.agent.voice.AudioFocusManager.onMusicStarted()
                 Dbg.i(TAG, "开始播放：$title")
             }
             mp.setOnCompletionListener {
@@ -65,6 +83,14 @@ class MusicPlayer private constructor(private val context: Context) {
         player = null
         isPlaying = false
         currentTitle = null
+        // 释放闸门：麦克风恢复可信，唤醒词能重新被识别
+        runCatching { audioGate?.close() }
+        audioGate = null
+        // 释放焦点：别的 App（网易云等）能正常出声
+        com.pilot.agent.voice.AudioFocusManager.abandonMusicFocus()
+        // 注销让路回调（别让已停止的播放器还挂着引用）
+        com.pilot.agent.voice.AudioFocusManager.musicVolume = null
+        com.pilot.agent.voice.AudioFocusManager.musicStop = null
     }
 
     fun nowPlaying(): String? = if (isPlaying) currentTitle else null

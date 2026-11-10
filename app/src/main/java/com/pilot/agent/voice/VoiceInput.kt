@@ -271,6 +271,14 @@ class VoiceInput(
     }
 
     private fun recognize(pcm: ShortArray) {
+        // ★ 放音期间（音乐/TTS）麦克风录到的是音频输出，不是人声——
+        //   送进 ASR 会把歌词误听成「你说完了」这类话，然后 agent 当成指令播报，
+        //   音乐就被打断了（11-10 真机反馈）。这里直接丢弃，不浪费 ASR 算力。
+        if (AudioGate.isMuted) {
+            Dbg.i(TAG, "放音中，丢弃本段音频（${pcm.size * 1000 / AudioCapture.SAMPLE_RATE}ms）")
+            backToIdleOrWake()
+            return
+        }
         if (!busy.compareAndSet(false, true)) return
         emitState(State.RECOGNIZING)
         worker.execute {
