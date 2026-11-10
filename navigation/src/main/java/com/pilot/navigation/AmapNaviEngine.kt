@@ -71,6 +71,22 @@ class AmapNaviEngine(
     private var stopRequested = false
     private var pendingDestination: String? = null
 
+    /** 算路结果闩：算路是异步回调，算路线程要用它等结果。 */
+    @Volatile private var routeLatch: java.util.concurrent.CountDownLatch? = null
+
+    /** 算路是否成功（awaitRoute 用）。 */
+    @Volatile private var routeOk = false
+
+    /** SDK 引擎是否可用（初始化成功）。 */
+    fun isReady(): Boolean = started && navi != null
+
+    /** 等算路结果，超时返回 false。 */
+    fun awaitRoute(timeoutMs: Long): Boolean {
+        val latch = routeLatch ?: return false
+        val done = latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        return done && routeOk
+    }
+
     /**
      * 初始化引擎（幂等）。
      *
@@ -131,17 +147,21 @@ class AmapNaviEngine(
         startLon: Double = 0.0,
     ) {
         val n = navi ?: return
-        // ★ 坐标保留 6 位小数（约 0.1 米精度）。
-        //   系统定位给的是 38.943980667514275 这种 15 位小数，
-        //   高德算路会报 errorCode=3（路径规划参数错误）——实测踩过。
-        val start = NaviLatLng().apply {
-            latitude = round6(startLat)
-            longitude = round6(startLon)
-        }
-        val end = NaviLatLng().apply {
-            latitude = round6(lat)
-            longitude = round6(lon)
-        }
+        // ★★ 起点/终点用 **String 重载**（"经度,纬度"），这是关键。
+        //
+        //   踩过的坑：用 `List<NaviLatLng>` 重载时算路稳定报
+        //   **errorCode=3 = ERROR_STARTPOINT（起点错误）**，
+        //   因为系统定位给的坐标可能落在**无法通行的区域**（小区内部/建筑里），
+        //   SDK 内部不会纠偏就报起点错误。
+        //
+        //   nav-agent 的定稿做法（它的注释写明）：
+        //   「起点用"经度,纬度"字符串传给 calculateDriveRoute 的 String 重载，
+        //     由 SDK 内部处理，省掉 GeocodeSearch 依赖」
+        //   String 重载会走服务端纠偏，起点会吸附到最近道路 → 算路成功。
+        val startStr = "${round6(startLon)},${round6(startLat)}"
+        val endStr = "${round6(lon)},${round6(lat)}"
+        routeOk = false
+        routeLatch = java.util.concurrent.CountDownLatch(1)
         val pathStrategy = PathPlanningStrategy.DRIVING_MULTIPLE_ROUTES_DEFAULT
         // ★ 算路**之前**设车辆信息（nav-agent 同款）：
         //   官方文档说 setCarInfo 影响「路径规划时会躲避车辆限行区域和路线」，
@@ -149,8 +169,8 @@ class AmapNaviEngine(
         //   不设的话算路可能直接失败（errorCode=3）。
         applyCarInfo(n)
         runCatching {
-            val ok = n.calculateDriveRoute(listOf(start), listOf(end), pathStrategy)
-            NLog.i(TAG, "算路 $startLat,$startLon → $lat,$lon ($name) ok=$ok strategy=$pathStrategy")
+            val ok = n.calculateDriveRoute(startStr, endStr, null, pathStrategy)
+            NLog.i(TAG, "算路 $startStr → $endStr ($name) ok=$ok strategy=$pathStrategy")
             onStateChange("正在规划去${name}的路线")
         }.onFailure {
             NLog.e(TAG, "算路失败", it)
@@ -206,6 +226,8 @@ class AmapNaviEngine(
     }
 
     private fun onRouteCalculated() {
+        routeOk = true
+        routeLatch?.countDown()
         if (stopRequested) return
         // ★ startNavi 必须在算路成功之后调——先 startNavi 再算路会返回 false。
         val n = navi ?: return
@@ -221,12 +243,16 @@ class AmapNaviEngine(
     }
 
     override fun onCalculateRouteFailure(error: Int) {
+        routeOk = false
+        routeLatch?.countDown()
         if (stopRequested) return
         NLog.w(TAG, "算路失败 error=$error")
         onStateChange("路线规划失败（$error）")
     }
 
     override fun onCalculateRouteFailure(result: AMapCalcRouteResult?) {
+        routeOk = false
+        routeLatch?.countDown()
         if (stopRequested) return
         NLog.w(TAG, "算路失败 errorCode=${result?.errorCode}")
         onStateChange("路线规划失败（${result?.errorCode}）")

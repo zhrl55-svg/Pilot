@@ -6,6 +6,7 @@ import android.content.Intent
 import android.os.Bundle
 import android.view.ViewGroup
 import android.widget.FrameLayout
+import com.amap.api.maps.CameraUpdateFactory
 import com.amap.api.maps.MapsInitializer
 import com.amap.api.navi.AMapNaviView
 
@@ -49,6 +50,7 @@ class NavActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        NLog.attach(filesDir)
         NLog.i(TAG, "NavActivity onCreate")
 
         // ★ 高德合规接口：必须在任何 SDK 调用之前（不调会崩/不给数据）
@@ -74,7 +76,34 @@ class NavActivity : Activity() {
         }.onFailure {
             NLog.e(TAG, "AMapNaviView 创建失败", it)
         }
+
+        // ★★ 地图默认停在**北京市**——AMapNaviView 不会自动把镜头挪到当前位置。
+        //   nav-agent 的注释写得很明确：「只打开地图不导航时，
+        //   AMapNaviView 不会自动把镜头挪到当前位置，实测停在北京市 ——
+        //   必须自己 moveCamera 一次」。
+        //   所以这里挂上定位回调，第一次拿到坐标就挪镜头。
+        val loc = NavigationService.peekLocationProvider()
+        if (loc != null) {
+            loc.onLocation = { lat, lon ->
+                if (!cameraMoved && lat != 0.0 && lon != 0.0) {
+                    cameraMoved = true
+                    runCatching {
+                        naviView?.map?.moveCamera(
+                            CameraUpdateFactory.newLatLngZoom(
+                                com.amap.api.maps.model.LatLng(lat, lon), 16f,
+                            ),
+                        )
+                        NLog.i(TAG, "地图挪到当前位置 $lat,$lon")
+                    }.onFailure { NLog.w(TAG, "moveCamera 失败 \${it.message}") }
+                }
+            }
+        } else {
+            NLog.w(TAG, "拿不到 LocationProvider，地图可能停在北京市")
+        }
     }
+
+    /** 是否已经把镜头挪到当前位置（只挪一次，之后交给导航引擎跟随）。 */
+    private var cameraMoved = false
 
     override fun onResume() {
         super.onResume()

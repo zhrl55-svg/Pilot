@@ -154,11 +154,18 @@
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
         <!-- 导航界面：高德 AMapNaviView 的载体（引擎必须有 View 才会回调） -->
+        <!--
+          导航界面：必须在 :navigation 进程！
+          NavigationService 的定位器是**进程内静态引用**，
+          跨进程拿不到（实测：Activity 在主进程时 peekLocationProvider 返回 null，
+          地图就停在北京市不动）。
+        -->
         <activity
             android:name="com.pilot.navigation.NavActivity"
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:exported="false"
             android:launchMode="singleTop"
+            android:process=":navigation"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
 
         <!-- 导航服务：独立进程（高德 native 87MB，崩溃隔离 + 内存独立计量） -->

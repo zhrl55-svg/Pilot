@@ -157,6 +157,24 @@ class RouteGuide(
     /** 当前在第几步（0 起），给 UI 显示用。 */
     fun currentStep(): Int = announcedStep.coerceAtLeast(0)
 
+    /** 剩余距离（米），「还有多远」查询用。 */
+    fun remainingMeters(): Int? {
+        val r = route ?: return null
+        if (points.isEmpty()) return null
+        val total = cumDistance.lastOrNull() ?: return null
+        return (total - lastAnnounceAt.coerceAtLeast(0.0)).toInt().coerceAtLeast(0)
+    }
+
+    /** 剩余时间（秒）：按路线平均速度折算。 */
+    fun remainingSeconds(): Int? {
+        val r = route ?: return null
+        val remain = remainingMeters() ?: return null
+        if (r.totalDistance <= 0 || r.totalDuration <= 0) return null
+        val speed = r.totalDistance.toDouble() / r.totalDuration   // 米/秒
+        if (speed <= 0) return null
+        return (remain / speed).toInt().coerceAtLeast(0)
+    }
+
     // ------------------------------------------------------------ 内部
 
     /** 把 steps 展平成点序列 + 累积距离。 */

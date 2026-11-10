@@ -30,6 +30,13 @@ class NavigationService : Service() {
     companion object {
         private const val TAG = "PilotNav"
         const val ACTION_BIND = "com.pilot.navigation.BIND"
+
+        /** 全局引用（NavActivity 要拿它挂 moveCamera 回调）。 */
+        @Volatile
+        private var instance: NavigationService? = null
+
+        /** 拿当前服务的定位器（没起来就返回 null）。 */
+        fun peekLocationProvider(): LocationProvider? = instance?.location
     }
 
     /** 导航状态机。 */
@@ -58,6 +65,7 @@ class NavigationService : Service() {
         super.onCreate()
         // ★ 先挂文件日志（国产 ROM 丢 logcat，文件日志是唯一可靠的排查手段）
         NLog.attach(filesDir)
+        instance = this
         NLog.i(TAG, ":navigation 进程启动 pid=${android.os.Process.myPid()}")
     }
 
@@ -136,6 +144,11 @@ class NavigationService : Service() {
         override fun getNavState(): String = buildString {
             append("{\"state\":\"").append(currentState.toString()).append("\"")
             append(",\"destination\":\"").append(currentDestination ?: "").append("\"")
+            // 剩余距离/时间给「还有多远」查询用
+            guide()?.let { g ->
+                g.remainingMeters()?.let { append(",\"remainMeters\":").append(it) }
+                g.remainingSeconds()?.let { append(",\"remainSeconds\":").append(it) }
+            }
             append("}")
         }
 
@@ -189,25 +202,64 @@ class NavigationService : Service() {
         val best = candidates.minByOrNull { it.distance } ?: candidates.first()
         NLog.i(TAG, "选定 POI：${best.name} (${best.lat},${best.lon}) 候选${candidates.size}个")
         emit(jobId, "state", "已找到${best.name}", priority = 0, stateName = currentState.toString())
-        // ★ 路线规划走 **Web API**（不用 SDK 算路）：
-        //   高德 Android 平台 Key 绑包名+签名，我们的包名是 com.pilot.agent.debug，
-        //   而 Key 注册在 com.navagent 名下 → SDK 算路直接被拒（errorCode=3）。
-        //   同一个 Web Key 走 REST 完全正常（实测返回 3.2 公里完整路线）。
-        //   引导播报我们自己算（RouteGuide），反正 SDK 内置语音本来就要关掉。
+        // ★ 算路：**SDK 优先，Web 降级**
+        //
+        //   为什么要有两条：
+        //   - SDK（AmapNaviEngine）：官方车道级导航、实时路况、红绿灯倒计时，
+        //     但 **Android 平台 Key 绑包名+签名**，Key 不匹配就 errorCode=3
+        //   - Web（WebRoutePlanner）：不受绑定限制，但没有地图渲染
+        //
+        //   策略：SDK 发起算路，等 15 秒。成功就走 SDK（体验最好）；
+        //   失败/超时自动降级 Web（保证一定能导航）。
         Thread {
-            webRoute().plan(
-                fromLat = loc.lat, fromLon = loc.lon,
-                toLat = best.lat, toLon = best.lon,
-                onResult = { r ->
-                    guide().start(r)
-                    emit(jobId, "state", "开始导航", priority = 0, stateName = currentState.toString())
-                },
-                onError = { msg ->
-                    currentState = State.FAILED
-                    emit(jobId, "error", msg, priority = 0, stateName = currentState.toString())
-                },
+            val sdkOk = trySdkRoute(jobId, best, loc, strategy)
+            if (!sdkOk) {
+                NLog.i(TAG, "SDK 算路不可用，降级 Web 通道")
+                webRoute().plan(
+                    fromLat = loc.lat, fromLon = loc.lon,
+                    toLat = best.lat, toLon = best.lon,
+                    onResult = { r ->
+                        guide().start(r)
+                        emit(jobId, "state", "开始导航", priority = 0, stateName = currentState.toString())
+                    },
+                    onError = { msg ->
+                        currentState = State.FAILED
+                        emit(jobId, "error", msg, priority = 0, stateName = currentState.toString())
+                    },
+                )
+            }
+        }.apply { name = "nav-route"; isDaemon = true }.start()
+    }
+
+    /**
+     * 尝试 SDK 算路，等回调。
+     * @return true = 算路成功（SDK 通道可用）
+     */
+    private fun trySdkRoute(
+        jobId: Long,
+        best: SdkPoiSearch.Candidate,
+        loc: LocationProvider,
+        strategy: Int,
+    ): Boolean {
+        return try {
+            val e = engine()
+            e.init()
+            if (!e.isReady()) {
+                NLog.w(TAG, "SDK 引擎没就绪，跳过")
+                return false
+            }
+            e.startNaviToPoint(
+                best.name, best.lat, best.lon, strategy,
+                startLat = loc.lat, startLon = loc.lon,
             )
-        }.apply { name = "nav-web-route"; isDaemon = true }.start()
+            // 等算路回调（导航引擎线程池回调，用 CountDownLatch）
+            val ok = e.awaitRoute(15_000)
+            NLog.i(TAG, "SDK 算路结果=$ok")
+            ok
+        } catch (t: Throwable) {
+            NLog.w(TAG, "SDK 算路异常 ${t.message}")
+            false
+        }
     }
 
     /** Web 算路器（懒初始化）。 */

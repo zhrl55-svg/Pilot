@@ -457,6 +457,29 @@ class AgentLoop(
                 }
             }
 
+            "navigate_stop" -> {
+                val ok = com.pilot.agent.navigation.NavigationClient.stopNavi(0)
+                emit(AgentEvent.Observe(if (ok) "已退出导航" else "当前没有在导航"))
+                true
+            }
+
+            "navigate_status" -> {
+                // 导航进程回的是 JSON，这里取关键字段拼成人话
+                val json = com.pilot.agent.navigation.NavigationClient.stateJson()
+                val st = Regex("\"state\":\"([^\"]*)\"").find(json)?.groupValues?.get(1) ?: "IDLE"
+                val dest = Regex("\"destination\":\"([^\"]*)\"").find(json)?.groupValues?.get(1).orEmpty()
+                val remain = Regex("\"remainMeters\":(\\d+)").find(json)?.groupValues?.get(1)
+                val text = when (st) {
+                    "IDLE" -> "当前没有在导航"
+                    "NAVIGATING" -> if (remain != null) "距$dest 还有 ${remain}米" else "正在导航去$dest"
+                    "ROUTING" -> "正在规划去$dest 的路线"
+                    "ARRIVED" -> "已经到达$dest"
+                    else -> "导航状态：$st"
+                }
+                emit(AgentEvent.Observe(text))
+                true
+            }
+
             else -> false
         }
     }

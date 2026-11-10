@@ -165,7 +165,27 @@ class HeuristicPlanner(
      * 目的地解析（POI 搜索）由导航模块自己做。
      */
     private fun ruleNavigation(goal: String): AgentAction? {
-        if (!goal.contains("导航") && !goal.contains("带我去") && !goal.contains("带我去")) {
+        // ---- 停止导航（要先于「导航去 X」判断，否则「停止导航」会被当成目的地） ----
+        if (Regex("(停止|退出|结束|关闭|取消).{0,3}导航").containsMatchIn(goal) ||
+            goal.trim() == "不导航了"
+        ) {
+            return AgentAction(
+                action = "systemop", target = "navigate_stop",
+                text = "", summary = "停止导航",
+            )
+        }
+
+        // ---- 导航进度查询：「还有多远」「到哪了」「还剩多久」 ----
+        if (Regex("(还有|还剩|剩余).{0,4}(多远|多少公里|多久|几分钟)").containsMatchIn(goal) ||
+            Regex("^(到哪了|到哪儿了|导航状态|导航到哪)").containsMatchIn(goal)
+        ) {
+            return AgentAction(
+                action = "systemop", target = "navigate_status",
+                text = "", summary = "查看导航进度",
+            )
+        }
+
+        if (!goal.contains("导航") && !goal.contains("带我去")) {
             // 「去XX」这种太宽（"去设置"是开 App，不是导航），只在有导航词时才认
             return null
         }
