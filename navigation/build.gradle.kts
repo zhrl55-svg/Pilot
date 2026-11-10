@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.library")
     alias(libs.plugins.kotlin.android)
@@ -13,10 +15,15 @@ android {
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
+        // 高德 Web Key（地点搜索用，不绑包名）。密钥放 local.properties 不入库。
+        // ★ 同 app 模块：local.properties 的键不会自动进 project property，
+        //   必须自己读 Properties 文件。
+        buildConfigField("String", "AMAP_WEB_KEY", "\"${localProp("AMAP_WEB_KEY")}\"")
     }
 
     buildFeatures {
         aidl = true
+        buildConfig = true
     }
 
     compileOptions {
@@ -35,4 +42,13 @@ dependencies {
 
     // 高德 SDK：jar（class + assets）与 so 分开带
     implementation(files("libs/AMap3DMap_11.3.100_AMapNavi_11.3.100_AMapSearch_9.8.1_AMapLocation_11.3.101_20260924.jar"))
+}
+
+/** 从 local.properties 读一个值（读不到返回空串）。 */
+fun localProp(key: String): String {
+    val f = rootProject.file("local.properties")
+    if (!f.isFile) return ""
+    val props = Properties()
+    f.inputStream().use { props.load(it) }
+    return props.getProperty(key) ?: ""
 }

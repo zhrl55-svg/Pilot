@@ -1,0 +1,391 @@
+package com.pilot.navigation
+
+import android.content.Context
+import android.util.Log
+import com.amap.api.navi.AMapNavi
+import com.amap.api.navi.AMapNaviListener
+import com.amap.api.navi.enums.NaviTTSType
+import com.amap.api.navi.enums.NaviType
+import com.amap.api.navi.enums.PathPlanningStrategy
+import com.amap.api.navi.model.AMapCalcRouteResult
+import com.amap.api.navi.model.NaviInfo
+import com.amap.api.navi.model.NaviLatLng
+
+/**
+ * 高德导航引擎封装（移植自 nav-agent 的 AmapNavController）。
+ *
+ * ## 与 nav-agent 的差别
+ * nav-agent 是「车机 App」，导航界面占满屏、有 HUD、有自己的语音优先级体系。
+ * Pilot 是「手机助手」，导航只是它的一个能力，所以：
+ * - 砍掉 nav-agent 的 HUD/车机逻辑，只留引擎 + 播报文本产出
+ * - 播报**不自己发声**：文本经 AIDL 回推主进程，走统一 TTS 队列
+ *
+ * ## 三个必踩的坑（nav-agent 已经踩过，直接继承它的做法）
+ * 1. **必须关内置语音** `setUseInnerVoice(false)`——否则和我们的 TTS 双重播报
+ * 2. **必须先同意隐私协议**——新版 SDK 不调 updatePrivacyAgree 就不给定位/算路
+ * 3. **算路是异步的**——真正 startNavi 在 onCalculateRouteSuccess 里，
+ *    先 startNavi 再算路会返回 false
+ *
+ * ## API 签名（javap 查过 SDK 11.3.100，别猜）
+ * - `calculateDriveRoute(List<NaviLatLng>, List<NaviLatLng>, int)`
+ * - `startNavi(int)` — int 是 NaviType（GPS / EMULATOR）
+ * - `onCalculateRouteSuccess(int[])` — 不是 AMapCalcRouteResult
+ */
+class AmapNaviEngine(
+    private val context: Context,
+    /** 播报文本产出（回推给主进程） */
+    private val onAnnounce: (String, Int) -> Unit,
+    /** 状态变化 */
+    private val onStateChange: (String) -> Unit,
+) : AMapNaviListener {
+
+    companion object {
+        private const val TAG = "PilotNavEngine"
+
+        /** 导航策略：0=推荐 1=躲避拥堵 2=最短 3=高速优先 */
+        const val STRATEGY_RECOMMEND = 0
+        const val STRATEGY_AVOID_JAM = 1
+        const val STRATEGY_SHORTEST = 2
+        const val STRATEGY_HIGHWAY = 3
+
+        /** 播报优先级：导航提示要抢占普通播报 */
+        const val PRIORITY_NAV = 1
+        const val PRIORITY_URGENT = 2
+
+        /** 同意隐私协议（新版 SDK 必需，不调就没法用）。 */
+        fun agreePrivacy(ctx: Context) {
+            runCatching {
+                com.amap.api.maps.MapsInitializer.updatePrivacyShow(ctx, true, true)
+                com.amap.api.maps.MapsInitializer.updatePrivacyAgree(ctx, true)
+                com.amap.api.location.AMapLocationClient.updatePrivacyShow(ctx, true, true)
+                com.amap.api.location.AMapLocationClient.updatePrivacyAgree(ctx, true)
+                com.amap.api.services.core.ServiceSettings.updatePrivacyShow(ctx, true, true)
+                com.amap.api.services.core.ServiceSettings.updatePrivacyAgree(ctx, true)
+                NLog.i(TAG, "高德隐私协议已同意")
+            }.onFailure { NLog.w(TAG, "隐私协议设置失败 ${it.message}") }
+        }
+    }
+
+    private var navi: AMapNavi? = null
+    private var started = false
+    private var stopRequested = false
+    private var pendingDestination: String? = null
+
+    /**
+     * 初始化引擎（幂等）。
+     *
+     * ★ 必须在 **Activity**（有 AMapNaviView 的那个）里调：
+     *   在纯 Service 进程里调 `AMapNavi.getInstance()` 会**卡住**——
+     *   引擎没有渲染载体就不回调（实测：getInstance 之后没有任何日志，
+     *   onCalculateRouteSuccess 永远不来，logcat 也没报错）。
+     *   nav-agent 也是 NavActivity 承载 NaviView 的。
+     */
+    fun init() {
+        if (started) return
+        agreePrivacy(context)
+        // 先把导航界面拉起来（它内部会创建 AMapNaviView）
+        runCatching { NavActivity.show(context, pendingDestination ?: "") }
+        runCatching {
+            val n = AMapNavi.getInstance(context)
+            n.addAMapNaviListener(this)
+            // ★ 关内置语音：我们要用统一 TTS 队列（导航播报要能抢占普通播报，
+            //   而且要占麦克风闸门防自问自答），SDK 内置语音做不到这些。
+            runCatching { n.setUseInnerVoice(false) }
+                .onFailure { NLog.w(TAG, "关内置语音失败 ${it.message}") }
+            navi = n
+            started = true
+            NLog.i(TAG, "AMapNavi 初始化成功 ver=${AMapNavi.getVersion()}")
+        }.onFailure {
+            NLog.e(TAG, "AMapNavi 初始化失败", it)
+            onStateChange("导航引擎初始化失败：${it.message}")
+        }
+    }
+
+    /**
+     * 开始导航（目的地是文本）。
+     * 真正的算路要先经 POI 解析出坐标，见 [startNaviToPoint]。
+     */
+    fun startNavi(destination: String, strategy: Int = STRATEGY_RECOMMEND) {
+        init()
+        if (navi == null) {
+            onStateChange("导航引擎没起来")
+            return
+        }
+        stopRequested = false
+        pendingDestination = destination
+        onStateChange("正在搜索目的地「$destination」")
+    }
+
+    /**
+     * POI 解析完成后调用：设起点终点并算路。
+     *
+     * ★ NaviLatLng 用**无参构造 + setter**——那个 (lat, lon) 有参构造
+     *   参数顺序有歧义，nav-agent 踩过（写成 lat/lon 实际是 lon/lat）。
+     */
+    fun startNaviToPoint(
+        name: String,
+        lat: Double,
+        lon: Double,
+        strategy: Int = STRATEGY_RECOMMEND,
+        startLat: Double = 0.0,
+        startLon: Double = 0.0,
+    ) {
+        val n = navi ?: return
+        // ★ 坐标保留 6 位小数（约 0.1 米精度）。
+        //   系统定位给的是 38.943980667514275 这种 15 位小数，
+        //   高德算路会报 errorCode=3（路径规划参数错误）——实测踩过。
+        val start = NaviLatLng().apply {
+            latitude = round6(startLat)
+            longitude = round6(startLon)
+        }
+        val end = NaviLatLng().apply {
+            latitude = round6(lat)
+            longitude = round6(lon)
+        }
+        val pathStrategy = PathPlanningStrategy.DRIVING_MULTIPLE_ROUTES_DEFAULT
+        // ★ 算路**之前**设车辆信息（nav-agent 同款）：
+        //   官方文档说 setCarInfo 影响「路径规划时会躲避车辆限行区域和路线」，
+        //   所以必须在 calculateDriveRoute 之前生效，不能只在 init 里设一次。
+        //   不设的话算路可能直接失败（errorCode=3）。
+        applyCarInfo(n)
+        runCatching {
+            val ok = n.calculateDriveRoute(listOf(start), listOf(end), pathStrategy)
+            NLog.i(TAG, "算路 $startLat,$startLon → $lat,$lon ($name) ok=$ok strategy=$pathStrategy")
+            onStateChange("正在规划去${name}的路线")
+        }.onFailure {
+            NLog.e(TAG, "算路失败", it)
+            onStateChange("算路失败：${it.message}")
+        }
+    }
+
+    /**
+     * 车辆信息（算路前必须设）。
+     * 0 = 轿车，restriction=true = 规避限行路段。
+     */
+    private fun applyCarInfo(navi: AMapNavi) {
+        runCatching {
+            val carInfo = com.amap.api.navi.model.AMapCarInfo().apply {
+                setCarType("0")
+                setRestriction(true)
+            }
+            navi.setCarInfo(carInfo)
+            NLog.i(TAG, "车辆信息已设 carType=${carInfo.carType} restriction=${carInfo.isRestriction}")
+        }.onFailure { NLog.w(TAG, "设置车辆信息失败：${it.message}") }
+    }
+
+    /** 坐标保留 6 位小数。 */
+    private fun round6(v: Double): Double = Math.round(v * 1_000_000.0) / 1_000_000.0
+
+    /** 停止导航。 */
+    fun stop() {
+        stopRequested = true
+        val n = navi ?: return
+        runCatching {
+            n.stopNavi()
+            n.removeAMapNaviListener(this)
+        }.onFailure { NLog.w(TAG, "停止导航失败 ${it.message}") }
+        onStateChange("已退出导航")
+    }
+
+    fun release() {
+        runCatching { navi?.stopNavi() }
+        navi = null
+        started = false
+    }
+
+    // ------------------------------------------------------------ AMapNaviListener
+
+    /** 算路成功回调（SDK 有两个重载，两个都必须实现，否则类不是抽象的编译不过）。 */
+    override fun onCalculateRouteSuccess(paths: IntArray?) {
+        onRouteCalculated()
+    }
+
+    override fun onCalculateRouteSuccess(result: AMapCalcRouteResult?) {
+        NLog.i(TAG, "算路成功(errorCode=${result?.errorCode})")
+        onRouteCalculated()
+    }
+
+    private fun onRouteCalculated() {
+        if (stopRequested) return
+        // ★ startNavi 必须在算路成功之后调——先 startNavi 再算路会返回 false。
+        val n = navi ?: return
+        runCatching {
+            // startNavi 要传定位类型（GPS = 真机定位）
+            val ok = n.startNavi(NaviType.GPS)
+            NLog.i(TAG, "startNavi=$ok")
+            if (ok) onStateChange("开始导航")
+        }.onFailure {
+            NLog.e(TAG, "startNavi 异常", it)
+            onStateChange("启动导航失败：${it.message}")
+        }
+    }
+
+    override fun onCalculateRouteFailure(error: Int) {
+        if (stopRequested) return
+        NLog.w(TAG, "算路失败 error=$error")
+        onStateChange("路线规划失败（$error）")
+    }
+
+    override fun onCalculateRouteFailure(result: AMapCalcRouteResult?) {
+        if (stopRequested) return
+        NLog.w(TAG, "算路失败 errorCode=${result?.errorCode}")
+        onStateChange("路线规划失败（${result?.errorCode}）")
+    }
+
+    override fun onInitNaviSuccess() {
+        NLog.i(TAG, "引擎初始化成功")
+    }
+
+    override fun onInitNaviFailure() {
+        NLog.e(TAG, "引擎初始化失败")
+        onStateChange("导航引擎初始化失败")
+    }
+
+    override fun onStartNavi(type: Int) {
+        NLog.i(TAG, "开始导航 type=$type")
+    }
+
+    /**
+     * ★ 高德 SDK 直接给播报文本——这是导航播报的主来源。
+     *   我们只转文本，不自己发声。
+     */
+    override fun onGetNavigationText(type: Int, text: String?) {
+        if (stopRequested) return
+        val t = text?.trim().orEmpty()
+        if (t.isEmpty()) return
+        NLog.i(TAG, "导航播报 type=$type text=$t")
+        onAnnounce(t, priorityOf(type))
+    }
+
+    /** 旧版 SDK 的单参数回调（两种可能同时到达，重复播报由上层节流）。 */
+    override fun onGetNavigationText(text: String?) {
+        if (stopRequested) return
+        val t = text?.trim().orEmpty()
+        if (t.isEmpty()) return
+        onAnnounce(t, PRIORITY_NAV)
+    }
+
+    override fun onArriveDestination() {
+        if (stopRequested) return
+        onStateChange("已到达目的地")
+        onAnnounce("已到达目的地", PRIORITY_NAV)
+    }
+
+    override fun onReCalculateRouteForYaw() {
+        if (stopRequested) return
+        onAnnounce("路线已重新规划", PRIORITY_NAV)
+    }
+
+    override fun onReCalculateRouteForTrafficJam() {
+        if (stopRequested) return
+        onAnnounce("前方拥堵，已为你换路", PRIORITY_NAV)
+    }
+
+    override fun onNaviInfoUpdate(info: NaviInfo?) {
+        if (stopRequested) return
+        val i = info ?: return
+        Log.i(
+            TAG,
+            "NaviInfo step=${i.curStepRetainDistance} road=${i.nextRoadName} " +
+                "remain=${i.pathRetainDistance}m",
+        )
+    }
+
+    override fun onTrafficStatusUpdate() {
+        NLog.i(TAG, "路况状态更新")
+    }
+
+    override fun onEndEmulatorNavi() {
+        NLog.i(TAG, "模拟器导航结束")
+    }
+
+    override fun onArrivedWayPoint(index: Int) {
+        NLog.i(TAG, "到达途经点 $index")
+    }
+
+    override fun onGpsSignalWeak(weak: Boolean) {
+        NLog.i(TAG, "GPS 信号弱=$weak")
+    }
+
+    override fun onGpsOpenStatus(open: Boolean) {
+        NLog.i(TAG, "GPS 开关=$open")
+    }
+
+    /** 不同事件类型的优先级：到达/偏航这种要立刻说，其余普通。 */
+    private fun priorityOf(type: Int): Int = when (type) {
+        NaviTTSType.NAVI_END_TEXT, NaviTTSType.NAVI_YAW -> PRIORITY_URGENT
+        else -> PRIORITY_NAV
+    }
+
+    // ---------------------------------------------------- 其余抽象方法（SDK 要求全实现）
+
+    override fun onLocationChange(location: com.amap.api.navi.model.AMapNaviLocation?) {
+        // 导航引擎自己的定位（比 AMapLocationClient 更准，含方向/速度）
+    }
+
+    override fun onNaviRouteNotify(data: com.amap.api.navi.model.AMapNaviRouteNotifyData?) {
+        NLog.i(TAG, "路线通知 road=${data?.roadName} reason=${data?.reason}")
+    }
+
+    override fun onPlayRing(ringType: Int) {
+        NLog.i(TAG, "导航提示音 type=$ringType")
+    }
+
+    override fun notifyParallelRoad(index: Int) {
+        NLog.i(TAG, "平行路提示 $index")
+    }
+
+    override fun updateAimlessModeCongestionInfo(
+        congestionInfo: com.amap.api.navi.model.AimLessModeCongestionInfo?,
+    ) {
+    }
+
+    override fun updateAimlessModeStatistics(
+        statistics: com.amap.api.navi.model.AimLessModeStat?,
+    ) {
+    }
+
+    override fun onServiceAreaUpdate(serviceAreas: Array<out com.amap.api.navi.model.AMapServiceAreaInfo>?) {
+    }
+
+    override fun showCross(cross: com.amap.api.navi.model.AMapNaviCross?) {
+    }
+
+    override fun hideCross() {
+    }
+
+    override fun showModeCross(cross: com.amap.api.navi.model.AMapModelCross?) {
+    }
+
+    override fun hideModeCross() {
+    }
+
+    override fun showLaneInfo(laneInfo: Array<out com.amap.api.navi.model.AMapLaneInfo>?, laneBitmap: ByteArray?, laneBitmap2: ByteArray?) {
+    }
+
+    override fun showLaneInfo(laneInfo: com.amap.api.navi.model.AMapLaneInfo?) {
+    }
+
+    override fun hideLaneInfo() {
+    }
+
+    override fun updateCameraInfo(cameraInfo: Array<out com.amap.api.navi.model.AMapNaviCameraInfo>?) {
+    }
+
+    override fun updateIntervalCameraInfo(
+        cameraInfo: com.amap.api.navi.model.AMapNaviCameraInfo?,
+        intervalCameraInfo: com.amap.api.navi.model.AMapNaviCameraInfo?,
+        index: Int,
+    ) {
+    }
+
+    override fun OnUpdateTrafficFacility(
+        trafficFacilityInfo: Array<out com.amap.api.navi.model.AMapNaviTrafficFacilityInfo>?,
+    ) {
+    }
+
+    override fun OnUpdateTrafficFacility(
+        trafficFacilityInfo: com.amap.api.navi.model.AMapNaviTrafficFacilityInfo?,
+    ) {
+    }
+}

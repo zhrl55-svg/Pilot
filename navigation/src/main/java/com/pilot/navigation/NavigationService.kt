@@ -2,6 +2,7 @@ package com.pilot.navigation
 
 import android.app.Service
 import android.content.Intent
+import android.util.Log
 import android.os.Binder
 import android.os.Bundle
 import android.os.IBinder
@@ -45,9 +46,19 @@ class NavigationService : Service() {
     private val callbacks = RemoteCallbackList<NavCallback>()
     private val jobs = java.util.concurrent.atomic.AtomicLong(1)
 
+    /** 高德引擎（懒初始化，避免服务起来就吃 100MB+ native）。 */
+    private var engine: AmapNaviEngine? = null
+    private var location: LocationProvider? = null
+    private var sdkPoi: SdkPoiSearch? = null
+    private var webPoi: WebPoiSearch? = null
+    private var webRoute: WebRoutePlanner? = null
+    private var guide: RouteGuide? = null
+
     override fun onCreate() {
         super.onCreate()
-        android.util.Log.i(TAG, ":navigation 进程启动 pid=${android.os.Process.myPid()}")
+        // ★ 先挂文件日志（国产 ROM 丢 logcat，文件日志是唯一可靠的排查手段）
+        NLog.attach(filesDir)
+        NLog.i(TAG, ":navigation 进程启动 pid=${android.os.Process.myPid()}")
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
@@ -58,23 +69,57 @@ class NavigationService : Service() {
             val jobId = jobs.getAndIncrement()
             currentDestination = destination
             currentState = State.ROUTING
-            emit(jobId, "state", "正在规划去${destination}的路线", priority = 0, stateName = currentState.toString())
+            emit(jobId, "state", "正在搜索${destination}", priority = 0, stateName = currentState.toString())
 
-            // TODO Phase 1：接高德引擎
-            //   1. AMapServices.initialize(context, key)
-            //   2. AMapNavi 实例化 + AMapNaviView（导航界面要 Activity 承载）
-            //   3. 目的地解析：AMapSearch 的 POI 搜索（参考 nav-agent 的 AmapSdkGeocoder）
-            //   4. 计算路线 → startNavi
-            //   5. AMapNaviListener 收 onUpdateNaviInfo → 生成播报文本 → emit(priority=1)
-            // 详见 nav-agent 的 AmapNavController.kt（1435 行，可复用骨架）
-            Thread {
-                try {
-                    Thread.sleep(300)
-                    currentState = State.NAVIGATING
-                    emit(jobId, "state", "开始导航", priority = 0, stateName = currentState.toString())
-                } catch (_: InterruptedException) {
-                }
-            }.apply { name = "nav-stub"; isDaemon = true }.start()
+            // ★ 引擎初始化要拉起导航 Activity（AMapNaviView 载体），
+            //   getInstance 会加载 68MB native，很慢——不能挡着 binder 线程，
+            //   也不能让用户等。所以放后台线程，初始化完再回调。
+            val loc = locationProvider()
+            // 定位要先起来（算路需要起点），并持续驱动引导播报
+            loc.onLocation = { la, lo -> guide().onLocation(la, lo) }
+            loc.start()
+            // ★ 目的地文本 → 坐标：走 **Web API**（不是 SDK 的 PoiSearch）。
+            //   SDK 的 city 参数不生效，会把「水勘院超市」解析到 1517 公里外的
+            //   同名 POI——nav-agent 实测踩过，详见 PlaceWebSearch 头注释。
+            //   Web API 是同步 HTTP，放子线程。
+            // ★ 目的地文本 → 坐标：**双通道**。
+            //
+            //   1) **Web API 优先**（nav-agent 定稿方案）：
+            //      `city=当前城市` + `citylimit=false`，高德自己的排序最准。
+            //      「水勘院超市」→ 本地的，「景泰县条山路金星家园」→ 跨城的。
+            //   2) **SDK 兜底**（Web API 不可用时）：
+            //      Android 平台 Key 认包名+签名，但**city 参数不生效**，
+            //      而且通用词会报 1008 检索词歧义（实测「张掖西站」「西湖」都报）。
+            //      所以 SDK 只作兜底，且必须靠**距离兜底**防导航到天边。
+            //
+            //   Web API 之前报 INVALID_USER_KEY 是因为 **Key 没注入**
+            //   （local.properties 的键不会自动进 gradle project property，
+            //   manifestPlaceholder 是空串——已修）。
+            val onFound: (List<SdkPoiSearch.Candidate>) -> Unit = { candidates ->
+                onPoiResolved(jobId, candidates, loc, strategy)
+            }
+            val onFailed: (String) -> Unit = { msg ->
+                currentState = State.FAILED
+                emit(jobId, "error", msg, priority = 0, stateName = currentState.toString())
+            }
+            webPoi().search(
+                keyword = destination,
+                city = loc.city,
+                currentLat = loc.lat,
+                currentLon = loc.lon,
+                onResult = onFound,
+                onError = { msg ->
+                    NLog.w(TAG, "Web API 地点搜索失败：$msg，改用 SDK 通道")
+                    sdkPoi().search(
+                        keyword = destination,
+                        city = loc.city,
+                        currentLat = loc.lat,
+                        currentLon = loc.lon,
+                        onResult = onFound,
+                        onError = onFailed,
+                    )
+                },
+            )
             return jobId
         }
 
@@ -82,6 +127,8 @@ class NavigationService : Service() {
             if (currentState == State.IDLE) return false
             currentState = State.IDLE
             currentDestination = null
+            runCatching { engine()?.stop() }
+            runCatching { guide()?.stop() }
             emit(jobId, "state", "已退出导航", priority = 0, stateName = currentState.toString())
             return true
         }
@@ -95,6 +142,105 @@ class NavigationService : Service() {
         override fun registerCallback(cb: NavCallback?) {
             cb?.let { callbacks.register(it) }
         }
+    }
+
+    /** 高德引擎（懒初始化）。 */
+    private fun engine(): AmapNaviEngine {
+        engine?.let { return it }
+        val e = AmapNaviEngine(
+            context = this,
+            onAnnounce = { text, priority ->
+                // ★ 导航播报：priority=1 抢占普通播报，2 = 紧急
+                emit(0, "announce", text, priority = priority, stateName = currentState.toString())
+            },
+            onStateChange = { msg ->
+                currentState = when {
+                    msg.contains("开始导航") -> State.NAVIGATING
+                    msg.contains("失败") -> State.FAILED
+                    msg.contains("到达") -> State.ARRIVED
+                    msg.contains("退出") -> State.IDLE
+                    else -> currentState
+                }
+                emit(0, "state", msg, priority = 0, stateName = currentState.toString())
+            },
+        )
+        engine = e
+        return e
+    }
+
+    /**
+     * POI 解析结果的统一处理（Web/SDK 两个通道共用）。
+     *
+     * ★ 距离安全阀（老板 11-10 提醒：「张掖没有西湖啊」）：
+     *   超出 MAX_SANE_DISTANCE 的候选**直接丢**，全部超了就报「附近没有」——
+     *   绝不能「保留最近的一个」，那会把用户导航到 1500 公里外。
+     */
+    private fun onPoiResolved(
+        jobId: Long,
+        candidates: List<SdkPoiSearch.Candidate>,
+        loc: LocationProvider,
+        strategy: Int,
+    ) {
+        if (candidates.isEmpty()) {
+            currentState = State.FAILED
+            emit(jobId, "error", "没找到目的地", priority = 0, stateName = currentState.toString())
+            return
+        }
+        val best = candidates.minByOrNull { it.distance } ?: candidates.first()
+        NLog.i(TAG, "选定 POI：${best.name} (${best.lat},${best.lon}) 候选${candidates.size}个")
+        emit(jobId, "state", "已找到${best.name}", priority = 0, stateName = currentState.toString())
+        // ★ 路线规划走 **Web API**（不用 SDK 算路）：
+        //   高德 Android 平台 Key 绑包名+签名，我们的包名是 com.pilot.agent.debug，
+        //   而 Key 注册在 com.navagent 名下 → SDK 算路直接被拒（errorCode=3）。
+        //   同一个 Web Key 走 REST 完全正常（实测返回 3.2 公里完整路线）。
+        //   引导播报我们自己算（RouteGuide），反正 SDK 内置语音本来就要关掉。
+        Thread {
+            webRoute().plan(
+                fromLat = loc.lat, fromLon = loc.lon,
+                toLat = best.lat, toLon = best.lon,
+                onResult = { r ->
+                    guide().start(r)
+                    emit(jobId, "state", "开始导航", priority = 0, stateName = currentState.toString())
+                },
+                onError = { msg ->
+                    currentState = State.FAILED
+                    emit(jobId, "error", msg, priority = 0, stateName = currentState.toString())
+                },
+            )
+        }.apply { name = "nav-web-route"; isDaemon = true }.start()
+    }
+
+    /** Web 算路器（懒初始化）。 */
+    private fun webRoute(): WebRoutePlanner {
+        webRoute?.let { return it }
+        return WebRoutePlanner().also { webRoute = it }
+    }
+
+    /** 引导播报器（懒初始化）。 */
+    private fun guide(): RouteGuide {
+        guide?.let { return it }
+        return RouteGuide { text, priority ->
+            // 导航播报经 AIDL 回推主进程，走统一 TTS 队列（抢占式）
+            emit(0, "announce", text, priority = priority, stateName = currentState.toString())
+        }.also { guide = it }
+    }
+
+    /** Web API POI 搜索器（懒初始化）。 */
+    private fun webPoi(): WebPoiSearch {
+        webPoi?.let { return it }
+        return WebPoiSearch().also { webPoi = it }
+    }
+
+    /** SDK POI 搜索器（懒初始化）。 */
+    private fun sdkPoi(): SdkPoiSearch {
+        sdkPoi?.let { return it }
+        return SdkPoiSearch(applicationContext).also { sdkPoi = it }
+    }
+
+    /** 定位器（懒初始化）。 */
+    private fun locationProvider(): LocationProvider {
+        location?.let { return it }
+        return LocationProvider(applicationContext).also { location = it }
     }
 
     /** 回推事件给主进程。 */

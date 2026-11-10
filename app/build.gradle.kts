@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -16,6 +18,15 @@ android {
         versionCode = 1
         versionName = "0.1.0"
         resourceConfigurations += listOf("zh", "en")
+        // 高德 Key（密钥，放 local.properties 不入库）。
+        // ★ local.properties 的键**不会**自动变成 gradle project property
+        //   （那是 Android Studio 的行为，命令行构建拿不到）——
+        //   必须自己读 Properties 文件，否则 manifestPlaceholder 是空串，
+        //   高德直接报 USERKEY 错误（踩过：value="" 在 aapt2 dump 里看出来的）。
+        // 高德 Key：优先用 pilot 专属的（AMAP_KEY_PILOT），没配就回退老的
+        // （老 Key 绑在 nav-agent 包名下，SDK 算路会被拒，但 POI/定位还能用）
+        manifestPlaceholders["AMAP_KEY"] =
+            localProp("AMAP_KEY_PILOT").ifBlank { localProp("AMAP_KEY") }
     }
 
     signingConfigs {
@@ -96,4 +107,20 @@ dependencies {
 
     // 导航模块（高德 SDK 87MB so 在 :navigation 里，见 NAV_MODULE_PLAN.md）
     implementation(project(":navigation"))
+}
+
+/**
+ * 从 local.properties 读一个值（读不到返回空串）。
+ *
+ * ★ local.properties 的键**不会**自动变成 gradle project property
+ *   （那是 Android Studio 的行为，命令行构建拿不到）——
+ *   必须自己读 Properties 文件，否则 manifestPlaceholder 是空串，
+ *   高德直接报 USERKEY 错误（这个坑踩过：aapt2 dump 里 value=""）。
+ */
+fun localProp(key: String): String {
+    val f = rootProject.file("local.properties")
+    if (!f.isFile) return ""
+    val props = Properties()
+    f.inputStream().use { props.load(it) }
+    return props.getProperty(key) ?: ""
 }

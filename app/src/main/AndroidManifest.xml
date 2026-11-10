@@ -128,6 +128,39 @@
             android:noHistory="true"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
+        <!-- 高德 Key：绑定包名（com.pilot.agent），从 local.properties 注入 -->
+        <meta-data
+            android:name="com.amap.api.v2.apikey"
+            android:value="${AMAP_KEY}" />
+
+        <!--
+          高德定位的辅助服务。高德 navi SDK 是纯 jar（不是 aar），
+          它的 manifest 不会被合并，而 AMapLocationClient 启动时会拉起这个服务。
+          不声明就会在 logcat 看到
+            Unable to start service Intent { cmp=.../com.amap.api.location.APSService } not found
+          并导致定位能力退化。必须手动补上（nav-agent 同款，已踩过）。
+        -->
+        <service
+            android:name="com.amap.api.location.APSService"
+            android:enabled="true"
+            android:exported="false" />
+
+        <!-- 触发入口：am start 走 Activity 而不是广播（华为 ROM 的广播队列会卡死） -->
+        <activity
+            android:name=".ui.TriggerActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- 导航界面：高德 AMapNaviView 的载体（引擎必须有 View 才会回调） -->
+        <activity
+            android:name="com.pilot.navigation.NavActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
+
         <!-- 导航服务：独立进程（高德 native 87MB，崩溃隔离 + 内存独立计量） -->
         <service
             android:name="com.pilot.navigation.NavigationService"
