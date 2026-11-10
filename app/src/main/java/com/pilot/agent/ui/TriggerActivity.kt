@@ -47,6 +47,13 @@ class TriggerActivity : Activity() {
     private fun handle(intent: Intent?) {
         val i = intent ?: return
 
+        // 停止播报（导航界面点「停止播报」时通知过来）
+        if (i.getBooleanExtra("stop_speaking", false)) {
+            Dbg.i(TAG, "收到停止播报指令")
+            runCatching { com.pilot.agent.runtime.AgentRuntime.speaker.stop() }
+            return
+        }
+
         // 沙箱自检
         val sandboxTest = i.getStringExtra("sandbox_test")?.trim()
         if (!sandboxTest.isNullOrEmpty()) {

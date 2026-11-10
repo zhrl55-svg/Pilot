@@ -21,13 +21,85 @@ class Speaker(context: Context) {
     var lastError: String? = null
         private set
 
-    fun speak(text: String) {
+    /**
+     * 导航播报（**不可打断**）。
+     *
+     * ## 为什么和普通播报不一样
+     * 导航播报极短——「左转」「前方 200 米右转」「已到达」，
+     * 而且**说完就没机会补了**（车已经开过路口）。
+     * 所以它有两个特权：
+     * 1. **能打断普通播报**（普通播报晚点说无所谓）
+     * 2. **自己播的时候不许别人插嘴**（普通播报、甚至下一条导航播报都要排队）
+     *
+     * ## 实现
+     * [navSpeaking] 是一个独占标记：播报期间所有 [speak] 调用直接丢弃，
+     * 下一条导航播报排队等（不会丢，只是延后）。
+     * 不能简单用 stop() 互斥——那样两条连续导航提示（「左转」「随后右转」）
+     * 会互相打断，用户只听到半句。
+     */
+    fun speakNav(text: String) {
         val t = text.trim()
         if (t.isEmpty()) return
+        synchronized(navLock) {
+            // 正在播导航 → 排队（最多排 2 条，再多就是刷屏了）
+            if (navSpeaking) {
+                if (navQueue.size < 2) navQueue.add(t)
+                Dbg.i(TAG, "导航播报正在播，排队：$t（队列 ${navQueue.size}）")
+                return
+            }
+            navSpeaking = true
+        }
+        // 打断当前普通播报（导航优先）
+        stop()
+        speakInternal(t, isNav = true)
+    }
+
+    /** 导航播报独占锁。 */
+    private val navLock = Any()
+    /** 当前是否在播导航提示。 */
+    @Volatile private var navSpeaking = false
+    /** 排队等播的导航提示。 */
+    private val navQueue = ArrayDeque<String>()
+
+    /** 一条导航播报播完了：播队列里的下一条，或解锁。 */
+    private fun onNavSpoken() {
+        val next: String?
+        synchronized(navLock) {
+            next = navQueue.removeFirstOrNull()
+            if (next == null) navSpeaking = false
+        }
+        if (next != null) {
+            Dbg.i(TAG, "导航播报出队：$next")
+            speakInternal(next, isNav = true)
+        }
+    }
+
+    fun speak(text: String) = speakInternal(text, isNav = false)
+
+    /**
+     * 实际播报。
+     * @param isNav true = 导航播报（独占、播完释放锁）
+     */
+    private fun speakInternal(text: String, isNav: Boolean) {
+        val t = text.trim()
+        if (t.isEmpty()) {
+            if (isNav) onNavSpoken()
+            return
+        }
+        // ★ 导航播报期间，普通播报**直接丢弃**——
+        //   导航提示短且说完就没机会补（车已经过路口了），
+        //   普通播报（「已帮你打开设置」）晚点说完全无所谓。
+        if (!isNav && navSpeaking) {
+            Dbg.i(TAG, "导航播报中，丢弃普通播报：$t")
+            return
+        }
 
         val s = AgentSettings.load()
         val engine: SpeechOutput = when (s.ttsEngine) {
-            AgentSettings.TTS_OFF -> return
+            AgentSettings.TTS_OFF -> {
+                if (isNav) onNavSpoken()
+                return
+            }
             AgentSettings.TTS_MINIMAX -> {
                 if (s.apiKey.isBlank()) {
                     // ★ 没配 key 就直接用系统 TTS（华为智慧语音等），不能一声不吭。
@@ -55,6 +127,7 @@ class Speaker(context: Context) {
             onDone = {
                 runCatching { gate.close() }
                 runCatching { speechFocus.close() }
+                if (isNav) onNavSpoken()
             },
             onError = { msg ->
                 lastError = msg
@@ -86,25 +159,19 @@ class Speaker(context: Context) {
                 } else {
                     runCatching { gate.close() }
                     runCatching { speechFocus.close() }
+                    if (isNav) onNavSpoken()
                 }
             },
         )
     }
 
     /**
-     * 抢占式播报。
+     * 抢占式播报（保留旧接口，导航场景用 [speakNav]）。
      *
-     * @param interrupt true = 打断当前正在播的话（导航提示用）
-     *
-     * ★ 导航播报必须抢占：「前方 200 米右转」这种话晚 3 秒说出来就没意义了，
-     *   而普通播报（「已经帮你打开了设置」）晚一点无所谓。
+     * @param interrupt true = 打断当前正在播的话
      */
     fun speakPriority(text: String, interrupt: Boolean) {
-        if (interrupt) {
-            // 先停掉当前正在播的，避免两句话叠在一起
-            stop()
-        }
-        speak(text)
+        if (interrupt) speakNav(text) else speak(text)
     }
 
     fun stop() {

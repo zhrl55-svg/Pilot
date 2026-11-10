@@ -37,6 +37,9 @@ class NavigationService : Service() {
 
         /** 拿当前服务的定位器（没起来就返回 null）。 */
         fun peekLocationProvider(): LocationProvider? = instance?.location
+
+        /** 拿当前服务实例（NavActivity 要调 stop）。 */
+        fun peek(): NavigationService? = instance
     }
 
     /** 导航状态机。 */
@@ -49,6 +52,10 @@ class NavigationService : Service() {
     @Volatile
     var currentDestination: String? = null
         private set
+
+    /** 是否已经请求停止（引擎回调里用来忽略迟到的事件）。 */
+    @Volatile
+    private var stopRequested = false
 
     private val callbacks = RemoteCallbackList<NavCallback>()
     private val jobs = java.util.concurrent.atomic.AtomicLong(1)
@@ -75,8 +82,37 @@ class NavigationService : Service() {
 
         override fun startNavi(destination: String, strategy: Int): Long {
             val jobId = jobs.getAndIncrement()
-            currentDestination = destination
             currentState = State.ROUTING
+
+            // ★ 先查常去地点：「回家」「去公司」这种词直接命中收藏，
+            //   不用走 POI 搜索（也避免搜出同名但很远的店）
+            val fav = matchFavorite(destination)
+            if (fav != null) {
+                currentDestination = fav.label
+                NLog.i(TAG, "命中常去地点「${fav.label}」→ ${fav.address}")
+                emit(jobId, "state", "导航去${fav.label}", priority = 0, stateName = currentState.toString())
+                // 收藏里已经有坐标，直接算路
+                java.util.concurrent.Executors.newSingleThreadExecutor().execute {
+                    val sdkOk = trySdkRouteFromFav(jobId, fav, strategy)
+                    if (!sdkOk) {
+                        webRoute().plan(
+                            fromLat = locationProvider().lat, fromLon = locationProvider().lon,
+                            toLat = fav.lat, toLon = fav.lon,
+                            onResult = { r ->
+                                guide().start(r)
+                                emit(jobId, "state", "开始导航", priority = 0, stateName = currentState.toString())
+                            },
+                            onError = { msg ->
+                                currentState = State.FAILED
+                                emit(jobId, "error", msg, priority = 0, stateName = currentState.toString())
+                            },
+                        )
+                    }
+                }
+                return jobId
+            }
+
+            currentDestination = destination
             emit(jobId, "state", "正在搜索${destination}", priority = 0, stateName = currentState.toString())
 
             // ★ 引擎初始化要拉起导航 Activity（AMapNaviView 载体），
@@ -163,8 +199,14 @@ class NavigationService : Service() {
         val e = AmapNaviEngine(
             context = this,
             onAnnounce = { text, priority ->
-                // ★ 导航播报：priority=1 抢占普通播报，2 = 紧急
-                emit(0, "announce", text, priority = priority, stateName = currentState.toString())
+                // ★ 按「播报详细程度」设置过滤：
+                //   详细=全念 / 标准=滤掉噪音 / 简洁=只念转弯
+                val level = NavigationSettings.load(this).broadcastLevel
+                if (!NavigationSettings.shouldSpeak(level, text)) {
+                    NLog.i(TAG, "播报被档位过滤(level=$level)：$text")
+                } else {
+                    emit(0, "announce", text, priority = priority, stateName = currentState.toString())
+                }
             },
             onStateChange = { msg ->
                 currentState = when {
@@ -175,6 +217,15 @@ class NavigationService : Service() {
                     else -> currentState
                 }
                 emit(0, "state", msg, priority = 0, stateName = currentState.toString())
+                // ★ 到达后自动退出：导航界面挂着很烦（开车到了就该下车走人）
+                if (msg.contains("到达") && NavigationSettings.load(this).arriveAutoExit) {
+                    NLog.i(TAG, "已到达，按设置自动退出导航")
+                    // 等播报说完再退出（「已到达目的地」要念出来）
+                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                        requestStop()
+                        runCatching { NavActivity.closeAll() }
+                    }, 4000)
+                }
             },
         )
         engine = e
@@ -213,7 +264,9 @@ class NavigationService : Service() {
         //   失败/超时自动降级 Web（保证一定能导航）。
         Thread {
             val sdkOk = trySdkRoute(jobId, best, loc, strategy)
-            if (!sdkOk) {
+            if (sdkOk) {
+                recordHistory(best.name, best.lat, best.lon, best.poiId)
+            } else {
                 NLog.i(TAG, "SDK 算路不可用，降级 Web 通道")
                 webRoute().plan(
                     fromLat = loc.lat, fromLon = loc.lon,
@@ -263,6 +316,73 @@ class NavigationService : Service() {
         }
     }
 
+    /**
+     * 匹配常去地点。
+     *
+     * 「回家」「回公司」「去单位」这种说法 → 命中收藏的 label。
+     * 匹配规则刻意宽松：只要用户说的词包含收藏的 label（或反之）就算，
+     * 因为用户不会一字不差地说「家」。
+     */
+    private fun matchFavorite(spoken: String): NavigationSettings.Favorite? {
+        val text = spoken.trim()
+        if (text.length > 8) return null   // 长句不是快捷指令
+        val favs = NavigationSettings.load(this).favorites
+        if (favs.isEmpty()) return null
+        return favs.firstOrNull { f ->
+            val label = f.label
+            label.isNotBlank() && (text.contains(label) || label.contains(text))
+        }
+    }
+
+    /** 从收藏点算路（有坐标，跳过 POI 搜索）。 */
+    private fun trySdkRouteFromFav(
+        jobId: Long,
+        fav: NavigationSettings.Favorite,
+        strategy: Int,
+    ): Boolean = try {
+        val e = engine()
+        e.init()
+        if (!e.isReady()) {
+            false
+        } else {
+            val loc = locationProvider()
+            loc.start()
+            e.startNaviToPoint(
+                fav.label, fav.lat, fav.lon, strategy,
+                startLat = loc.lat, startLon = loc.lon,
+                poiId = fav.poiId,
+            )
+            e.awaitRoute(15_000)
+        }
+    } catch (t: Throwable) {
+        NLog.w(TAG, "收藏点算路异常 ${t.message}")
+        false
+    }
+
+    /**
+     * 记录导航历史（最近 20 条，重复目的地合并到最前）。
+     *
+     * 记录时机是**算路成功**之后，不是点导航的时候——
+     * 用户说了目的地但没算出路（比如「附近没有」），不该进历史。
+     */
+    private fun recordHistory(name: String, lat: Double, lon: Double, poiId: String?) {
+        runCatching {
+            val cur = NavigationSettings.load(this)
+            val entry = NavigationSettings.HistoryEntry(
+                name = name, alias = "", lat = lat, lon = lon, poiId = poiId,
+                time = System.currentTimeMillis(),
+            )
+            // 同一个地方（名字+坐标接近）只留最新一条
+            val rest = cur.history.filterNot {
+                it.name == name && kotlin.math.abs(it.lat - lat) < 0.0005 &&
+                    kotlin.math.abs(it.lon - lon) < 0.0005
+            }
+            val list = (listOf(entry) + rest).take(20)
+            NavigationSettings.save(this, cur.copy(history = list))
+            NLog.i(TAG, "历史已记录：$name（共 ${list.size} 条）")
+        }.onFailure { NLog.w(TAG, "记历史失败 ${it.message}") }
+    }
+
     /** Web 算路器（懒初始化）。 */
     private fun webRoute(): WebRoutePlanner {
         webRoute?.let { return it }
@@ -294,6 +414,24 @@ class NavigationService : Service() {
     private fun locationProvider(): LocationProvider {
         location?.let { return it }
         return LocationProvider(applicationContext).also { location = it }
+    }
+
+    /** 供界面层发起导航（历史再导航用）。 */
+    fun startNaviFromOuter(destination: String, strategy: Int): Long =
+        binder.startNavi(destination, strategy)
+
+    /**
+     * 请求停止导航（供 NavActivity 的退出按钮调）。
+     * 停引擎 + 停引导 + 落状态，**不 finish 界面**（界面由调用方决定关不关）。
+     */
+    fun requestStop() {
+        NLog.i(TAG, "requestStop 停止导航")
+        stopRequested = true
+        currentState = State.IDLE
+        runCatching { engine?.stop() }
+        runCatching { guide?.stop() }
+        currentDestination = null
+        emit(0, "state", "已退出导航", priority = 0, stateName = currentState.toString())
     }
 
     /** 回推事件给主进程。 */

@@ -12,7 +12,7 @@ set -uo pipefail
 export MSYS_NO_PATHCONV=1
 
 DEV="${1:-}"
-PKG="com.pilot.agent.debug"
+PKG="com.pilot.agent"
 SVC="$PKG/com.pilot.agent.service.AgentAccessibilityService"
 APK="app/build/outputs/apk/debug/app-debug.apk"
 ADB="${ADB:-D:/Android/Sdk/platform-tools/adb.exe}"
