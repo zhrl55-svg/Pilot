@@ -47,7 +47,17 @@ class MountedFoldersStore(private val appContext: Context) {
     }
 
     private fun load() {
+        // 优先读共享文件（跨进程可见），没有再退回 SP（旧数据迁移）
+        val f = mountsFile()
+        if (f.isFile) {
+            runCatching { loadFromJson(f.readText()) }
+            return
+        }
         val raw = prefs.getString("entries", null) ?: return
+        runCatching { loadFromJson(raw) }
+    }
+
+    private fun loadFromJson(raw: String) {
         val arr = JSONArray(raw)
         val list = ArrayList<Entry>(arr.length())
         for (i in 0 until arr.length()) {
@@ -67,6 +77,60 @@ class MountedFoldersStore(private val appContext: Context) {
         _entries.value = list
     }
 
+    /**
+     * 从磁盘重新加载（跨进程场景必需）。
+     *
+     * 挂载表要跨进程共享：主进程（UI）写，`:sandbox` 进程读。
+     *
+     * ## 为什么不用 SharedPreferences
+     * SP 的跨进程缓存失效依赖 MODE_MULTI_PROCESS，而那个 flag 从 API 23 起
+     * 就被废弃了——AOSP 里 `getSharedPreferences` 会直接忽略它，
+     * 结果就是 :sandbox 进程永远读到启动时那份内存副本，
+     * 主进程新加的挂载它永远不知道（踩过）。
+     *
+     * ## 方案：文件 + mtime 判重
+     * 挂载表落到沙箱专属目录下的一个 JSON 文件，两个进程读同一个文件。
+     * 用 mtime+size 判「有没有变」，变了才重新解析——
+     * 解析很便宜，但每条命令都解析也没必要。
+     */
+    fun reloadFromDisk() {
+        runCatching {
+            val f = mountsFile()
+            val stamp = if (f.isFile) "${f.lastModified()}:${f.length()}" else "none"
+            if (stamp == lastDiskStamp) return@runCatching
+            lastDiskStamp = stamp
+            if (!f.isFile) {
+                if (_entries.value.isNotEmpty()) _entries.value = emptyList()
+                return@runCatching
+            }
+            val arr = JSONArray(f.readText())
+            val list = ArrayList<Entry>(arr.length())
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                list += Entry(
+                    id = o.optString("id", UUID.randomUUID().toString()),
+                    name = o.optString("name"),
+                    sourceDisplayName = o.optString("sourceDisplayName"),
+                    treeUri = o.optString("treeUri"),
+                    createdAt = o.optLong("createdAt", System.currentTimeMillis()),
+                    isWritable = o.optBoolean("isWritable", true),
+                    userAllowWrite = o.optBoolean("userAllowWrite", true),
+                    resolvedHostPath = o.optString("resolvedHostPath").takeIf { it.isNotEmpty() }
+                        ?: resolveHostPathFromUri(o.optString("treeUri")),
+                )
+            }
+            if (list != _entries.value) {
+                _entries.value = list
+            }
+        }.onFailure { /* 读不到就沿用内存里的 */ }
+    }
+
+    /** 挂载表文件（两进程共享，沙箱专属目录）。 */
+    private fun mountsFile(): java.io.File =
+        java.io.File(appContext.filesDir, "sandbox/mounts.json")
+
+    @Volatile private var lastDiskStamp: String = ""
+
     private fun persist(list: List<Entry>) {
         val arr = JSONArray()
         for (e in list) {
@@ -78,8 +142,33 @@ class MountedFoldersStore(private val appContext: Context) {
                 put("resolvedHostPath", e.resolvedHostPath ?: "")
             })
         }
+        // 写共享文件（:sandbox 进程读它）+ 写 SP（备份/旧版本兼容）
+        runCatching {
+            val f = mountsFile()
+            f.parentFile?.mkdirs()
+            // 原子写：先写临时文件再 rename，避免另一个进程读到半截 JSON
+            val tmp = java.io.File(f.parentFile, f.name + ".tmp")
+            tmp.writeText(arr.toString())
+            if (!tmp.renameTo(f)) {
+                f.writeText(arr.toString())
+                tmp.delete()
+            }
+        }
         prefs.edit().putString("entries", arr.toString()).apply()
+        // 本进程的下次 reload 会因为 mtime 变了而重新解析，刷新指纹缓存
+        lastDiskStamp = ""
     }
+
+    /**
+     * 挂载集合变化时回调（增/删/改都触发）。
+     *
+     * ★ 热挂载的关键（minis 原版 T219-5 同款）：
+     *   proot 的 `-b` 参数在**进程 spawn 时**就冻结了，
+     *   所以光改 bindMounts 快照对已经跑着的 shell 没用——
+     *   必须杀掉热壳，下一条命令重建时带上新的 bind 集合。
+     *   回调里做两件事：applyMountedFoldersSnapshot + stopCurrentCommand()。
+     */
+    var onChange: (() -> Unit)? = null
 
     /** 挂一个目录（name 决定 guest 里的 /var/minis/mounts/<name>）。 */
     fun add(name: String, hostPath: String, writable: Boolean = true): Entry {
@@ -93,6 +182,7 @@ class MountedFoldersStore(private val appContext: Context) {
         val list = _entries.value.filter { it.name != name } + entry
         _entries.value = list
         persist(list)
+        notifyChanged()
         return entry
     }
 
@@ -127,6 +217,7 @@ class MountedFoldersStore(private val appContext: Context) {
         val hit = list.firstOrNull { it.id == id } ?: return false
         _entries.value = list - hit
         persist(_entries.value)
+        notifyChanged()
         return true
     }
 
@@ -134,6 +225,11 @@ class MountedFoldersStore(private val appContext: Context) {
         val list = _entries.value
         val hit = list.firstOrNull { it.name == name } ?: return false
         return remove(hit.id)
+    }
+
+    /** 通知外部：挂载集合变了，需要重建 proot 的 bind 参数。 */
+    private fun notifyChanged() {
+        runCatching { onChange?.invoke() }
     }
 
     /** SAF tree uri → POSIX 路径（只支持 /storage/... 型 external storage，与 minis 同规则）。 */

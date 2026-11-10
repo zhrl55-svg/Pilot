@@ -18,6 +18,12 @@ object HostBridge {
             val r = req.orEmpty()
             Dbg.i("PilotSandbox", "host call: $r")
             return when {
+                // 沙箱要空闲回收了 → 主进程必须解绑，否则 BIND_AUTO_CREATE
+                // 会让系统立刻把服务再拉起来，回收白做。
+                r == "idleRecycle" -> {
+                    com.pilot.agent.sandbox.SandboxClient.disconnectForIdle()
+                    Bundle().apply { putBoolean("ok", true) }
+                }
                 r.startsWith("open:") -> {
                     val app = r.removePrefix("open:")
                     val actions = AgentRuntime.actions

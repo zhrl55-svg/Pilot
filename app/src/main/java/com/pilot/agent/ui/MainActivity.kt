@@ -594,6 +594,7 @@ private fun SettingsDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
     var preferOnDevice by remember { mutableStateOf(vm.settings.preferOnDevice) }
     var ttsEngine by remember { mutableStateOf(vm.settings.ttsEngine) }
     var musicPolicy by remember { mutableStateOf(vm.settings.musicPolicy) }
+    var sandboxIdleMin by remember { mutableStateOf(vm.settings.sandboxIdleMinutes.toString()) }
     var wakeWords by remember { mutableStateOf(vm.settings.wakeWords) }
     var wakeTone by remember { mutableStateOf(vm.settings.wakeTone) }
     var showEnroll by remember { mutableStateOf(false) }
@@ -721,7 +722,7 @@ private fun SettingsDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
                             Text("清空", fontSize = 12.sp, color = colors.error)
                         }
                     }
-                    SettingsSection(title = "沙箱挂载目录", hint = "SAF 选目录 bind 进容器 /var/minis/mounts/<名字>；重启沙箱进程后生效") {
+                    SettingsSection(title = "沙箱挂载目录", hint = "SAF 选目录 bind 进容器 /var/minis/mounts/<名字>；添加后热壳自动重启，立即生效") {
                         val mountPicker = androidx.activity.compose.rememberLauncherForActivityResult(
                             androidx.activity.result.contract.ActivityResultContracts.OpenDocumentTree(),
                         ) { uri ->
@@ -742,6 +743,12 @@ private fun SettingsDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
                         TextButton(onClick = { mountPicker.launch(null) }) {
                             Text("添加挂载目录", fontSize = 12.sp)
                         }
+                        SmallField(
+                            sandboxIdleMin, { sandboxIdleMin = it },
+                            "沙箱空闲回收（分钟，0=不回收）",
+                            KeyboardType.Number,
+                        )
+                        Hint("沙箱进程闲置后会自杀回收（释放约 130MB 内存），下次使用自动重启（1.5 秒）。")
                     }
                 }
             }
@@ -757,6 +764,7 @@ private fun SettingsDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
                         preferOnDevice = preferOnDevice,
                         ttsEngine = ttsEngine,
                         musicPolicy = musicPolicy,
+                        sandboxIdleMinutes = sandboxIdleMin.toIntOrNull()?.coerceIn(0, 120) ?: 5,
                         wakeWords = wakeWords.trim().ifEmpty { AgentSettings.DEFAULT_WAKE_WORDS },
                         wakeTone = wakeTone,
                         requireVoiceprint = requireVp,

@@ -48,11 +48,73 @@ class SandboxService : Service() {
     }
     private var host: IHostBridge? = null
 
+    /** 最后一次活动时间（空闲回收用）。 */
+    @Volatile private var lastActiveAt = System.currentTimeMillis()
+
     override fun onCreate() {
         super.onCreate()
         Dbg.i(TAG, ":sandbox 进程启动 pid=${android.os.Process.myPid()}")
         SandboxTerminal.init(this)
         registerHostHandlers()
+        startIdleReaper()
+    }
+
+    /**
+     * 空闲回收：闲置一段时间后自杀，释放 guest 的内存（实测 :sandbox 常驻 130MB）。
+     *
+     * ## 为什么需要
+     * guest 里的 proot + Alpine 常驻 130MB，对一台要跑端侧模型的手机不是小数。
+     * 而沙箱的使用是**突发型**的——用户偶尔喊一句「在终端里跑个 df」，
+     * 大部分时间它是闲的。闲着的 130MB 不如还给系统。
+     *
+     * ## 代价
+     * 重启后要重新 boot rootfs（~1.5 秒，rootfs 已在磁盘不用重解包）
+     * 并重建热壳（~150ms）。所以阈值不能太短——默认 5 分钟，
+     * 用户正在连续用的时候不会被打断。
+     *
+     * ## 为什么不主动 unbind
+     * 主进程不主动解绑（热壳值钱）。这里只杀沙箱自己：主进程下次调用时
+     * bindService 会拉起新进程，透明无感。
+     */
+    private fun startIdleReaper() {
+        val thresholdMs = idleTimeoutMs()
+        Thread {
+            var lastActive = System.currentTimeMillis()
+            while (!Thread.currentThread().isInterrupted) {
+                try {
+                    Thread.sleep(30_000L)
+                } catch (_: InterruptedException) {
+                    return@Thread
+                }
+                val idle = System.currentTimeMillis() - lastActive
+                if (idle >= thresholdMs) {
+                    Dbg.i(TAG, "空闲 ${idle / 1000}s（阈值 ${thresholdMs / 1000}s），回收 :sandbox 进程")
+                    // ★ 先通知主进程解绑：否则 BIND_AUTO_CREATE 会让系统
+                    //   立刻把服务再拉起来，回收白做。
+                    runCatching { host?.call("idleRecycle") }
+                    // 先释放 guest 资源再自杀，别留半个 proot 在那儿
+                    runCatching { ExecutionCoordinator.stopCurrentCommand() }
+                    stopSelf()
+                    // 给系统一点时间走正常的销毁流程
+                    try {
+                        Thread.sleep(500)
+                    } catch (_: InterruptedException) {
+                    }
+                    android.os.Process.killProcess(android.os.Process.myPid())
+                    return@Thread
+                }
+            }
+        }.apply {
+            name = "sandbox-idle-reaper"
+            isDaemon = true
+            start()
+        }
+    }
+
+    /** 空闲回收阈值（设置项可调，0 = 不回收）。 */
+    private fun idleTimeoutMs(): Long {
+        val v = com.pilot.agent.agent.AgentSettings.load().sandboxIdleMinutes
+        return if (v <= 0) Long.MAX_VALUE else v * 60_000L
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
@@ -60,6 +122,7 @@ class SandboxService : Service() {
     private val binder = object : ISandboxService.Stub() {
 
         override fun startCommand(session: String, command: String, timeoutMs: Long): Long {
+            lastActiveAt = System.currentTimeMillis()
             val jobId = jobs.getAndIncrement()
             io.execute {
                 val r = try {
@@ -72,6 +135,7 @@ class SandboxService : Service() {
                     Dbg.e(TAG, "job $jobId 异常", t)
                     Triple("沙箱异常：${t.message}", -2, 0L)
                 }
+                lastActiveAt = System.currentTimeMillis()
                 val b = Bundle().apply {
                     putString("out", r.first)
                     putInt("exit", r.second)

@@ -24,6 +24,7 @@ object SandboxTerminal {
     private const val TAG = "PilotSandbox"
     const val SESSION = "pilot-agent"
     @Volatile private var ready = false
+    @Volatile private var currentContext: Context? = null
     @Volatile private var remoteDisabled = false
 
     data class Result(val output: String, val exitCode: Int, val durationMs: Long) {
@@ -37,6 +38,7 @@ object SandboxTerminal {
         if (ready) return
         synchronized(this) {
             if (ready) return
+            currentContext = context.applicationContext
             ExecutionCoordinator.init(context)
             // 挂载目录存储注入（UI 添加的 SAF/POSIX 目录 → PRootKernel bind mounts）。
             // boot 是首条命令时才发生（ExecutionCoordinator 自动引导），这里注入来得及。
@@ -68,6 +70,8 @@ object SandboxTerminal {
     private suspend fun runLocal(command: String, timeoutMs: Long): Result {
         if (!ready) return Result("沙箱未初始化", -1, 0)
         Dbg.i(TAG, "run(local): $command")
+        // 挂载热更新：UI 改了挂载表之后，本进程的热壳也要重建
+        currentContext?.let { syncMountsIfChanged(it) }
         val r = ExecutionCoordinator.execute(
             sessionId = SESSION,
             command = command,
@@ -80,10 +84,42 @@ object SandboxTerminal {
     /** :sandbox 进程里跑（SandboxService 专用，勿在主进程调）。 */
     suspend fun runInService(context: Context, session: String, command: String, timeoutMs: Long): Triple<String, Int, Long> {
         if (!ready) init(context)
+        // ★ 跨进程热挂载：挂载表存在 SharedPreferences（主进程写、:sandbox 读），
+        //   所以 :sandbox 侧靠「指纹变了没有」判断要不要重建热壳。
+        syncMountsIfChanged(context)
         val r = ExecutionCoordinator.execute(
             sessionId = session, command = command, timeout = timeoutMs,
         )
         return Triple(r.output, r.exitCode, r.durationMs)
+    }
+
+    /**
+     * 挂载指纹（名字+路径的哈希）。变了就要重建 proot 的 bind 参数。
+     */
+    @Volatile private var mountsFingerprint: String = ""
+
+    private fun syncMountsIfChanged(context: Context) {
+        try {
+            val store = SandboxStores.mountedFolders(context)
+            // 跨进程：挂载表是主进程写的，:sandbox 侧的内存副本是旧的，
+            // 必须每次重新从磁盘读（SharedPreferences 跨进程缓存不可靠）。
+            store.reloadFromDisk()
+            val fp = store.entries.value
+                .map { "${it.name}=${it.resolvedHostPath.orEmpty()}" }
+                .sorted()
+                .joinToString("|")
+            if (fp == mountsFingerprint) return
+            val first = mountsFingerprint.isEmpty()
+            mountsFingerprint = fp
+            PRootKernel.applyMountedFoldersSnapshot(context.applicationContext)
+            if (!first) {
+                // 指纹变了 = 挂载集合变了 → 热壳的 -b 参数已过期，杀掉重建
+                ExecutionCoordinator.stopCurrentCommand()
+                Dbg.i(TAG, "检测到挂载变化（:sandbox），热壳已重建")
+            }
+        } catch (t: Throwable) {
+            Dbg.w(TAG, "挂载同步失败：${t.message}")
+        }
     }
 
     /** rootfs 状态一行字（status 通道用）。 */

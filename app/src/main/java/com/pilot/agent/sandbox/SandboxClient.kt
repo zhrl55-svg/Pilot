@@ -28,6 +28,9 @@ object SandboxClient {
     @Volatile private var binding = false
     private var deadCount = 0
 
+    /** Application context（bind/unbind 必须用它，Receiver 的 context 不行）。 */
+    @Volatile private var appContext: Context? = null
+
     private val pending = ConcurrentHashMap<Long, kotlinx.coroutines.CancellableContinuation<SandboxTerminal.Result>>()
 
     private val callback = object : ResultCallback.Stub() {
@@ -63,6 +66,29 @@ object SandboxClient {
             }
             Dbg.w(TAG, ":sandbox 进程断开（guest 崩溃或系统回收）")
         }
+    }
+
+    /**
+     * 主进程主动断开并**不重连**。
+     *
+     * 沙箱空闲回收时用它：沙箱进程自杀 → 系统会通知主进程 binder 断开 →
+     * 如果主进程还保持绑定，系统会把服务**再拉起来**（BIND_AUTO_CREATE 的语义），
+     * 回收就白做了。所以回收前必须先 unbindService。
+     *
+     * 解绑后下次真正有命令时 [ensureBound] 会重新 bind（那时才拉进程）。
+     */
+    fun disconnectForIdle() {
+        if (service == null && !binding) return
+        val ctx = appContext
+        if (ctx != null) runCatching { ctx.unbindService(connection) }
+        service = null
+        binding = false
+        pending.keys.toList().forEach { id ->
+            pending.remove(id)?.let { c ->
+                runCatching { c.resume(SandboxTerminal.Result("沙箱已回收", -3, 0)) }
+            }
+        }
+        Dbg.i(TAG, "已解除 :sandbox 绑定（空闲回收）")
     }
 
     /** 返回 null = 远端不可用（上层降级进程内）；非 null = 远端结果（含失败）。 */
@@ -114,6 +140,7 @@ object SandboxClient {
             //   （"BroadcastReceiver components are not allowed to bind to services"）。
             //   自检通道是 receiver 触发的，用它的 context 必炸——踩过一轮。
             val appCtx = context.applicationContext
+            appContext = appCtx
             val ok = appCtx.bindService(intent, connection, Context.BIND_AUTO_CREATE)
             Dbg.i(TAG, "bindService :sandbox -> $ok")
             if (!ok) {
