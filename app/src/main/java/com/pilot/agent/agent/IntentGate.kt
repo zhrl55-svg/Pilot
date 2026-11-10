@@ -49,6 +49,25 @@ object IntentGate {
         "终端", "沙箱", "命令", "跑个", "跑一下", "执行命",
     )
 
+    /**
+     * 自我介绍/身份类问题。
+     *
+     * ★ 为什么要单独列（老板 11-10 反馈：「你是谁这样的问题不要走规则，
+     *   模型交给模型回答」）：
+     *   原来靠 QUERY_HINTS 判，而 QUERY_HINTS 里有「是谁」——
+     *   「你是谁」包含「是谁」，于是被误判成查询类。
+     *   更糟的是查询类会去找数据源，没有数据源才 fallback 到模型，
+     *   等于绕了一圈才到模型，规则在这里纯属添乱。
+     *
+     *   判据刻意收窄到「你 + 身份/能力词」这类**明确在问模型自己**的说法，
+     *   避免误伤「谁是谁的联系人」这种真查询。
+     */
+    private val SELF_ASK = listOf(
+        "你是谁", "你叫什么", "你叫啥", "你叫什麼", "你是什么",
+        "你能做什么", "你会做什么", "你能干什么", "你会干什么",
+        "介绍一下你自己", "自我介绍", "你是什么助手", "你是什么ai",
+    )
+
     /** 纯交流的开头，命中就不当成任务 */
     private val CHAT_PREFIX = listOf(
         "你是谁", "你叫", "你能做什么", "你会", "你好", "在吗", "在不在",
@@ -74,7 +93,12 @@ object IntentGate {
         // 裸 shell 命令（"df -h"、"cat /etc/alpine-release"）没有中文动词，
         // 但首 token 命中沙箱工具白名单就是明确的任务意图
         val rawShell = HeuristicPlanner.looksLikeRawShellCommand(t)
+        // 在问模型自己 → 一定交给模型回答，不查数据源
+        val selfAsk = SELF_ASK.any { t.contains(it) }
 
+        // 在问自己 → 交流（模型回答）。放最前面，避免「是谁」这种
+        // 泛化查询词把它误判成数据查询。
+        if (selfAsk) return Kind.CHAT
         // 有操作动词 → 任务（哪怕同时有"查"，比如"打开XX查一下"）
         if (hasVerb || rawShell) return Kind.TASK
         // 纯交流开头且没有查询词 → 闲聊

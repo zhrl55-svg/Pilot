@@ -6,6 +6,8 @@ import android.content.Intent
 import android.os.Binder
 import android.os.Process
 import com.pilot.agent.Dbg
+import kotlinx.coroutines.runBlocking
+import okhttp3.MediaType.Companion.toMediaType
 import com.pilot.agent.agent.AgentSettings
 import com.pilot.agent.runtime.AgentRuntime
 
@@ -172,6 +174,40 @@ class RunReceiver : BroadcastReceiver() {
             Dbg.w(TAG, "触发请求缺少 goal / asr_test / llm_test")
             return
         }
+
+        // ★ 意图门：不是操作指令就别进 agent loop。
+        //   「你是谁」这类问题进 loop 会去乱点屏幕（真机实测过一句话触发 3 次乱点）。
+        //   走模型回答 —— 老板 11-10：「你是谁这样的问题不要走规则，模型交给模型回答」。
+        //   但 QUERY 类（查上证指数）要优先走 QueryEngine：更快、数据更准，
+        //   查不到才 fallback 到模型。
+        val kind = com.pilot.agent.agent.IntentGate.classify(goal)
+        if (kind != com.pilot.agent.agent.IntentGate.Kind.TASK) {
+            if (kind == com.pilot.agent.agent.IntentGate.Kind.QUERY) {
+                Thread {
+                    val answer = runCatching {
+                        runBlocking { com.pilot.agent.query.QueryEngine.handle(goal) }
+                    }.getOrNull()
+                    if (!answer.isNullOrBlank()) {
+                        AgentRuntime.speaker.speak(answer)
+                    } else {
+                        AgentRuntime.speaker.speak(
+                            runCatching { runBlocking { answerByModel(goal) } }
+                                .getOrDefault("我暂时没法回答。"),
+                        )
+                    }
+                }.apply { name = "query-answer"; isDaemon = true }.start()
+                return
+            }
+            Dbg.i(TAG, "非操作指令（$kind），交给模型回答：$goal")
+            // onReceive 不能阻塞（10 秒 ANR），扔到后台线程回答
+            Thread {
+                val reply = runCatching { runBlocking { answerByModel(goal) } }
+                    .getOrDefault("我暂时没法回答。")
+                AgentRuntime.speaker.speak(reply)
+            }.apply { name = "chat-answer"; isDaemon = true }.start()
+            return
+        }
+
         val loop = AgentRuntime.loop
         if (loop == null) {
             Dbg.e(TAG, "无障碍服务未连接，无法执行：$goal")
@@ -181,6 +217,64 @@ class RunReceiver : BroadcastReceiver() {
         Dbg.i(TAG, "broadcast run goal=$goal caller=$caller")
         // ui=false：后台触发时没人能点确认按钮，遇到需要确认的动作应快速放弃
         loop.start(AgentRuntime.scope, goal, ui = false)
+    }
+
+    /**
+     * 非操作类问题的模型回答（云端优先，端侧兜底）。
+     *
+     * 走 AgentRuntime 里同一套提示词，保证语音路径和广播路径回答一致。
+     */
+    private suspend fun answerByModel(text: String): String {
+        val s = com.pilot.agent.agent.AgentSettings.load()
+        val now = java.text.SimpleDateFormat("yyyy年M月d日 EEEE HH:mm", java.util.Locale.CHINA)
+            .format(java.util.Date())
+        // 云端
+        if (s.cloudReady) {
+            runCatching {
+                val body = org.json.JSONObject().apply {
+                    put("model", s.model)
+                    put("stream", false)
+                    put("messages", org.json.JSONArray().apply {
+                        put(org.json.JSONObject().apply {
+                            put("role", "system")
+                            put(
+                                "content",
+                                "你是手机助手 Pilot，运行在这台安卓手机上。现在是 $now。" +
+                                    "用一到两句话回答，简短口语化，不要用列表。" +
+                                    "你能开关应用、查天气和股票、播音乐、跑 shell 命令、做导航。",
+                            )
+                        })
+                        put(org.json.JSONObject().apply {
+                            put("role", "user")
+                            put("content", text)
+                        })
+                    })
+                }.toString()
+                val req = okhttp3.Request.Builder()
+                    .url(s.baseUrl.trimEnd('/') + "/chat/completions")
+                    .addHeader("Authorization", "Bearer ${s.apiKey}")
+                    .addHeader("Content-Type", "application/json")
+                    .post(okhttp3.RequestBody.create("application/json".toMediaType(), body))
+                    .build()
+                okhttp3.OkHttpClient().newCall(req).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        org.json.JSONObject(resp.body?.string().orEmpty())
+                            .optJSONArray("choices")?.optJSONObject(0)
+                            ?.optJSONObject("message")?.optString("content")
+                    } else null
+                }
+            }.getOrNull()?.takeIf { it.isNotBlank() }?.let { return it.trim().take(200) }
+        }
+        // 端侧兜底
+        val llm = AgentRuntime.localLlm
+        if (!llm.ensureReady()) return "我暂时没法回答。"
+        val noThink = if (llm.wantsNoThink) "/no_think" else ""
+        return llm.generate(
+            "system\n你是手机助手 Pilot，运行在这台安卓手机上，现在是 $now。" +
+                "能开关应用、查天气股票、播音乐、跑命令、做导航。" +
+                "回答简短口语化，不超过 25 个字。$noThink\n" +
+                "user\n$text\nassistant\n"
+        )?.trim()?.take(200) ?: "我暂时没法回答。"
     }
 
     private companion object {

@@ -7,6 +7,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.pilot.agent.Dbg
 import com.pilot.agent.agent.AgentEvent
 import com.pilot.agent.agent.AgentSettings
 import com.pilot.agent.agent.IntentGate
@@ -17,6 +18,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
 
 data class LogEntry(val id: Long, val kind: Kind, val text: String) {
     enum class Kind { USER, THINK, ACT, OBSERVE, DONE, ERROR }
@@ -25,6 +27,10 @@ data class LogEntry(val id: Long, val kind: Kind, val text: String) {
 data class ConfirmUi(val id: Long, val question: String, val risk: Risk)
 
 class AgentViewModel(app: Application) : AndroidViewModel(app) {
+
+    private companion object {
+        const val TAG = "PilotVM"
+    }
 
     var settings by mutableStateOf(AgentSettings.load())
         private set
@@ -405,37 +411,94 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * 闲聊/提问走这里：端侧小模型直接回答，不碰屏幕。
+     * 闲聊/提问走这里：**交给模型回答**，不碰屏幕。
      *
-     * 没有 TTS，所以只显示文字。要出声得再接一层播报，那是下一步。
+     * ★ 老板 11-10：「你是谁这样的问题不要走规则，模型交给模型回答」
+     *   所以顺序是：云端模型（能力强）→ 端侧小模型（离线兜底）。
+     *   之前只有端侧 0.3B，问「你能做什么」会答得干巴巴甚至答非所问。
+     *
+     * 端侧小模型不知道当前时间，prompt 里必须注入，否则问「今天几号」
+     * 会答成占位符。
      */
     private fun chat(text: String) {
         viewModelScope.launch {
-            add(LogEntry.Kind.THINK, "这句不是操作指令，交给端侧模型回答")
+            add(LogEntry.Kind.THINK, "这句不是操作指令，交给模型回答")
             val reply = withContext(Dispatchers.IO) {
-                val llm = AgentRuntime.localLlm
-                if (!llm.ensureReady()) {
-                    return@withContext null
-                }
-                val noThink = if (llm.wantsNoThink) "/no_think" else ""
-                // 小模型不知道当前时间，不注入的话问「今天几号」会答成占位符
                 val now = java.text.SimpleDateFormat("yyyy年M月d日 EEEE HH:mm", java.util.Locale.CHINA)
                     .format(java.util.Date())
-                llm.generate(
-                    "<|im_start|>system\n你是手机助手 Pilot，现在是 $now。" +
-                        "回答简短口语化，不超过 25 个字。$noThink<|im_end|>\n" +
-                        "<|im_start|>user\n$text<|im_end|>\n<|im_start|>assistant\n"
-                )
+                // 1) 云端模型优先
+                val cloud = cloudChat(text, now)
+                if (!cloud.isNullOrBlank()) return@withContext cloud
+                // 2) 端侧小模型兜底（离线 / 没配 key）
+                localChat(text, now)
             }
             if (reply.isNullOrBlank()) {
-                add(LogEntry.Kind.OBSERVE, "端侧模型不可用，这句没法回答。")
+                add(LogEntry.Kind.OBSERVE, "模型不可用，这句没法回答。")
             } else {
-                val clean = reply.trim().take(120)
+                val clean = reply.trim().take(200)
                 add(LogEntry.Kind.DONE, clean)
                 AgentRuntime.speaker.speak(clean)
             }
             refreshStatus()
         }
+    }
+
+    /** 云端模型回答（OpenAI 兼容接口）。 */
+    private suspend fun cloudChat(text: String, now: String): String? {
+        val s = AgentSettings.load()
+        if (!s.cloudReady) return null
+        return try {
+            val body = org.json.JSONObject().apply {
+                put("model", s.model)
+                put("stream", false)
+                put("messages", org.json.JSONArray().apply {
+                    put(org.json.JSONObject().apply {
+                        put("role", "system")
+                        put(
+                            "content",
+                            "你是手机助手 Pilot，运行在这台安卓手机上。现在是 $now。" +
+                                "用一到两句话回答，简短口语化，不要用列表。" +
+                                "你能开关应用、查天气和股票、播音乐、跑 shell 命令、做导航。",
+                        )
+                    })
+                    put(org.json.JSONObject().apply {
+                        put("role", "user")
+                        put("content", text)
+                    })
+                })
+            }.toString()
+            val req = okhttp3.Request.Builder()
+                .url(s.baseUrl.trimEnd('/') + "/chat/completions")
+                .addHeader("Authorization", "Bearer ${s.apiKey}")
+                .addHeader("Content-Type", "application/json")
+                .post(okhttp3.RequestBody.create("application/json".toMediaType(), body))
+                .build()
+            okhttp3.OkHttpClient().newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    Dbg.w(TAG, "云端对话失败 http=${resp.code}")
+                    return null
+                }
+                val json = org.json.JSONObject(resp.body?.string().orEmpty())
+                json.optJSONArray("choices")?.optJSONObject(0)
+                    ?.optJSONObject("message")?.optString("content")
+            }
+        } catch (t: Throwable) {
+            Dbg.w(TAG, "云端对话异常：${t.message}")
+            null
+        }
+    }
+
+    /** 端侧小模型回答（离线兜底）。 */
+    private suspend fun localChat(text: String, now: String): String? {
+        val llm = AgentRuntime.localLlm
+        if (!llm.ensureReady()) return null
+        val noThink = if (llm.wantsNoThink) "/no_think" else ""
+        return llm.generate(
+            "system\n你是手机助手 Pilot，运行在这台安卓手机上，现在是 $now。" +
+                "能开关应用、查天气股票、播音乐、跑命令、做导航。" +
+                "回答简短口语化，不超过 25 个字。$noThink\n" +
+                "user\n$text\nassistant\n"
+        )
     }
 
     fun run(goal: String) {
