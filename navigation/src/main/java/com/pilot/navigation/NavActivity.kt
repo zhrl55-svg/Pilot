@@ -128,6 +128,34 @@ class NavActivity : Activity(), AMapNaviViewListener {
                 opts.isAutoChangeZoom = true
                 opts.isTrafficBarEnabled = true   // 右侧路况条
                 opts.isSettingMenuEnabled = true  // 高德自己的设置菜单
+
+                // ★ 地图日夜自适应（两层，缺一不可）。
+                //
+                //   **踩了两个坑**：
+                //   1. 只设 `isNaviNight = true` → 界面元素变了，**底图还是白底**
+                //      （那个属性只管导航引导层的配色，不管地图瓦片）
+                //   2. 同时开 `isAutoNaviViewNightMode = true` → auto 把手动值覆盖，
+                //      刚进界面定位没就绪它就判白天，之后也不纠正
+                //
+                //   正确做法：
+                //   - `setMapStyle(MapStyle.NIGHT, "")` ← **切底图**（关键）
+                //   - `isNaviNight = true`            ← 切引导层/转向图标配色
+                //   - auto 关掉，按本地时间判断（18:00~06:00 夜间）
+                opts.isAutoNaviViewNightMode = false
+                runCatching {
+                    val hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
+                    val night = hour >= 18 || hour < 6
+                    val style = if (night) {
+                        com.amap.api.navi.enums.MapStyle.NIGHT
+                    } else {
+                        com.amap.api.navi.enums.MapStyle.DAY
+                    }
+                    // 切底图（第二参数是自定义样式文件的绝对路径，内置样式传空）
+                    opts.setMapStyle(style, "")
+                    // 切引导层配色
+                    opts.isNaviNight = night
+                    NLog.i(TAG, "地图配色：${if (night) "夜间" else "白天"}（本地 ${hour}点，style=$style）")
+                }.onFailure { NLog.w(TAG, "设日夜配色失败 ${it.message}") }
             }.onFailure { NLog.w(TAG, "viewOptions 设置失败 ${it.message}") }
 
             NLog.i(TAG, "AMapNaviView 创建完成")
@@ -208,13 +236,6 @@ class NavActivity : Activity(), AMapNaviViewListener {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
         }
-        // 设置：**不依赖高德那个「设置」按钮**。
-        //   实测高德的底部「设置」第一次点只是进入「浏览模式」
-        //   （底部变成「退出/继续导航/设置」），并不会回调 onNaviSetting；
-        //   再点一次才回调，用户很容易以为按钮坏了。
-        side.addView(pillButton("⚙", width = dp(52)) { showSettingsDialog() }.apply {
-            textSize = 18f
-        })
         side.addView(pillButton("🏠", width = dp(52)) { onHomeButton() }.apply {
             textSize = 18f
         })
@@ -233,6 +254,7 @@ class NavActivity : Activity(), AMapNaviViewListener {
         return wrap
     }
 
+    /** 导航界面上的悬浮按钮（深底浅字）。 */
     private fun pillButton(text: String, width: Int, onClick: () -> Unit): Button =
         Button(this).apply {
             this.text = text
@@ -307,14 +329,23 @@ class NavActivity : Activity(), AMapNaviViewListener {
     }
 
     /**
-     * 「设置」按钮。
+     * 高德底部「设置」按钮 → 弹 Pilot 的导航设置面板。
      *
-     * ★ 之前点了也没作用——同样是因为没实现回调。
-     *   现在弹 Pilot 自己的导航设置面板（播报详细度、到达自动退出等）。
+     * ## ★ 为什么要延迟 350ms
+     * 高德点「设置」后会**先把自己的界面切到浏览模式**
+     * （底部三栏变成「退出 / 继续导航 / 设置」，右侧弹出路况/刷新/缩放）。
+     * 这个切换会重建 AMapNaviView 的渲染层，
+     * 我们立刻弹 AlertDialog 会被它顶掉——**dialog 一闪就没**（实测）。
+     *
+     * 所以等它切完再弹。350ms 是实测能稳定弹出来的值
+     * （200ms 偶尔还会被吞）。
      */
     override fun onNaviSetting() {
-        NLog.i(TAG, "高德界面：设置")
-        showSettingsDialog()
+        NLog.i(TAG, "高德界面：设置（延迟 350ms 弹面板，避开高的 UI 切换）")
+        window.decorView.postDelayed({
+            runCatching { showSettingsDialog() }
+                .onFailure { NLog.e(TAG, "弹设置面板失败", it) }
+        }, 350)
     }
 
     override fun onStopSpeaking() {
@@ -343,7 +374,10 @@ class NavActivity : Activity(), AMapNaviViewListener {
         NLog.i(TAG, "路线策略变更 $strategy")
     }
     override fun onBroadcastModeChanged(mode: Int) = Unit
-    override fun onDayAndNightModeChanged(mode: Int) = Unit
+    override fun onDayAndNightModeChanged(mode: Int) {
+        // 0=白天 1=夜间（高德按定位所在地的日出日落自动切）
+        NLog.i(TAG, "地图日夜模式切换 mode=$mode")
+    }
     override fun onScaleAutoChanged(auto: Boolean) = Unit
     override fun onListenToVoiceDuringCallChanged(listen: Boolean) = Unit
     override fun onControlMusicVolumeModeChanged(mode: Int) = Unit
@@ -365,11 +399,17 @@ class NavActivity : Activity(), AMapNaviViewListener {
         val s = NavigationSettings.load(this)
         val pad = dp(20)
 
-        // 内容可能很长（常去地点 + 历史），用 ScrollView 包一层
-        val scroll = android.widget.ScrollView(this)
+        // ★ 必须用**浅色主题**的 Dialog。
+        //   导航界面是全屏黑（Theme.Black.NoTitleBar.Fullscreen），
+        //   默认 AlertDialog 会继承黑底 → 深色文字完全看不清（老板反馈「一片黑」）。
+        //   所以显式指定 Light 主题，并给内容区白底圆角卡片。
+        val scroll = android.widget.ScrollView(this).apply {
+            setBackgroundColor(Color.WHITE)
+        }
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(pad, dp(8), pad, dp(8))
+            setBackgroundColor(Color.WHITE)
+            setPadding(pad, dp(4), pad, dp(4))
         }
         scroll.addView(box)
 
@@ -377,10 +417,14 @@ class NavActivity : Activity(), AMapNaviViewListener {
         box.addView(sectionTitle("播报"))
         val levels = arrayOf("详细（全部念）", "标准（默认）", "简洁（只念转弯）")
         val levelText = TextView(this).apply {
-            text = levels[s.broadcastLevel.coerceIn(0, 2)]
-            setTextColor(Color.parseColor("#2196F3"))
+            text = "▸ " + levels[s.broadcastLevel.coerceIn(0, 2)]
+            setTextColor(Color.parseColor("#1565C0"))
             textSize = 15f
-            setPadding(0, dp(4), 0, dp(8))
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#F1F3F4"))
+                cornerRadius = dp(8).toFloat()
+            }
             setOnClickListener {
                 AlertDialog.Builder(this@NavActivity)
                     .setTitle("播报详细程度")
@@ -429,7 +473,7 @@ class NavActivity : Activity(), AMapNaviViewListener {
         box.addView(histBox)
         renderHistory(histBox)
 
-        AlertDialog.Builder(this)
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Light_Dialog_Alert)
             .setTitle("导航设置")
             .setView(scroll)
             .setPositiveButton("完成", null)
@@ -547,17 +591,18 @@ class NavActivity : Activity(), AMapNaviViewListener {
             .show()
     }
 
+    /** 分区标题：品牌绿 + 上方留白，浅底上层次清楚。 */
     private fun sectionTitle(text: String): TextView = TextView(this).apply {
         this.text = text
-        setTextColor(Color.parseColor("#212121"))
-        textSize = 14f
-        setPadding(0, dp(16), 0, dp(4))
+        setTextColor(Color.parseColor("#0F9D58"))
+        textSize = 13f
+        setPadding(0, dp(18), 0, dp(6))
         setTypeface(typeface, android.graphics.Typeface.BOLD)
     }
 
     private fun hintText(text: String): TextView = TextView(this).apply {
         this.text = text
-        setTextColor(Color.parseColor("#999999"))
+        setTextColor(Color.parseColor("#757575"))
         textSize = 13f
         setPadding(0, dp(4), 0, dp(8))
     }
@@ -571,7 +616,9 @@ class NavActivity : Activity(), AMapNaviViewListener {
         }
         row.addView(TextView(this).apply {
             this.text = text
+            setTextColor(Color.parseColor("#212121"))
             textSize = 14f
+            setPadding(0, dp(4), 0, dp(4))
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         })
         row.addView(TextView(this).apply {
@@ -603,11 +650,14 @@ class NavActivity : Activity(), AMapNaviViewListener {
         }
         row.addView(TextView(this).apply {
             this.text = text
+            setTextColor(Color.parseColor("#212121"))
             textSize = 15f
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         })
         row.addView(Switch(this).apply {
             isChecked = checked
+            // 固定宽度：不设的话在某些 ROM 上 Switch 的 on/off 文字会被裁掉
+            layoutParams = LinearLayout.LayoutParams(dp(56), dp(36))
             setOnCheckedChangeListener { _, v -> onChange(v) }
         })
         return row
