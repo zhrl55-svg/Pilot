@@ -208,6 +208,13 @@ class NavActivity : Activity(), AMapNaviViewListener {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
         }
+        // 设置：**不依赖高德那个「设置」按钮**。
+        //   实测高德的底部「设置」第一次点只是进入「浏览模式」
+        //   （底部变成「退出/继续导航/设置」），并不会回调 onNaviSetting；
+        //   再点一次才回调，用户很容易以为按钮坏了。
+        side.addView(pillButton("⚙", width = dp(52)) { showSettingsDialog() }.apply {
+            textSize = 18f
+        })
         side.addView(pillButton("🏠", width = dp(52)) { onHomeButton() }.apply {
             textSize = 18f
         })
