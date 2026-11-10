@@ -73,6 +73,22 @@ class Speaker(context: Context) {
         )
     }
 
+    /**
+     * 抢占式播报。
+     *
+     * @param interrupt true = 打断当前正在播的话（导航提示用）
+     *
+     * ★ 导航播报必须抢占：「前方 200 米右转」这种话晚 3 秒说出来就没意义了，
+     *   而普通播报（「已经帮你打开了设置」）晚一点无所谓。
+     */
+    fun speakPriority(text: String, interrupt: Boolean) {
+        if (interrupt) {
+            // 先停掉当前正在播的，避免两句话叠在一起
+            stop()
+        }
+        speak(text)
+    }
+
     fun stop() {
         system?.stop()
         minimax?.stop()

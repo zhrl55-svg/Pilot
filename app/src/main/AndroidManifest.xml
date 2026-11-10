@@ -128,6 +128,12 @@
             android:noHistory="true"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
+        <!-- 导航服务：独立进程（高德 native 87MB，崩溃隔离 + 内存独立计量） -->
+        <service
+            android:name="com.pilot.navigation.NavigationService"
+            android:exported="false"
+            android:process=":navigation" />
+
         <!-- 沙箱独立进程（崩溃隔离 + 内存独立计量，见 SandboxService 头注释） -->
         <service
             android:name=".sandbox.SandboxService"

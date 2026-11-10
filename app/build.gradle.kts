@@ -93,4 +93,7 @@ dependencies {
 
     // 端侧语音识别：sherpa-onnx（SenseVoice-Small）
     implementation(files("libs/sherpa-onnx.aar"))
+
+    // 导航模块（高德 SDK 87MB so 在 :navigation 里，见 NAV_MODULE_PLAN.md）
+    implementation(project(":navigation"))
 }

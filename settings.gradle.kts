@@ -22,3 +22,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "Pilot"
 include(":app")
+include(":navigation")

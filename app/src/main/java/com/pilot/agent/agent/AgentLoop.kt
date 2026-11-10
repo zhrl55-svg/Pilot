@@ -437,6 +437,26 @@ class AgentLoop(
                 usable
             }
 
+            "navigate" -> {
+                // 导航：高德 SDK 在 :navigation 进程，主进程只发指令 + 收播报。
+                val ctx = com.pilot.agent.PilotApp.instance
+                val jobId = com.pilot.agent.navigation.NavigationClient.startNavi(ctx, arg)
+                if (jobId == 0L) {
+                    emit(AgentEvent.Observe("导航服务没连上"))
+                    false
+                } else {
+                    // ★ 导航播报要**抢占**普通播报：「前方 200 米右转」不能等
+                    //   前面那句说完。onAnnounce 里用 speakPriority。
+                    com.pilot.agent.navigation.NavigationClient.onAnnounce = { text, priority ->
+                        com.pilot.agent.runtime.AgentRuntime.speaker.speakPriority(
+                            text, priority >= 1,
+                        )
+                    }
+                    emit(AgentEvent.Observe("开始导航去 $arg"))
+                    true
+                }
+            }
+
             else -> false
         }
     }

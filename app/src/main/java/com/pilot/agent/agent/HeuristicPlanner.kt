@@ -146,10 +146,44 @@ class HeuristicPlanner(
             )
         }
 
+        // 导航：「导航去XX」「带我去XX」「去XX」
+        ruleNavigation(goal)?.let { return it }
+
         // 沙箱终端：「在终端里跑 df -h」「执行命令 X」，或整句就是一条 shell 命令
         ruleTerminal(goal)?.let { return it }
 
         return null
+    }
+
+    /**
+     * 导航指令识别。
+     *
+     * 判据要宽——用户说法的变体太多（「导航去西湖」「带我去机场」
+     * 「去火车站」「开始导航」），正则穷举必然漏（nav-agent 就是因为
+     * 正则漏匹配被用户骂过一轮，最后改成整条链路交给模型）。
+     * 所以这里只做**高置信度**的抽取：拿到目的地就交给导航模块，
+     * 目的地解析（POI 搜索）由导航模块自己做。
+     */
+    private fun ruleNavigation(goal: String): AgentAction? {
+        if (!goal.contains("导航") && !goal.contains("带我去") && !goal.contains("带我去")) {
+            // 「去XX」这种太宽（"去设置"是开 App，不是导航），只在有导航词时才认
+            return null
+        }
+        val dest = Regex(
+            "(?:导航|带我去|去|前往|到)\\s*[「\"']?([^「」\"'，。？！,.?!]{2,20})[」\"']?$",
+        ).find(goal)?.groupValues?.get(1)?.trim()
+        if (dest.isNullOrEmpty() || dest.length < 2) return null
+        // 「导航」单独出现没目的地 → 交给模型规划
+        if (dest == "导航") return null
+        // 去掉粘连的动词尾巴：「导航去西湖」→ 正则吃到「去西湖」，
+        // 目的地其实只有「西湖」。多带一个字，高德就搜不到 POI 了。
+        val cleaned = dest.trimStart('去', '往', '到', '给')
+            .trim()
+        if (cleaned.length < 2) return null
+        return AgentAction(
+            action = "systemop", target = "navigate",
+            text = cleaned, summary = "导航去 $cleaned",
+        )
     }
 
     /**
