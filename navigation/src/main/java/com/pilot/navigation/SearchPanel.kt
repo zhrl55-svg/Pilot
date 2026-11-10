@@ -326,6 +326,15 @@ class SearchPanel(
         input?.setSelection(text.length)
     }
 
+    /** 清空输入和候选（结束导航时调）。 */
+    fun reset() {
+        input?.setText("")
+        candidates = emptyList()
+        resultBox?.removeAllViews()
+        resultScroll?.visibility = View.GONE
+        NLog.i(TAG, "搜索面板已重置")
+    }
+
     /** 显示/隐藏面板。 */
     fun toggle() {
         root.visibility = if (root.visibility == View.VISIBLE) View.GONE else View.VISIBLE

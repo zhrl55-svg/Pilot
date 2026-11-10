@@ -21,3 +21,4 @@ keystore/
 # 临时
 *.log
 *.tmp
+.workbuddy-ai/

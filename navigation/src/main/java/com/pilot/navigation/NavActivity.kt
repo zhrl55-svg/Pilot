@@ -1,6 +1,5 @@
 package com.pilot.navigation
 
-import android.app.Activity
 import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
@@ -42,7 +41,7 @@ import com.pilot.navigation.NavigationSettings.Companion.LEVEL_NORMAL
  * - 「设置」→ [AMapNaviViewListener.onNaviSetting]
  * 不实现这两个回调，点了就什么都不会发生（实测踩过）。
  */
-class NavActivity : Activity(), AMapNaviViewListener {
+class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener {
 
     companion object {
         private const val TAG = "PilotNav"
@@ -92,6 +91,12 @@ class NavActivity : Activity(), AMapNaviViewListener {
     /** 转弯提示框下方的搜索面板。 */
     private var searchPanel: SearchPanel? = null
 
+    /** 根容器（Compose 设置面板要挂到这上面，不能挂 Dialog）。 */
+    private var contentRoot: FrameLayout? = null
+
+    /** 设置面板的 ComposeView（关闭时移除）。 */
+    private var settingsComposeView: androidx.compose.ui.platform.ComposeView? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         NLog.attach(filesDir)
@@ -126,6 +131,7 @@ class NavActivity : Activity(), AMapNaviViewListener {
             ViewGroup.LayoutParams.MATCH_PARENT,
         )
         setContentView(root)
+        contentRoot = root
 
         runCatching {
             val v = AMapNaviView(this)
@@ -270,41 +276,59 @@ class NavActivity : Activity(), AMapNaviViewListener {
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT,
             )
-            // 按钮容器本身不拦截触摸，只有按钮自己响应
             isClickable = false
         }
 
-        // ---- 左下：语音（状态图标，无文字）----
-        val voice = buildVoiceButton()
-        wrap.addView(voice, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT, dp(44),
-        ).apply {
-            gravity = Gravity.BOTTOM or Gravity.START
-            leftMargin = dp(16)
-            bottomMargin = dp(96)   // 避开高德底部三栏
-        })
-
-        // ---- 右侧竖排：主页 / 退出（低频）----
+        // ★ 右侧竖排四个按钮（老板要求：语音移到最上，四个统一底色和圆边框）
+        //   顺序：语音 / 历史 / 主页 / 退出
+        //   全部用同一个 FLOATING_BTN 底色 + 同一个圆角，视觉是一组。
         val side = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
         }
-        side.addView(pillButton("🏠", width = dp(52)) { onHomeButton() }.apply {
-            textSize = 18f
-        })
-        side.addView(pillButton("✕", width = dp(52)) { onExitApp() }.apply {
-            textSize = 18f
-        })
+        side.addView(buildVoiceButton())
+        side.addView(roundButton("🕘") { showHistoryDialog() })
+        side.addView(roundButton("🏠") { onHomeButton() })
+        side.addView(roundButton("✕") { onExitApp() })
+
         wrap.addView(side, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT,
             FrameLayout.LayoutParams.WRAP_CONTENT,
         ).apply {
             gravity = Gravity.CENTER_VERTICAL or Gravity.END
-            rightMargin = dp(10)
+            rightMargin = dp(8)
         })
 
         pilotBar = side
         return wrap
+    }
+
+    /**
+     * 统一的圆形按钮（四个都用它）。
+     *
+     * 老板要求「四个按钮统一底色和圆边框」：
+     * 同底色 [NavColors.FLOATING_BTN]、同圆角半径、同尺寸、同间距。
+     */
+    private fun roundButton(icon: String, onClick: () -> Unit): Button {
+        val size = dp(NavColors.FLOATING_BTN_SIZE_DP)
+        val radius = dp(NavColors.FLOATING_BTN_RADIUS_DP).toFloat()
+        return Button(this).apply {
+            text = icon
+            setTextColor(NavColors.ON_SURFACE)
+            textSize = 18f
+            isAllCaps = false
+            setPadding(0, 0, 0, 0)
+            background = GradientDrawable().apply {
+                setColor(NavColors.FLOATING_BTN)
+                cornerRadius = radius
+                setStroke(dp(1), NavColors.OUTLINE)
+            }
+            layoutParams = LinearLayout.LayoutParams(size, size).apply {
+                bottomMargin = dp(10)
+            }
+            stateListAnimator = null
+            setOnClickListener { onClick() }
+        }
     }
 
     /** 导航界面上的悬浮按钮（深底浅字）。 */
@@ -347,8 +371,8 @@ class NavActivity : Activity(), AMapNaviViewListener {
      * 状态从主进程的 `files/voice_state.json` 轮询（跨进程，见 VoiceState）。
      */
     private fun buildVoiceButton(): Button {
-        val btn = pillButton("🎤", width = dp(56)) { onVoiceButton() }
-        btn.textSize = 20f
+        // 用统一的 roundButton，保证和另外三个长得一样
+        val btn = roundButton("🎤") { onVoiceButton() }
         // 呼吸/跳动动画：只改 scale，不动 layout（避免触发重新布局）
         voiceAnim = android.animation.ObjectAnimator.ofFloat(btn, "scaleX", 1f, 1.18f).apply {
             duration = 600
@@ -510,8 +534,36 @@ class NavActivity : Activity(), AMapNaviViewListener {
      *   高德的按钮只负责「通知宿主」，具体做什么由我们自己决定。
      */
     override fun onNaviCancel() {
-        NLog.i(TAG, "高德界面：退出导航")
-        stopNaviAndFinish()
+        NLog.i(TAG, "高德界面：退出导航 → 弹确认框")
+        // ★ 老板要求：底部「退出」弹出**「结束导航」确认框**。
+        //
+        //   为什么必须弹框（而不是直接结束）：
+        //   高德的退出按钮点下去，它内部会**立刻 finish 掉 NavActivity**
+        //   （日志实测 onNaviCancel → 1ms 后 onAMapNaviViewExit → onDestroy）。
+        //   所以要在它销毁之前弹框，用户确认后才走「结束导航」流程
+        //   （结束导航 + 重建地图界面）。
+        //
+        //   副作用：高德点退出后会先把底部切成「退出/继续导航/设置」的浏览模式，
+        //   如果用户选「继续导航」，点一下就是恢复，体验可接受。
+        showEndNaviConfirm()
+    }
+
+    /**
+     * 「结束导航」确认框。
+     *
+     * 用系统 AlertDialog（不用 Compose）——这里要**赶在高德销毁 Activity 之前**
+     * 弹出来，Compose 首次初始化要几十毫秒，可能来不及。
+     */
+    private fun showEndNaviConfirm() {
+        android.app.AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("结束导航")
+            .setMessage("要结束导航吗？地图会保留，可以继续搜别的地方。")
+            .setPositiveButton("结束导航") { _, _ ->
+                NLog.i(TAG, "用户确认结束导航")
+                endNaviKeepMap()
+            }
+            .setNegativeButton("继续导航", null)
+            .show()
     }
 
     override fun onAMapNaviViewExit() {
@@ -545,8 +597,8 @@ class NavActivity : Activity(), AMapNaviViewListener {
     }
 
     override fun onNaviBackClick(): Boolean {
-        // 返回键：退出导航（车机场景没有「返回上一页」的概念）
-        stopNaviAndFinish()
+        // 返回键：结束导航但不退出地图（和底部「退出」一致）
+        endNaviKeepMap()
         return true
     }
 
@@ -575,7 +627,186 @@ class NavActivity : Activity(), AMapNaviViewListener {
     override fun onEagleChanged(enabled: Boolean) = Unit
     override fun onNaviRouteHighlightChange(routeId: Long, mode: Int) = Unit
 
-    // ------------------------------------------------------------ 设置面板
+    /**
+     * 导航历史面板（右侧 🕘 按钮）。
+     *
+     * 从这里能：点一条直接再去、改别名、删掉。
+     * 和设置面板里的历史列表是同一份数据（NavigationSettings.history）。
+     */
+    private fun showHistoryDialog() {
+        val hist = NavigationSettings.load(this).history
+        if (hist.isEmpty()) {
+            AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("导航历史")
+                .setMessage("还没有导航记录")
+                .setPositiveButton("知道了", null)
+                .show()
+            return
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(NavColors.SURFACE)
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+        }
+        val scroll = android.widget.ScrollView(this).apply {
+            setBackgroundColor(NavColors.SURFACE)
+        }
+        scroll.addView(box)
+        for (h in hist.take(15)) {
+            val title = if (h.alias.isNotBlank()) "${h.alias}（${h.name}）" else h.name
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(12), dp(12), dp(12), dp(12))
+                background = GradientDrawable().apply {
+                    setColor(NavColors.SURFACE_VARIANT)
+                    cornerRadius = dp(10).toFloat()
+                }
+                isClickable = true
+                setOnClickListener {
+                    NLog.i(TAG, "历史点选：$title")
+                    startNaviWithRetry(h.alias.ifBlank { h.name }, 0)
+                }
+            }
+            row.addView(TextView(this).apply {
+                text = title
+                setTextColor(NavColors.ON_SURFACE)
+                textSize = 15f
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            })
+            row.addView(TextView(this).apply {
+                text = "删除"
+                setTextColor(NavColors.ERROR)
+                textSize = 13f
+                setPadding(dp(10), 0, dp(4), 0)
+                setOnClickListener {
+                    val cur = NavigationSettings.load(this@NavActivity)
+                    NavigationSettings.save(this@NavActivity, cur.copy(history = cur.history - h))
+                    NLog.i(TAG, "删除历史：${h.name}")
+                    toast("已删除")
+                }
+            })
+            box.addView(row, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { bottomMargin = dp(6) })
+        }
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("导航历史")
+            .setView(scroll)
+            .setPositiveButton("关闭", null)
+            .show()
+    }
+
+    // ------------------------------------------------------------ 设置面板（Compose）
+
+    /**
+     * 导航设置（Compose 版）。
+     *
+     * ★ 用 Compose 而不是传统 View 的原因：
+     *   老板要求「用主界面菜单的开关样式」——主界面是 Compose + Material3，
+     *   只有用同一个 `Switch` 组件才能完全一致。
+     *   传统 View 的 android.widget.Switch 在这个 ROM 的深色主题下看不见。
+     */
+    private fun showSettingsDialog() {
+        val state = androidx.compose.runtime.mutableStateOf(NavigationSettings.load(this))
+        var dialog: android.app.Dialog? = null
+
+        fun reload() {
+            state.value = NavigationSettings.load(this)
+        }
+
+        val cv = androidx.compose.ui.platform.ComposeView(this).apply {
+            setContent {
+                NavSettingsDialog(
+                    settings = state.value,
+                    onDismiss = { closeSettings() },
+                    onLevelChange = { lvl ->
+                        val cur = NavigationSettings.load(this@NavActivity)
+                        NavigationSettings.save(this@NavActivity, cur.copy(broadcastLevel = lvl))
+                        NLog.i(TAG, "播报档位 → $lvl")
+                        reload()
+                    },
+                    onToggle = { key, v ->
+                        val cur = NavigationSettings.load(this@NavActivity)
+                        val next = when (key) {
+                            "arriveAutoExit" -> cur.copy(arriveAutoExit = v)
+                            "keepScreenOn" -> cur.copy(keepScreenOn = v)
+                            "avoidJam" -> cur.copy(avoidJam = v)
+                            "autoZoom" -> cur.copy(autoZoom = v)
+                            else -> cur
+                        }
+                        NavigationSettings.save(this@NavActivity, next)
+                        if (key == "autoZoom") {
+                            runCatching { naviView?.viewOptions?.isAutoChangeZoom = v }
+                        }
+                        if (key == "keepScreenOn") {
+                            if (v) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                            else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                        }
+                        reload()
+                    },
+                    onAddFavorite = {
+                        // 添加流程还是用原来的 View 对话框（要输入框，Compose 里再写一套不值）
+                        // ★ this@NavActivity：lambda 里的 this 是 ComposeView
+                        val box = LinearLayout(this@NavActivity)
+                        addFavoriteDialog(box)
+                    },
+                    onDeleteFavorite = { f ->
+                        val cur = NavigationSettings.load(this@NavActivity)
+                        NavigationSettings.save(
+                            this@NavActivity,
+                            cur.copy(favorites = cur.favorites - f),
+                        )
+                        NLog.i(TAG, "删除常去地点：${f.label}")
+                        reload()
+                    },
+                    onFavoriteClick = { f ->
+                        closeSettings()
+                        startNaviWithRetry(f.label, 0)
+                    },
+                    onDeleteHistory = { h ->
+                        val cur = NavigationSettings.load(this@NavActivity)
+                        NavigationSettings.save(this@NavActivity, cur.copy(history = cur.history - h))
+                        NLog.i(TAG, "删除历史：${h.name}")
+                        reload()
+                    },
+                    onHistoryClick = { h ->
+                        closeSettings()
+                        startNaviWithRetry(h.alias.ifBlank { h.name }, 0)
+                    },
+                )
+            }
+        }
+
+        // ★ 不用 Dialog 承载 ComposeView！
+        //   Dialog 的 window 不在 Activity 的 View 树上，
+        //   ComposeView 找不到 ViewTreeLifecycleOwner，直接崩：
+        //   `IllegalStateException: ViewTreeLifecycleOwner not found from ComposeView`（实测）。
+        //   改成直接挂到 Activity 的根容器——LifecycleOwner 自然能继承，
+        //   而且 Compose 的 AlertDialog 会自己画遮罩层。
+        closeSettings()
+        contentRoot?.addView(
+            cv,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ),
+        )
+        settingsComposeView = cv
+        // 关闭回调要能移除这个 View
+        dialog = null
+        NLog.i(TAG, "弹出 Compose 设置面板")
+    }
+
+    /** 关闭设置面板（移除 ComposeView）。 */
+    private fun closeSettings() {
+        settingsComposeView?.let { cv ->
+            runCatching { contentRoot?.removeView(cv) }
+        }
+        settingsComposeView = null
+    }
+
+    // ------------------------------------------------------------ 设置面板（旧 View 版，降级保留）
 
     /**
      * 导航设置面板。
@@ -586,7 +817,7 @@ class NavActivity : Activity(), AMapNaviViewListener {
      * - 屏幕常亮 —— 导航时不能灭屏
      * - 躲避拥堵 / 自动缩放
      */
-    private fun showSettingsDialog() {
+    private fun showSettingsDialogLegacy() {
         val s = NavigationSettings.load(this)
         val pad = dp(20)
 
@@ -594,12 +825,14 @@ class NavActivity : Activity(), AMapNaviViewListener {
         //   导航界面是全屏黑（Theme.Black.NoTitleBar.Fullscreen），
         //   默认 AlertDialog 会继承黑底 → 深色文字完全看不清（老板反馈「一片黑」）。
         //   所以显式指定 Light 主题，并给内容区白底圆角卡片。
+        // 统一成主界面的深色主题（老板要求「统一配色」）：
+        // 深底 NavColors.SURFACE + 浅色文字 NavColors.ON_SURFACE
         val scroll = android.widget.ScrollView(this).apply {
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(NavColors.SURFACE)
         }
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(NavColors.SURFACE)
             setPadding(pad, dp(4), pad, dp(4))
         }
         scroll.addView(box)
@@ -610,15 +843,16 @@ class NavActivity : Activity(), AMapNaviViewListener {
         val levels = arrayOf("详细", "标准", "简洁")
         val levelText = TextView(this).apply {
             text = "▸ " + levels[s.broadcastLevel.coerceIn(0, 2)]
-            setTextColor(Color.parseColor("#1565C0"))
-            textSize = 16f
-            setPadding(dp(12), dp(12), dp(12), dp(12))
+            setTextColor(NavColors.PRIMARY)
+            textSize = 17f
+            setPadding(dp(14), dp(14), dp(14), dp(14))
             background = GradientDrawable().apply {
-                setColor(Color.parseColor("#F1F3F4"))
-                cornerRadius = dp(8).toFloat()
+                setColor(NavColors.SURFACE_VARIANT)
+                cornerRadius = dp(10).toFloat()
+                setStroke(dp(1), NavColors.OUTLINE)
             }
             setOnClickListener {
-                AlertDialog.Builder(this@NavActivity, android.R.style.Theme_DeviceDefault_Light_Dialog_Alert)
+                AlertDialog.Builder(this@NavActivity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
                     .setTitle("播报详细程度")
                     .setSingleChoiceItems(levels, NavigationSettings.load(this@NavActivity).broadcastLevel) { d, which ->
                         val cur = NavigationSettings.load(this@NavActivity)
@@ -666,7 +900,7 @@ class NavActivity : Activity(), AMapNaviViewListener {
         box.addView(histBox)
         renderHistory(histBox)
 
-        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Light_Dialog_Alert)
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("导航设置")
             .setView(scroll)
             .setPositiveButton("完成", null)
@@ -682,7 +916,9 @@ class NavActivity : Activity(), AMapNaviViewListener {
             return
         }
         for (f in favs) {
-            val row = rowWithDelete("${f.label}  ·  ${f.address.take(20)}") {
+            // 地址太长会把「删除」挤掉：只取前 12 个字
+            val addr = f.address.take(12).let { if (f.address.length > 12) "$it…" else it }
+            val row = rowWithDelete("${f.label}  ·  $addr") {
                 val cur = NavigationSettings.load(this)
                 NavigationSettings.save(this, cur.copy(favorites = cur.favorites - f))
                 NLog.i(TAG, "删除常去地点：${f.label}")
@@ -690,7 +926,7 @@ class NavActivity : Activity(), AMapNaviViewListener {
             }
             // 点整行 → 改名字 / 直接导航（老板要求「常去地点设置可编辑」）
             row.setOnClickListener {
-                AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Light_Dialog_Alert)
+                AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
                     .setTitle(f.label)
                     .setItems(arrayOf("改名字", "导航去这里")) { _, which ->
                         if (which == 0) renameFavorite(f, container)
@@ -708,7 +944,7 @@ class NavActivity : Activity(), AMapNaviViewListener {
             setText(f.label)
             setPadding(dp(16), dp(12), dp(16), dp(12))
         }
-        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Light_Dialog_Alert)
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("改名字")
             .setView(input)
             .setPositiveButton("保存") { _, _ ->
@@ -744,7 +980,7 @@ class NavActivity : Activity(), AMapNaviViewListener {
             }
             // 点文字 → 改别名 / 直接再导航
             row.setOnClickListener {
-                AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Light_Dialog_Alert)
+                AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
                     .setTitle(h.name)
                     .setItems(arrayOf("改个名字", "再去这里")) { _, which ->
                         if (which == 0) renameHistory(h)
@@ -763,7 +999,7 @@ class NavActivity : Activity(), AMapNaviViewListener {
             hint = "比如「公司」「丈母娘家」"
             setPadding(dp(16), dp(8), dp(16), dp(8))
         }
-        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Light_Dialog_Alert)
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("给「${h.name}」改个名字")
             .setView(input)
             .setPositiveButton("保存") { _, _ ->
@@ -795,7 +1031,7 @@ class NavActivity : Activity(), AMapNaviViewListener {
      * 2. **用当前位置**——最快，导航到哪就在哪加
      */
     private fun addFavoriteDialog(container: LinearLayout) {
-        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Light_Dialog_Alert)
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("添加常去地点")
             .setItems(arrayOf("输入地址搜索", "用当前位置")) { _, which ->
                 if (which == 0) addFavoriteBySearch(container) else addFavoriteByCurrent(container)
@@ -810,7 +1046,7 @@ class NavActivity : Activity(), AMapNaviViewListener {
             hint = "比如「张掖西站」「人民公园」"
             setPadding(dp(16), dp(12), dp(16), dp(12))
         }
-        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Light_Dialog_Alert)
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("搜索地点")
             .setView(input)
             .setPositiveButton("搜索") { _, _ ->
@@ -845,7 +1081,7 @@ class NavActivity : Activity(), AMapNaviViewListener {
         val names = list.map { c ->
             if (c.distance > 0) "${c.name} · ${c.distance}米" else c.name
         }.toTypedArray()
-        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Light_Dialog_Alert)
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("选一个地点")
             .setItems(names) { _, which ->
                 val c = list[which]
@@ -855,21 +1091,37 @@ class NavActivity : Activity(), AMapNaviViewListener {
             .show()
     }
 
-    /** 方式 2：用当前位置。 */
+    /**
+     * 方式 2：用当前位置（**反查成真实地址**，不显示经纬度）。
+     *
+     * 老板要求「当前位置不要显示经纬度，要解析为最近的地址」——
+     * 存成 `38.94478, 100.4` 用户根本不知道是哪。
+     * 反查要一次网络请求，所以先弹个「正在解析地址…」再回填。
+     */
     private fun addFavoriteByCurrent(container: LinearLayout) {
         val loc = NavigationService.peekLocationProvider()
         if (loc == null || loc.lat == 0.0) {
             toast("还没拿到定位，稍后再试")
             return
         }
-        askFavoriteLabel(
-            address = "当前位置（${String.format("%.5f", loc.lat)}, ${String.format("%.5f", loc.lon)}）",
-            address2 = "当前位置",
-            lat = loc.lat,
-            lon = loc.lon,
-            poiId = null,
-            container = container,
-        )
+        val lat = loc.lat
+        val lon = loc.lon
+        toast("正在解析地址…")
+        Thread {
+            // 反查人类可读地址（失败退回附近 POI 名，绝不显示经纬度）
+            val addr = GeoCoder.describe(lat, lon, fallback = "当前位置附近")
+            NLog.i(TAG, "当前位置解析为：$addr")
+            runOnUiThread {
+                askFavoriteLabel(
+                    address = addr,
+                    address2 = addr,
+                    lat = lat,
+                    lon = lon,
+                    poiId = null,
+                    container = container,
+                )
+            }
+        }.apply { name = "fav-regeo"; isDaemon = true }.start()
     }
 
     /** 问名字并存下来。
@@ -888,7 +1140,7 @@ class NavActivity : Activity(), AMapNaviViewListener {
             hint = "叫它什么？比如「家」「公司」"
             setPadding(dp(16), dp(12), dp(16), dp(12))
         }
-        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Light_Dialog_Alert)
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("起个名字")
             .setMessage(address.take(40))
             .setView(input)
@@ -915,13 +1167,13 @@ class NavActivity : Activity(), AMapNaviViewListener {
     private fun flatButton(text: String, onClick: () -> Unit): Button =
         Button(this).apply {
             this.text = text
-            setTextColor(Color.parseColor("#1565C0"))
-            textSize = 15f
+            setTextColor(NavColors.PRIMARY)
+            textSize = 16f
             isAllCaps = false
             background = GradientDrawable().apply {
-                setColor(Color.parseColor("#E3F2FD"))
-                cornerRadius = dp(8).toFloat()
-                setStroke(dp(1), Color.parseColor("#90CAF9"))
+                setColor(NavColors.SURFACE_VARIANT)
+                cornerRadius = dp(10).toFloat()
+                setStroke(dp(1), NavColors.OUTLINE)
             }
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(44),
@@ -940,7 +1192,7 @@ class NavActivity : Activity(), AMapNaviViewListener {
      */
     private fun sectionTitle(text: String): TextView = TextView(this).apply {
         this.text = text
-        setTextColor(Color.parseColor("#0F9D58"))
+        setTextColor(NavColors.PRIMARY)
         textSize = 12f
         setPadding(0, dp(16), 0, dp(6))
         setTypeface(typeface, android.graphics.Typeface.BOLD)
@@ -949,8 +1201,8 @@ class NavActivity : Activity(), AMapNaviViewListener {
 
     private fun hintText(text: String): TextView = TextView(this).apply {
         this.text = text
-        setTextColor(Color.parseColor("#757575"))
-        textSize = 13f
+        setTextColor(NavColors.ON_SURFACE_VARIANT)
+        textSize = 14f
         setPadding(0, dp(4), 0, dp(8))
     }
 
@@ -963,15 +1215,15 @@ class NavActivity : Activity(), AMapNaviViewListener {
         }
         row.addView(TextView(this).apply {
             this.text = text
-            setTextColor(Color.parseColor("#212121"))
-            textSize = 15f
-            setPadding(0, dp(6), 0, dp(6))
+            setTextColor(NavColors.ON_SURFACE)
+            textSize = 16f
+            setPadding(0, dp(8), 0, dp(8))
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         })
         row.addView(TextView(this).apply {
             this.text = "删除"
-            setTextColor(Color.parseColor("#E53935"))
-            textSize = 13f
+            setTextColor(NavColors.ERROR)
+            textSize = 14f
             setPadding(dp(12), 0, 0, 0)
             setOnClickListener { onDelete() }
         })
@@ -989,29 +1241,89 @@ class NavActivity : Activity(), AMapNaviViewListener {
         setPadding(0, dp(10), 0, 0)
     }
 
+    /**
+     * 设置行（**不用系统 Switch**）。
+     *
+     * ## 为什么不用 Switch
+     * 深色主题下 `android.widget.Switch` 的轨道默认色和面板背景都是深灰，
+     * 实测**完全看不见**（截图里右侧只有一个淡淡的小点）。
+     * 试过 `thumbTintList` / `trackTintList` 显式着色，在这个 ROM 上还是不生效
+     * （华为对 Switch 有自己的主题覆盖）。
+     *
+     * 所以改成**文字状态按钮**：直接显示「已开启 / 已关闭」，
+     * 开是青绿、关是灰，一眼能看清，点一下切换。
+     */
     private fun switchRow(text: String, checked: Boolean, onChange: (Boolean) -> Unit): View {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(6), 0, dp(6))
+            isClickable = true
         }
         row.addView(TextView(this).apply {
             this.text = text
-            setTextColor(Color.parseColor("#212121"))
-            // 16sp：老板说选项字太小看不见，放大一档
-            textSize = 16f
+            setTextColor(NavColors.ON_SURFACE)
+            textSize = 17f
+            setPadding(0, dp(6), dp(8), dp(6))
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         })
-        row.addView(Switch(this).apply {
-            isChecked = checked
-            // 固定宽度：不设的话在某些 ROM 上 Switch 的 on/off 文字会被裁掉
-            layoutParams = LinearLayout.LayoutParams(dp(56), dp(36))
-            setOnCheckedChangeListener { _, v -> onChange(v) }
-        })
+
+        val stateBtn = TextView(this).apply {
+            var on = checked
+            fun render() {
+                // this.text：外层函数参数也叫 text（val），不写 this 会指到参数上
+                this.text = if (on) "已开启" else "已关闭"
+                setTextColor(if (on) NavColors.SURFACE else NavColors.ON_SURFACE_VARIANT)
+                background = GradientDrawable().apply {
+                    setColor(if (on) NavColors.PRIMARY else NavColors.SURFACE_VARIANT)
+                    cornerRadius = dp(14).toFloat()
+                    if (!on) setStroke(dp(1), NavColors.OUTLINE)
+                }
+            }
+            render()
+            textSize = 14f
+            gravity = Gravity.CENTER
+            setPadding(dp(14), dp(7), dp(14), dp(7))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            )
+            isClickable = true
+            setOnClickListener {
+                on = !on
+                render()
+                onChange(on)
+                NLog.i(TAG, "设置「$text」→ $on")
+            }
+        }
+        row.addView(stateBtn)
+        // 点整行也能切换
+        row.setOnClickListener { stateBtn.performClick() }
         return row
     }
 
     // ------------------------------------------------------------ 生命周期
+
+    /**
+     * 结束导航但**保留地图界面**（老板要求）。
+     *
+     * 停引擎、清路线、播一句「已结束导航」，界面留在原地——
+     * 用户可以接着搜下一个地点，不用重新进导航。
+     */
+    private fun endNaviKeepMap() {
+        // ★ 关键：高德的「退出」按钮点下去，它内部会**自己 finish 掉 NavActivity**
+        //   （日志实测：onNaviCancel → 1ms 后 onAMapNaviViewExit → onDestroy）。
+        //   我们拦不住它的 finish（接口返回 void），所以只能**重新拉起**一个空的
+        //   导航界面——视觉上地图一直在，只是路线没了。
+        keepMapAfterExit = true
+        runCatching { NavigationService.peek()?.requestStop() }
+        runCatching { searchPanel?.reset() }
+        toast("已结束导航")
+        NLog.i(TAG, "导航已结束，稍后重建地图界面")
+    }
+
+    /** 标记：用户是按「结束导航」（而不是真的要退出），需要重建界面。 */
+    @Volatile
+    private var keepMapAfterExit = false
 
     private fun stopNaviAndFinish() {
         runCatching { NavigationService.peek()?.requestStop() }
@@ -1033,7 +1345,20 @@ class NavActivity : Activity(), AMapNaviViewListener {
         naviView = null
         if (current === this) current = null
         super.onDestroy()
-        NLog.i(TAG, "NavActivity onDestroy")
+        NLog.i(TAG, "NavActivity onDestroy（keepMap=$keepMapAfterExit）")
+        // 用户是「结束导航」而不是退出界面 → 立刻重建一个空的地图界面。
+        // 用 applicationContext 启动（this 已经不合法了）。
+        if (keepMapAfterExit) {
+            keepMapAfterExit = false
+            runCatching {
+                applicationContext.startActivity(
+                    Intent(applicationContext, NavActivity::class.java).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    },
+                )
+                NLog.i(TAG, "已重建地图界面（导航已结束）")
+            }.onFailure { NLog.w(TAG, "重建地图界面失败 \${it.message}") }
+        }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {

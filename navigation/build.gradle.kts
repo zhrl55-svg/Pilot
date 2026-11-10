@@ -3,6 +3,8 @@ import java.util.Properties
 plugins {
     id("com.android.library")
     alias(libs.plugins.kotlin.android)
+    // 设置面板用 Compose：需要 Compose 编译器插件（Kotlin 2.0 起强制要求）
+    alias(libs.plugins.kotlin.compose)
 }
 
 android {
@@ -24,6 +26,7 @@ android {
     buildFeatures {
         aidl = true
         buildConfig = true
+        compose = true
     }
 
     compileOptions {
@@ -39,6 +42,13 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.okhttp)
+
+    // Compose：设置面板要跟主界面用同一套 Material3 组件
+    implementation(libs.androidx.activity.compose)
+    implementation(platform(libs.androidx.compose.bom))
+    implementation(libs.androidx.compose.ui)
+    implementation(libs.androidx.compose.foundation)
+    implementation(libs.androidx.compose.material3)
 
     // 高德 SDK：jar（class + assets）与 so 分开带
     implementation(files("libs/AMap3DMap_11.3.100_AMapNavi_11.3.100_AMapSearch_9.8.1_AMapLocation_11.3.101_20260924.jar"))

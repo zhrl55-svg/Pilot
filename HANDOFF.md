@@ -1,6 +1,6 @@
 # 交接文档
 
-> 最后更新：2026-11-10 18:15
+> 最后更新：2026-11-11 00:15
 > 写给明天的自己（或者接手的人）。看完这一份就能接着干。
 
 ---
@@ -10,7 +10,7 @@
 **这个工程不需要读代码就能上手。** 按顺序做三件事：
 
 1. 读本文件的「一句话现状」和「明天的开工清单」
-2. 跑 `bash scripts/deploy-device.sh MDX0220A21035172`（编译+装+推模型+自检一条龙）
+2. 跑 `bash scripts/deploy-device.sh 192.168.2.32:5555`（编译+装+推模型+自检一条龙）
 3. 跑「开工清单」第 0 条的 10 条回归
 
 **给新会话的开场白可以直接复制这段**：
@@ -18,7 +18,7 @@
 ```
 接手 D:/phone agent 这个项目。先读 HANDOFF.md 和 ARCHITECTURE.md，
 然后按 HANDOFF 里「明天（或下次）的开工清单」第 0 条跑一遍回归测试，
-把结果告诉我。手机已经连着（MDX0220A21035172），服务器 rl@192.168.2.102 已配免密。
+把结果告诉我。手机已经连着（192.168.2.32:5555），服务器 rl@192.168.2.102 已配免密。
 ```
 
 **不要做的事**：
@@ -33,9 +33,14 @@
 Pilot 已经是一个**能在真机上跑通语音 agent** 的 App：喊「小派」唤醒 → 说指令 → 端侧识别 →
 判断是操作/查询/闲聊 → 执行或回答 → 播报。端侧模型、语音识别、语音合成都跑在本机。
 
-**已具备**：沙箱终端（proot + Alpine，11-10 移植完成，语音可直接跑 shell 命令）。
-**还没做的**：导航 SDK、多模块拆分、沙箱独立进程。
-**卡住的**：在线音乐（网易云频率风控）。
+**已具备**：
+- 沙箱终端（proot + Alpine，语音直接跑 shell 命令；SAF 热挂载 + 空闲回收都通了）
+- **导航全链路**（高德 SDK 官方导航界面 + 语音选候选 + 播报接管，11-10 深夜打通）
+
+**还没做的**：多模块拆分落地（方案已定，见 NAV_MODULE_PLAN.md）、ROM 预置。
+**卡住的**：
+- 在线音乐（网易云频率风控）
+- 云端 TTS 音色（MiniMax Key 未配，现在走系统华为智慧语音）
 
 ---
 
@@ -44,7 +49,7 @@ Pilot 已经是一个**能在真机上跑通语音 agent** 的 App：喊「小�
 | 项 | 值 |
 |---|---|
 | 工程目录 | `D:\phone agent` |
-| 真机 | 华为 P40 Pro，序列号 `MDX0220A21035172`（USB） |
+| 真机 | 华为 P40 Pro，序列号 `192.168.2.32:5555`（USB） |
 | 系统 | HarmonyOS 4.0 / API 31 / arm64-v8a |
 | 包名 | `com.pilot.agent.debug`（debug 包，可 run-as） |
 | 音乐服务器 | `rl@192.168.2.102`（Ubuntu 24.04，已配免密公钥） |
@@ -55,11 +60,11 @@ Pilot 已经是一个**能在真机上跑通语音 agent** 的 App：喊「小�
 ```bash
 # 编译 + 部署（一条搞定）
 cd "D:/phone agent"
-bash scripts/deploy-device.sh MDX0220A21035172
+bash scripts/deploy-device.sh 192.168.2.32:5555
 
 # 手动装（华为必须这样才能免审核）
 export MSYS_NO_PATHCONV=1
-adb -s MDX0220A21035172 install -r -t -g app/build/outputs/apk/debug/app-debug.apk
+adb -s 192.168.2.32:5555 install -r -t -g app/build/outputs/apk/debug/app-debug.apk
 
 # 看日志（EMUI 会丢弃 logcat，只能读文件日志）
 adb shell "run-as com.pilot.agent.debug cat files/pilot.log"
@@ -245,6 +250,114 @@ STOP 策略要记 `justSpoke` 窗口兜住，否则停了个寂寞。
 
 ---
 
+## 11-10 傍晚到深夜做了什么（沙箱收尾 + 导航全链路）
+
+> 这一段是 18:15 之后的工作，按时间顺序。每个「坑」都写了现象和解法，
+> 遇到类似问题时先在这里搜关键词。
+
+### 一、沙箱收尾件
+
+**SAF 热挂载**
+- 现象：加了挂载目录，`ls /var/minis/mounts/` 还是空的
+- 根因：proot 的 `-b` 参数在**进程 spawn 时**就冻结了，改快照对活着的热壳无效
+- 解法：挂载变化时杀热壳，下一条命令重建（照搬 minis 原版 T219-5）
+- 附带坑：挂载表原来存 SharedPreferences，但 SP 的跨进程缓存靠
+  `MODE_MULTI_PROCESS`，那个 flag API23 起被废弃 → `:sandbox` 永远读旧副本。
+  改存文件（`files/sandbox/mounts.json`，原子写 + mtime 判重）
+- 实测：热挂载 287ms 生效，guest 写 `/var/minis/mounts/Download/x.txt`
+  宿主 `/sdcard/Download/x.txt` 真出现
+
+**`:sandbox` 空闲回收**
+- 现象：回收后进程又活了
+- 根因：**沙箱自杀后主进程还持着 binder**，系统按 `BIND_AUTO_CREATE`
+  立刻把服务拉回来，回收白做
+- 解法：回收前先通知主进程 `unbindService`（用已有的 IHostBridge 反向通道）
+- 实测：回收后进程真消失，下条命令自动重启（145ms），挂载表还在
+
+### 二、导航全链路（重点）
+
+**架构**（详见 `navigation/ARCHITECTURE.md`）
+```
+主进程                              :navigation 进程
+IntentGate → HeuristicPlanner       NavigationService
+   ↓                                  ├─ LocationProvider（双通道定位）
+NavigationClient ──AIDL──→           ├─ WebPoiSearch / SdkPoiSearch（POI）
+   ↑                                  ├─ WebRoutePlanner / AmapNaviEngine（算路）
+   └── NavCallback ────────────────── ├─ RouteGuide（自研引导）
+        ↓                             └─ NavActivity（高德官方界面 + 我们的按钮）
+Speaker.speakNav（不可打断）
+```
+
+**高德接入踩的 3 个错误码**（反射 `PathPlanningErrCode` 打出来的对照表）
+
+| 码 | 含义 | 真因 | 解法 |
+|---|---|---|---|
+| 3 | ERROR_STARTPOINT | `List<NaviLatLng>` 重载不纠偏，起点落在不可通行区域 | 改 **String 重载**（"经度,纬度"），服务端吸附到道路 |
+| 22 | INVALID_USER_SCODE | **安全码格式**：高德控制台要求**带冒号**的 SHA1 | 填 `26:F6:15:CD:A0:6C:...` |
+| 6 | ERROR_ENDPOINT | POI 坐标是**停车场中心/建筑内部**，不在道路上 | 用 `NaviPoi(poiId, LatLng, name)` 传 **POI ID** |
+
+**Key 管理**
+- `local.properties`（不入库）：`AMAP_KEY_PILOT`（SDK Key，绑 com.pilot.agent）、
+  `AMAP_WEB_KEY`（Web Key，地点搜索/算路/逆地理编码）
+- ★ 坑：`local.properties` 的键**不会**自动变成 gradle project property
+  （那是 Android Studio 的行为），命令行构建拿到空串。
+  必须自己读 `Properties` 文件——`aapt2 dump` 看到 `value=""` 才发现
+
+**地图相关**
+- 地图停在北京市：两个原因叠加 —— ① `startService` 是**异步**的；
+  ② 定位器是**懒创建**的，没人调 `startNavi` 就永远不创建。
+  修：`peekLocationProvider()` 改成「拿不到就创建并 start」+ 轮询等 10 秒
+- 日夜自适应：`setMapStyle(MapStyle.NIGHT/DAY, "")` 切**底图**（关键）+
+  `isNaviNight` 切引导层。**开了 auto 就不要再手动设**，会打架
+- 缩放：14f 合适（13f 只剩一条主干道四周空白，16f 太近）
+
+**高德界面按钮的真面目**
+- 「退出」「设置」不是自己弹菜单，而是**回调给宿主**：
+  `onNaviCancel()` / `onNaviSetting()`。不实现就点了没反应
+- 点「退出」后高德会**自己 finish 掉 Activity**（日志：onNaviCancel → 1ms 后
+  onAMapNaviViewExit → onDestroy），拦不住。想保留地图只能 onDestroy 里重建
+- 点「设置」后高德会先切到浏览模式（底部变「退出/继续导航/设置」），
+  我们立刻弹的 Dialog 会被顶掉 → **延迟 350ms 弹**
+
+### 三、导航界面 UI（老板多轮迭代后的最终形态）
+
+```
+┌────────────────────────────────┐
+│ [高德转向提示]         卫星弱   │
+│ ┌────────────────────────┐     │
+│ │ 搜地点，或直接说出来    │     │ ← 灰色搜索框（右侧留 96dp）
+│ └────────────────────────┘     │
+│  ① 张掖西站停车场 · 320米       │ ← 候选列表
+│  ② 张掖汽车站 · 1.2公里         │
+│                          🎤    │ ← 语音（状态图标：静态/呼吸/跳动）
+│                          🕘    │ ← 历史
+│                          🏠    │ ← 主页
+│                          ✕     │ ← 退出 App
+│ 退出  3.2公里 11分钟    设置    │ ← 高德底栏
+└────────────────────────────────┘
+```
+
+- 四个按钮统一：`#B33A424D` 底 + 24dp 圆角 + 48dp + outline 描边
+- 设置面板用 **Compose**（Material3 Switch，和主界面同款），
+  配色抄主界面 PilotTheme（`NavColors` / `NavTheme`）
+- 播报三档：详细 / 标准 / 简洁
+- 常去地点：输入地址搜 / 用当前位置（**反查真实地址，不显示经纬度**）
+- 导航历史：算路**成功后**才记，可删可改别名
+
+### 四、这一轮新增的坑（都验证过）
+
+| # | 坑 | 现象 | 解法 |
+|---|---|---|---|
+| 1 | Gradle 构建失败被 grep 吞了 | 我 `grep ^e:` 过滤，而 `FAILURE: Build failed` 不带 `e:` 前缀 → 连装几次旧 APK，以为代码没生效 | **看完整构建输出**，别只 grep 编译错误行 |
+| 2 | Compose Compiler 插件 | `Starting in Kotlin 2.0, the Compose Compiler Gradle plugin is required` | 模块的 plugins 里要用 `alias(libs.plugins.kotlin.compose)`，`id(...)` 不带版本不生效 |
+| 3 | ComposeView 挂 Dialog 崩 | `ViewTreeLifecycleOwner not found from ComposeView` | Dialog 的 window 不在 Activity 的 View 树上 → 改成 `addView` 到根容器 |
+| 4 | lambda 里的 this | 在 `ComposeView{ setContent { ... } }` 里 `this` 是 ComposeView | 要写 `this@NavActivity` |
+| 5 | 华为 ROM 广播队列卡死 | `am broadcast` 的 `dispatchClockTime=1970-01-01`，广播永远不派发 | 用 `am start -n ...TriggerActivity` 绕开 |
+| 6 | 国产 ROM 丢 logcat | 日志完全看不到 | 写文件（`Dbg` / `NLog`），用 `run-as` 读 |
+| 7 | 改包名丢模型 | 包名从 `.debug` 改掉后卸载旧包，554MB 模型全删 | `deploy-device.sh` 的 `PKG` 要同步改；改包名前先备份 |
+| 8 | `run-as` 访问不了外部目录 | `cat /sdcard/Android/data/...` Permission denied | Android 11+ 限制，只能让 App 自己读 |
+| 9 | 截图坐标 ≠ 点击坐标 | 按截图比例点，落到别处（误触 SAF 文件夹选择） | 截图是缩放显示的，实际屏幕 `wm size` 看 |
+
 ## 模型清单（都在手机 `files/models/`）
 
 ```
@@ -315,7 +428,27 @@ adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent.debug --ez imp
 
 ---
 
-## 明天的开工清单
+## 下次的开工清单
+
+**第 0 条：10 条回归（必跑）**
+```bash
+bash scripts/deploy-device.sh 192.168.2.32:5555   # 编译+装+推模型
+adb shell "am start -n com.pilot.agent/com.pilot.agent.ui.TriggerActivity \
+    --es goal '<指令>'"                          # 触发（广播在这台 ROM 上不派发）
+```
+依次跑：打开设置 / 回桌面 / 返回 / 点击电池 / 打开蓝牙 /
+声音大一点 / 给10086打电话（预期失败，后台拦截）/ 查上证指数 / 你是谁 / 播放晴天
+
+**第 1 条：导航端到端**
+- 「导航去张掖西站」→ 看是否走 SDK 算路（日志 `SDK 算路结果=true`）
+- 地图是否停在张掖（日志 `地图挪到当前位置 ... zoom=14.0`）
+- 转弯提示、播报、红绿灯倒计时是否出来
+
+**第 2 条：待确认项**
+- 云端 TTS：设置页填 MiniMax Key（包名换过，配置被重置了）
+- 语音选候选链路（说地点 → 列 5 条 → 说「第2个」）还没端到端验过
+
+### 旧的开工清单（保留）
 
 ### 0. 先跑回归（10 分钟，别省）—— ✅ 11-10 17:40 已全部跑通（含两处护栏修复，见「今天做了什么」§0）
 
