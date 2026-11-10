@@ -21,4 +21,16 @@ keystore/
 # 临时
 *.log
 *.tmp
-.workbuddy-ai/
+# 只忽略 .workbuddy-ai 下的临时产物（截图等），
+# 记忆日志（.workbuddy-ai/memory/）要入库——换人接手时需要它
+.workbuddy-ai/*.png
+.workbuddy-ai/*.jpg
+.workbuddy-ai/map.png
+.workbuddy-ai/m2.png
+.workbuddy-ai/n*.png
+.workbuddy-ai/s*.png
+.workbuddy-ai/v*.png
+.workbuddy-ai/w*.png
+.workbuddy-ai/x*.png
+.workbuddy-ai/y*.png
+.workbuddy-ai/m1.png
