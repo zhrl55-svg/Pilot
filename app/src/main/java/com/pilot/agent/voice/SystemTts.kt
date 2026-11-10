@@ -49,8 +49,16 @@ class SystemTts(context: Context) : SpeechOutput {
                     val r = tts?.setLanguage(Locale.SIMPLIFIED_CHINESE)
                     langOk = r != TextToSpeech.LANG_MISSING_DATA && r != TextToSpeech.LANG_NOT_SUPPORTED
                     if (!langOk) {
-                        lastError = "系统 TTS 没有中文语音包"
-                        Dbg.w(TAG, lastError!!)
+                        // ★ 缺中文语音包时再试一次默认 locale——
+                        //   有些 ROM（华为智慧语音）默认是英文，中文包要单独下，
+                        //   但 setLanguage 失败不代表完全不能出声。
+                        val r2 = tts?.setLanguage(Locale.getDefault())
+                        val r3 = tts?.setLanguage(Locale.SIMPLIFIED_CHINESE)
+                        langOk = r2 != TextToSpeech.LANG_MISSING_DATA || r3 != TextToSpeech.LANG_MISSING_DATA
+                        if (!langOk) {
+                            lastError = "系统 TTS 没有中文语音包"
+                            Dbg.w(TAG, lastError!!)
+                        }
                     }
                     tts?.setSpeechRate(1.0f)
                     tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
@@ -68,7 +76,7 @@ class SystemTts(context: Context) : SpeechOutput {
                             doneCallbacks.remove(utteranceId)?.invoke()
                         }
                     })
-                    Dbg.i(TAG, "系统 TTS 就绪 lang=${if (langOk) "zh" else "缺中文包"}")
+                    Dbg.i(TAG, "系统 TTS 就绪 引擎=${engineName()} lang=${if (langOk) "zh" else "缺中文包"}")
                 } else {
                     lastError = "系统 TTS 初始化失败 status=$status"
                     Dbg.e(TAG, lastError!!)
@@ -81,6 +89,11 @@ class SystemTts(context: Context) : SpeechOutput {
             initLatch.countDown()
         }
     }
+
+    /** 当前用的哪个系统引擎（华为智慧语音 = com.huawei.hiai）。 */
+    private fun engineName(): String = runCatching {
+        tts?.defaultEngine?.orEmpty() ?: "未知"
+    }.getOrDefault("未知")
 
     override fun speak(text: String, onDone: () -> Unit, onError: (String) -> Unit) {
         if (text.isBlank()) {
