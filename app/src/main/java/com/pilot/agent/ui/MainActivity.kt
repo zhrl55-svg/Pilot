@@ -135,7 +135,26 @@ private fun AgentScreen(vm: AgentViewModel, onMicClick: () -> Unit) {
             .imePadding()
             .padding(horizontal = 16.dp, vertical = 10.dp),
     ) {
-        Header(vm, onSettings = { showSettings = true })
+        Header(
+            vm,
+            onSettings = { showSettings = true },
+            onNavOpen = {
+                // 直接拉起导航界面（NavActivity 在 :navigation 进程）
+                runCatching {
+                    ctx.startActivity(
+                        Intent().apply {
+                            setClassName(ctx.packageName, "com.pilot.navigation.NavActivity")
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        },
+                    )
+                }.onFailure {
+                    android.widget.Toast.makeText(
+                        ctx, "打不开导航界面：${it.message}",
+                        android.widget.Toast.LENGTH_SHORT,
+                    ).show()
+                }
+            },
+        )
         Spacer(Modifier.height(12.dp))
         StatusCard(
             vm,
@@ -222,7 +241,7 @@ private fun AgentScreen(vm: AgentViewModel, onMicClick: () -> Unit) {
 }
 
 @Composable
-private fun Header(vm: AgentViewModel, onSettings: () -> Unit) {
+private fun Header(vm: AgentViewModel, onSettings: () -> Unit, onNavOpen: () -> Unit) {
     val colors = MaterialTheme.colorScheme
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
         Box(
@@ -239,7 +258,16 @@ private fun Header(vm: AgentViewModel, onSettings: () -> Unit) {
                 color = colors.onSurfaceVariant,
             )
         }
-        TextButton(onClick = onSettings) { Text("设置", fontSize = 13.sp) }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            // ★ 导航入口（老板要求）：直接进高德导航界面。
+            //   放标题栏而不是输入栏——放输入栏会把输入框挤窄
+            //   （实测「让 Pilot 做什么？」被挤成两行）。
+            // 老板要求：只显示文字，不要图标
+            TextButton(onClick = onNavOpen) {
+                Text("导航", fontSize = 13.sp)
+            }
+            TextButton(onClick = onSettings) { Text("设置", fontSize = 13.sp) }
+        }
     }
 }
 

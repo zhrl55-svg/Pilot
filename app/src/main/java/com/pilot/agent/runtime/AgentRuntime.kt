@@ -19,6 +19,7 @@ import com.pilot.agent.voice.LocalAsr
 import com.pilot.agent.voice.LocalLlm
 import com.pilot.agent.voice.Speaker
 import com.pilot.agent.voice.VoiceprintGate
+import com.pilot.agent.voice.VoiceInput
 import com.pilot.agent.voice.WakeWordDetector
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
@@ -67,6 +68,27 @@ object AgentRuntime {
 
     /** 声纹门禁（WeSpeaker，模型在 filesDir） */
     val voiceprint: VoiceprintGate by lazy { VoiceprintGate(PilotApp.instance) }
+
+    /**
+     * 语音输入（**进程级单例**）。
+     *
+     * 为什么提到 Runtime：导航界面要能直接触发识别
+     * （`TriggerActivity` 收 `start_voice` intent），而它拿不到 ViewModel。
+     * 回调是可变的（见 VoiceInput），ViewModel 每次 attach 时替换即可。
+     */
+    @Volatile
+    var voiceInput: VoiceInput? = null
+
+    /** 拿（或创建）语音输入单例。 */
+    fun ensureVoiceInput(): VoiceInput {
+        voiceInput?.let { return it }
+        return VoiceInput(
+            context = PilotApp.instance,
+            asr = asr,
+            wake = wakeDetector,
+            gate = voiceprint,
+        ).also { voiceInput = it }
+    }
 
     /**
      * App 内入口索引。建一次要 1~3 秒（100+ App × 平均 10 个 Activity），

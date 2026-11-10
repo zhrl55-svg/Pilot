@@ -27,14 +27,37 @@ import java.net.URL
  * **必须**按距离过滤：超过 [MAX_SANE_DISTANCE_M] 的直接丢。
  * 全被丢掉 → 报「附近没有这个地点」，而不是导航到天边。
  */
-class WebPoiSearch {
+object WebPoiSearch {
 
-    companion object {
-        private const val BASE = "https://restapi.amap.com/v3/place/text"
-        private const val TAG = "PilotNavWebPoi"
+    private const val BASE = "https://restapi.amap.com/v3/place/text"
+    private const val TAG = "PilotNavWebPoi"
 
-        /** 超过这个距离的候选直接丢（防止导航到 1500 公里外） */
-        const val MAX_SANE_DISTANCE_M = 50_000
+    /** 超过这个距离的候选直接丢（防止导航到 1500 公里外） */
+    const val MAX_SANE_DISTANCE_M = 50_000
+
+    /**
+     * **同步**搜索（调用方自己放子线程）。
+     *
+     * 内部就是包一层回调版：HTTP 是同步的，onResult 在**调用线程**直接返回，
+     * 所以不需要 latch。给搜索面板这种「子线程里顺序取结果」的场景用。
+     */
+    fun searchBlocking(
+        keyword: String,
+        city: String?,
+        currentLat: Double,
+        currentLon: Double,
+        limit: Int = 10,
+    ): List<SdkPoiSearch.Candidate> {
+        var out: List<SdkPoiSearch.Candidate> = emptyList()
+        search(
+            keyword = keyword,
+            city = city,
+            currentLat = currentLat,
+            currentLon = currentLon,
+            onResult = { out = it },
+            onError = { NLog.w("PilotNavWebPoi", "同步搜索失败：$it") },
+        )
+        return out
     }
 
     /**

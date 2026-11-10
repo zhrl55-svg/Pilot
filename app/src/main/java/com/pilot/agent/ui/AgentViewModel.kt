@@ -150,6 +150,30 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     /** 第一次点麦克风时才建，避免启动就抢麦克风 */
     private fun ensureVoice() {
         if (voice != null) return
+        voice = AgentRuntime.ensureVoiceInput()
+        voice?.let { v ->
+            // 单例复用：把回调换成当前 ViewModel 的
+            v.onState = { voiceState = it }
+            v.onText = { text ->
+                add(LogEntry.Kind.USER, "「$text」")
+                when (IntentGate.classify(text)) {
+                    IntentGate.Kind.TASK -> run(text)
+                    IntentGate.Kind.QUERY -> query(text)
+                    IntentGate.Kind.CHAT -> chat(text)
+                }
+            }
+            v.onError = { msg -> add(LogEntry.Kind.ERROR, msg) }
+            v.onWake = { word -> add(LogEntry.Kind.OBSERVE, "唤醒「$word」，说吧") }
+            v.onVoiceprint = { score, pass ->
+                voiceprintInfo = "%.2f".format(score) + if (pass) " 通过" else " 拒绝"
+                add(
+                    LogEntry.Kind.OBSERVE,
+                    "声纹 ${"%.2f".format(score)} ${if (pass) "通过" else "不匹配，这句话会被丢弃"}",
+                )
+            }
+        }
+        if (voice != null) return
+        // 兜底：理论上走不到（ensureVoiceInput 一定返回实例）
         voice = VoiceInput(
             context = getApplication(),
             asr = AgentRuntime.asr,

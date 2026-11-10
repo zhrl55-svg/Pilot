@@ -48,13 +48,15 @@ class NavActivity : Activity(), AMapNaviViewListener {
         private const val TAG = "PilotNav"
 
         /**
-         * 初始缩放级别。
+         * 初始缩放级别（数字越大越近）。
          *
-         * 高德级别含义（数字越小范围越大）：
          *   17f = 车道级（导航跟随时）
-         *   **14f = 街区级（能看到周边几个街区，适合刚打开地图认路）**
+         *   15f = 街道级（能看清路口和小区名）
+         *   **14f = 街区级（周边几个街区，看路况够用）**
+         *   13f = 太大了（实测只剩一条主干道，四周空白，老板反馈「比例太大」）
          *   11f = 城区级
-         *    8f = 城市级
+         *
+         * 试过 13f 想看得更广，结果太太空——地图上没有参照物反而不知道该往哪走。
          */
         private const val INITIAL_ZOOM = 14f
 
@@ -87,11 +89,24 @@ class NavActivity : Activity(), AMapNaviViewListener {
     /** Pilot 自己的按钮栏。 */
     private var pilotBar: LinearLayout? = null
 
+    /** 转弯提示框下方的搜索面板。 */
+    private var searchPanel: SearchPanel? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         NLog.attach(filesDir)
         current = this
         NLog.i(TAG, "NavActivity onCreate")
+
+        // ★ 保证 NavigationService 在跑。
+        //   从主界面「导航」进来时，主进程可能还没 bind 过导航服务，
+        //   这时 NavigationService.instance 是 null → 搜索面板选定地点后
+        //   `peek()?.startNaviFromOuter()` 静默失败（**选定不导航的 bug 就是它**）。
+        //   startService 会触发 onCreate，instance 立刻有值。
+        runCatching {
+            startService(Intent(this, NavigationService::class.java))
+            NLog.i(TAG, "已确保 NavigationService 运行")
+        }.onFailure { NLog.w(TAG, "启动 NavigationService 失败 ${it.message}") }
 
         // 导航时屏幕常亮（开车看路线，不能灭屏）
         if (NavigationSettings.load(this).keepScreenOn) {
@@ -129,33 +144,14 @@ class NavActivity : Activity(), AMapNaviViewListener {
                 opts.isTrafficBarEnabled = true   // 右侧路况条
                 opts.isSettingMenuEnabled = true  // 高德自己的设置菜单
 
-                // ★ 地图日夜自适应（两层，缺一不可）。
+                // ★ 地图日夜：用高德的 **auto 模式**（老板指定）。
                 //
-                //   **踩了两个坑**：
-                //   1. 只设 `isNaviNight = true` → 界面元素变了，**底图还是白底**
-                //      （那个属性只管导航引导层的配色，不管地图瓦片）
-                //   2. 同时开 `isAutoNaviViewNightMode = true` → auto 把手动值覆盖，
-                //      刚进界面定位没就绪它就判白天，之后也不纠正
-                //
-                //   正确做法：
-                //   - `setMapStyle(MapStyle.NIGHT, "")` ← **切底图**（关键）
-                //   - `isNaviNight = true`            ← 切引导层/转向图标配色
-                //   - auto 关掉，按本地时间判断（18:00~06:00 夜间）
-                opts.isAutoNaviViewNightMode = false
-                runCatching {
-                    val hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
-                    val night = hour >= 18 || hour < 6
-                    val style = if (night) {
-                        com.amap.api.navi.enums.MapStyle.NIGHT
-                    } else {
-                        com.amap.api.navi.enums.MapStyle.DAY
-                    }
-                    // 切底图（第二参数是自定义样式文件的绝对路径，内置样式传空）
-                    opts.setMapStyle(style, "")
-                    // 切引导层配色
-                    opts.isNaviNight = night
-                    NLog.i(TAG, "地图配色：${if (night) "夜间" else "白天"}（本地 ${hour}点，style=$style）")
-                }.onFailure { NLog.w(TAG, "设日夜配色失败 ${it.message}") }
+                //   auto 会按「定位所在地的日出日落」判断，比按小时硬判更准
+                //   （夏天 19 点天还亮、冬天 17 点就黑）。
+                //   注意：开了 auto 就不要同时设 `isNaviNight` 和 `setMapStyle`——
+                //   那两个是手动模式，会跟 auto 打架（实测手动值会被 auto 覆盖，
+                //   表现为「设了夜间但还是白底」）。
+                opts.isAutoNaviViewNightMode = true
             }.onFailure { NLog.w(TAG, "viewOptions 设置失败 ${it.message}") }
 
             NLog.i(TAG, "AMapNaviView 创建完成")
@@ -163,28 +159,85 @@ class NavActivity : Activity(), AMapNaviViewListener {
             NLog.e(TAG, "AMapNaviView 创建失败", it)
         }
 
+        // ★ 转弯提示框下方的搜索面板（老板要求）
+        //   语音识别到地址会自动填进来，也可以手打；
+        //   停下 600ms 自动搜，列 5 条候选，说「第2个」或点一下就开始导航。
+        runCatching {
+            val panel = SearchPanel(
+                activity = this,
+                onPick = { c ->
+                    NLog.i(TAG, "搜索面板选定：${c.name} (${c.lat},${c.lon})")
+                    startNaviWithRetry(c.name, attempt = 0)
+                },
+                onSpeak = { text -> announceLocal(text) },
+            )
+            searchPanel = panel
+            root.addView(panel.root)
+            // 5 秒后开始轮询语音输入（等界面稳定）
+            root.postDelayed({ startAsrPolling() }, 5000)
+        }.onFailure { NLog.e(TAG, "创建搜索面板失败", it) }
+
         // Pilot 自己的按钮栏
         root.addView(buildPilotBar())
 
-        // ★ 地图默认停在北京市——必须在拿到第一次定位时手动 moveCamera
+        // ★ 地图默认停在北京市——必须手动 moveCamera 到当前位置。
+        //
+        //   **踩坑**：只挂 `loc.onLocation` 回调不够，原因有两个：
+        //   1. `startService()` 是**异步**的——服务 onCreate 比这行代码晚几十毫秒，
+        //      这时 `peekLocationProvider()` 还是 null
+        //   2. 就算服务起来了，定位器也是**懒创建**的，没人调 startNavi 就不启动
+        //   结果：地图永远停在北京市（老板反馈）。
+        //
+        //   所以：立刻试一次 + 起轮询兜底（最多 10 秒）。
         val loc = NavigationService.peekLocationProvider()
         if (loc != null) {
-            loc.onLocation = { lat, lon ->
-                if (!cameraMoved && lat != 0.0 && lon != 0.0) {
-                    cameraMoved = true
-                    runCatching {
-                        naviView?.map?.moveCamera(
-                            CameraUpdateFactory.newLatLngZoom(
-                                com.amap.api.maps.model.LatLng(lat, lon), INITIAL_ZOOM,
-                            ),
-                        )
-                        NLog.i(TAG, "地图挪到当前位置 $lat,$lon zoom=$INITIAL_ZOOM")
-                    }.onFailure { NLog.w(TAG, "moveCamera 失败 ${it.message}") }
-                }
-            }
+            loc.onLocation = { lat, lon -> centerOnMe(lat, lon) }
+            centerOnMe(loc.lat, loc.lon)   // 位置可能早就在了，立刻挪
         } else {
-            NLog.w(TAG, "拿不到 LocationProvider，地图可能停在北京市")
+            NLog.i(TAG, "导航服务还没就绪，等它起来再挪镜头")
         }
+        if (!cameraMoved) {
+            pollCenterOnMe(attempt = 0)
+        }
+    }
+
+    /** 把镜头挪到指定坐标（只挪一次）。 */
+    private fun centerOnMe(lat: Double, lon: Double) {
+        if (cameraMoved || lat == 0.0 || lon == 0.0) return
+        cameraMoved = true
+        runCatching {
+            naviView?.map?.moveCamera(
+                CameraUpdateFactory.newLatLngZoom(
+                    com.amap.api.maps.model.LatLng(lat, lon), INITIAL_ZOOM,
+                ),
+            )
+            NLog.i(TAG, "地图挪到当前位置 $lat,$lon zoom=$INITIAL_ZOOM")
+        }.onFailure {
+            cameraMoved = false   // 失败允许重试
+            NLog.w(TAG, "moveCamera 失败 ${it.message}")
+        }
+    }
+
+    /**
+     * 轮询等定位就绪（最多 10 秒，每 500ms 一次）。
+     *
+     * 服务冷启动 + 定位首帧都要时间。用户不能对着北京地图干等，
+     * 所以这边主动轮询，一拿到坐标就挪镜头。
+     */
+    private fun pollCenterOnMe(attempt: Int) {
+        if (cameraMoved || attempt >= 20) {
+            if (!cameraMoved) NLog.w(TAG, "等定位超时，地图仍在默认位置")
+            return
+        }
+        window.decorView.postDelayed({
+            if (cameraMoved) return@postDelayed
+            val loc = NavigationService.peekLocationProvider()
+            if (loc != null && loc.lat != 0.0 && loc.lon != 0.0) {
+                centerOnMe(loc.lat, loc.lon)
+            } else {
+                pollCenterOnMe(attempt + 1)
+            }
+        }, 500)
     }
 
     // ------------------------------------------------------------ Pilot 按钮栏
@@ -221,8 +274,8 @@ class NavActivity : Activity(), AMapNaviViewListener {
             isClickable = false
         }
 
-        // ---- 左下：语音（最常用，拇指区）----
-        val voice = pillButton("🎤 语音", width = dp(104)) { onVoiceButton() }
+        // ---- 左下：语音（状态图标，无文字）----
+        val voice = buildVoiceButton()
         wrap.addView(voice, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT, dp(44),
         ).apply {
@@ -255,40 +308,178 @@ class NavActivity : Activity(), AMapNaviViewListener {
     }
 
     /** 导航界面上的悬浮按钮（深底浅字）。 */
+    /**
+     * 悬浮按钮（灰色 + 高透明）。
+     *
+     * 老板要求「底色全部灰色并提高透明度」：
+     * 之前用 #CC1A1A1A（近黑 80% 不透明），压在地图上很重。
+     * 改成 #8C9E9E9E（中灰 55% 透明）——能看清图标，又不抢地图。
+     */
     private fun pillButton(text: String, width: Int, onClick: () -> Unit): Button =
         Button(this).apply {
             this.text = text
             setTextColor(Color.WHITE)
             textSize = 13f
             isAllCaps = false
-            setPadding(dp(8), 0, dp(8), 0)
+            setPadding(dp(4), 0, dp(4), 0)
             background = GradientDrawable().apply {
-                setColor(Color.parseColor("#CC1A1A1A"))
+                setColor(Color.parseColor("#8C9E9E9E"))
                 cornerRadius = dp(22).toFloat()
             }
             val lp = LinearLayout.LayoutParams(width, dp(44)).apply {
                 bottomMargin = dp(8)
             }
             layoutParams = lp
+            stateListAnimator = null   // 去掉按钮默认的阴影/抬升，免得跟地图打架
             setOnClickListener { onClick() }
         }
+
+    /**
+     * 语音按钮（状态图标版）。
+     *
+     * 老板要求「取消文字，播报时显示小喇叭动态、录音时麦克风动态、平时显示语音」。
+     *
+     * 三种状态：
+     * - **平时** 🎤 静态（提示可以说话）
+     * - **录音中** 🎤 呼吸动画（缩放到 1.15 再回来）
+     * - **播报中** 🔈 跳动动画（提示正在出声，别说话）
+     *
+     * 状态从主进程的 `files/voice_state.json` 轮询（跨进程，见 VoiceState）。
+     */
+    private fun buildVoiceButton(): Button {
+        val btn = pillButton("🎤", width = dp(56)) { onVoiceButton() }
+        btn.textSize = 20f
+        // 呼吸/跳动动画：只改 scale，不动 layout（避免触发重新布局）
+        voiceAnim = android.animation.ObjectAnimator.ofFloat(btn, "scaleX", 1f, 1.18f).apply {
+            duration = 600
+            repeatMode = android.animation.ValueAnimator.REVERSE
+            repeatCount = android.animation.ValueAnimator.INFINITE
+        }
+        voiceBtn = btn
+        startVoiceStatePolling()
+        return btn
+    }
+
+    /** 语音按钮 + 动画（状态轮询里用）。 */
+    private var voiceBtn: Button? = null
+    private var voiceAnim: android.animation.ObjectAnimator? = null
+    private var lastVoiceState: String = ""
+
+    /**
+     * 轮询语音状态（播报中 / 录音中 / 空闲）。
+     *
+     * ## 为什么轮询而不是推送
+     * 状态产生在主进程（TTS/ASR），导航界面在 `:navigation` 进程。
+     * 推的话要额外做一套 AIDL 回调 + 生命周期管理；
+     * 而这是**每秒一次读一个小文件**的事，轮询简单得多，开销可忽略
+     * （文件几百字节，readText 不到 1ms）。
+     */
+    private fun startVoiceStatePolling() {
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        val runnable = object : Runnable {
+            override fun run() {
+                val st = VoiceState.read(this@NavActivity)
+                if (st != lastVoiceState) {
+                    lastVoiceState = st
+                    applyVoiceState(st)
+                }
+                handler.postDelayed(this, 1000)
+            }
+        }
+        handler.post(runnable)
+    }
+
+    private fun applyVoiceState(state: String) {
+        val btn = voiceBtn ?: return
+        when (state) {
+            VoiceState.SPEAKING -> {
+                btn.text = "🔈"
+                voiceAnim?.start()
+            }
+            VoiceState.RECORDING -> {
+                btn.text = "🎤"
+                voiceAnim?.start()
+            }
+            else -> {
+                btn.text = "🎤"
+                voiceAnim?.cancel()
+                btn.scaleX = 1f
+                btn.scaleY = 1f   // 恢复原大小，动画只动 scaleX
+            }
+        }
+        NLog.i(TAG, "语音按钮状态：$state")
+    }
 
     private fun dp(v: Int): Int = TypedValue.applyDimension(
         TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics,
     ).toInt()
 
-    /** 语音按钮：回到主界面开语音识别（导航继续在后台跑）。 */
-    private fun onVoiceButton() {
-        NLog.i(TAG, "点击语音按钮")
-        // 拉起主进程的主界面并带「立刻开语音」标记
-        runCatching {
-            val i = Intent().apply {
-                setClassName(packageName, "com.pilot.agent.ui.MainActivity")
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                putExtra("start_voice", true)
+    /**
+     * 发起导航（带重试）。
+     *
+     * ★ 为什么需要重试：从主界面直接点「导航」进来时，
+     *   NavigationService 可能刚被 startService 拉起来，`instance` 还没赋值
+     *   （onCreate 在另一个线程跑）。这时 `peek()` 是 null，
+     *   直接调就是静默失败——**老板报的「选定后没有规划路线」就是这个**。
+     *   重试 3 次、每次 300ms，覆盖服务冷启动。
+     */
+    private fun startNaviWithRetry(destination: String, attempt: Int) {
+        val svc = NavigationService.peek()
+        if (svc != null) {
+            val jobId = runCatching { svc.startNaviFromOuter(destination, 0) }.getOrDefault(0L)
+            NLog.i(TAG, "发起导航「$destination」jobId=$jobId（第 ${attempt + 1} 次尝试）")
+            if (jobId != 0L) {
+                toast("正在规划去$destination 的路线")
+                return
             }
-            startActivity(i)
-        }.onFailure { NLog.w(TAG, "拉起主界面失败 ${it.message}") }
+        } else {
+            NLog.w(TAG, "NavigationService 还没就绪（第 ${attempt + 1} 次）")
+        }
+        if (attempt < 3) {
+            window.decorView.postDelayed({
+                startNaviWithRetry(destination, attempt + 1)
+            }, 300)
+        } else {
+            NLog.e(TAG, "发起导航失败：服务一直没就绪")
+            toast("导航服务没起来，请重开导航界面")
+        }
+    }
+
+    /** 让主进程播一句话（搜索候选播报、选定确认都用它）。 */
+    private fun announceLocal(text: String) {
+        runCatching { AgentBridge.speak(this, text) }
+    }
+
+    /**
+     * 轮询语音识别结果 → 喂给搜索面板。
+     *
+     * 为什么单独一个轮询而不是塞进 VoiceState 那个：
+     * 那个只管按钮图标（1 秒一次够了）；
+     * 识别结果要**及时**（用户说完马上就要填进搜索框并搜），
+     * 所以这个 400ms 一次。反正只是读一个小文件。
+     */
+    private fun startAsrPolling() {
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        val runnable = object : Runnable {
+            override fun run() {
+                runCatching { searchPanel?.pollVoiceInput() }
+                handler.postDelayed(this, 400)
+            }
+        }
+        handler.post(runnable)
+    }
+
+    /**
+     * 语音按钮：**在导航界面里直接开始语音识别**（不跳走）。
+     *
+     * 老板要求按钮要显示麦克风/喇叭动画，说明语音交互就发生在这个界面——
+     * 所以不能让用户切回主界面（切走就看不到路线了）。
+     * 主进程识别完把结果写进 VoiceState，这里轮询到就填进搜索框。
+     */
+    private fun onVoiceButton() {
+        NLog.i(TAG, "点击语音按钮，开始识别")
+        runCatching { AgentBridge.startVoice(this) }
+        toast("请说地点名，或说「第几个」")
     }
 
     /** 主页按钮：回主界面，导航继续。 */
@@ -415,18 +606,19 @@ class NavActivity : Activity(), AMapNaviViewListener {
 
         // ================= 播报 =================
         box.addView(sectionTitle("播报"))
-        val levels = arrayOf("详细（全部念）", "标准（默认）", "简洁（只念转弯）")
+        // 老板要求：只显示三档名字，不要括号里的解释
+        val levels = arrayOf("详细", "标准", "简洁")
         val levelText = TextView(this).apply {
             text = "▸ " + levels[s.broadcastLevel.coerceIn(0, 2)]
             setTextColor(Color.parseColor("#1565C0"))
-            textSize = 15f
+            textSize = 16f
             setPadding(dp(12), dp(12), dp(12), dp(12))
             background = GradientDrawable().apply {
                 setColor(Color.parseColor("#F1F3F4"))
                 cornerRadius = dp(8).toFloat()
             }
             setOnClickListener {
-                AlertDialog.Builder(this@NavActivity)
+                AlertDialog.Builder(this@NavActivity, android.R.style.Theme_DeviceDefault_Light_Dialog_Alert)
                     .setTitle("播报详细程度")
                     .setSingleChoiceItems(levels, NavigationSettings.load(this@NavActivity).broadcastLevel) { d, which ->
                         val cur = NavigationSettings.load(this@NavActivity)
@@ -463,8 +655,9 @@ class NavActivity : Activity(), AMapNaviViewListener {
         val favBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         box.addView(favBox)
         renderFavorites(favBox)
-        box.addView(pillButton("＋ 把当前位置设为常去地点", width = ViewGroup.LayoutParams.MATCH_PARENT) {
-            addFavoriteFromCurrent(favBox)
+        // 添加：两种方式（输入地址搜索 / 用当前位置）——老板要求
+        box.addView(flatButton("＋ 添加常去地点") {
+            addFavoriteDialog(favBox)
         })
 
         // ================= 导航历史 =================
@@ -489,13 +682,49 @@ class NavActivity : Activity(), AMapNaviViewListener {
             return
         }
         for (f in favs) {
-            container.addView(rowWithDelete("${f.label}  ·  ${f.address.take(20)}") {
+            val row = rowWithDelete("${f.label}  ·  ${f.address.take(20)}") {
                 val cur = NavigationSettings.load(this)
                 NavigationSettings.save(this, cur.copy(favorites = cur.favorites - f))
                 NLog.i(TAG, "删除常去地点：${f.label}")
                 renderFavorites(container)
-            })
+            }
+            // 点整行 → 改名字 / 直接导航（老板要求「常去地点设置可编辑」）
+            row.setOnClickListener {
+                AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Light_Dialog_Alert)
+                    .setTitle(f.label)
+                    .setItems(arrayOf("改名字", "导航去这里")) { _, which ->
+                        if (which == 0) renameFavorite(f, container)
+                        else NavigationService.peek()?.startNaviFromOuter(f.label, 0)
+                    }
+                    .show()
+            }
+            container.addView(row)
         }
+    }
+
+    /** 改常去地点的名字。 */
+    private fun renameFavorite(f: NavigationSettings.Favorite, container: LinearLayout) {
+        val input = android.widget.EditText(this).apply {
+            setText(f.label)
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+        }
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Light_Dialog_Alert)
+            .setTitle("改名字")
+            .setView(input)
+            .setPositiveButton("保存") { _, _ ->
+                val label = input.text.toString().trim()
+                if (label.isNotBlank()) {
+                    val cur = NavigationSettings.load(this)
+                    val newList = cur.favorites.map {
+                        if (it.lat == f.lat && it.lon == f.lon) it.copy(label = label) else it
+                    }
+                    NavigationSettings.save(this, cur.copy(favorites = newList))
+                    NLog.i(TAG, "常去地点改名：${f.label} → $label")
+                    renderFavorites(container)
+                }
+            }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     /** 渲染导航历史（点击直接再导航一次）。 */
@@ -515,7 +744,7 @@ class NavActivity : Activity(), AMapNaviViewListener {
             }
             // 点文字 → 改别名 / 直接再导航
             row.setOnClickListener {
-                AlertDialog.Builder(this)
+                AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Light_Dialog_Alert)
                     .setTitle(h.name)
                     .setItems(arrayOf("改个名字", "再去这里")) { _, which ->
                         if (which == 0) renameHistory(h)
@@ -534,7 +763,7 @@ class NavActivity : Activity(), AMapNaviViewListener {
             hint = "比如「公司」「丈母娘家」"
             setPadding(dp(16), dp(8), dp(16), dp(8))
         }
-        AlertDialog.Builder(this)
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Light_Dialog_Alert)
             .setTitle("给「${h.name}」改个名字")
             .setView(input)
             .setPositiveButton("保存") { _, _ ->
@@ -560,44 +789,162 @@ class NavActivity : Activity(), AMapNaviViewListener {
         svc.startNaviFromOuter(h.alias.ifBlank { h.name }, 0)
     }
 
-    /** 把当前位置存为常去地点（让用户起个名）。 */
-    private fun addFavoriteFromCurrent(container: LinearLayout) {
+    /**
+     * 添加常去地点。两种方式（老板要求）：
+     * 1. **直接输入地址**——搜出来选一条（支持跨城，比如「丈母娘家」在外地）
+     * 2. **用当前位置**——最快，导航到哪就在哪加
+     */
+    private fun addFavoriteDialog(container: LinearLayout) {
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Light_Dialog_Alert)
+            .setTitle("添加常去地点")
+            .setItems(arrayOf("输入地址搜索", "用当前位置")) { _, which ->
+                if (which == 0) addFavoriteBySearch(container) else addFavoriteByCurrent(container)
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** 方式 1：输入地址 → 搜 → 选一条 → 起名。 */
+    private fun addFavoriteBySearch(container: LinearLayout) {
+        val input = android.widget.EditText(this).apply {
+            hint = "比如「张掖西站」「人民公园」"
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+        }
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Light_Dialog_Alert)
+            .setTitle("搜索地点")
+            .setView(input)
+            .setPositiveButton("搜索") { _, _ ->
+                val q = input.text.toString().trim()
+                if (q.length < 2) {
+                    toast("至少输入两个字")
+                    return@setPositiveButton
+                }
+                toast("搜索中…")
+                Thread {
+                    val loc = NavigationService.peekLocationProvider()
+                    val list = runCatching {
+                        WebPoiSearch.searchBlocking(q, loc?.city, loc?.lat ?: 0.0, loc?.lon ?: 0.0, 10)
+                    }.getOrDefault(emptyList())
+                        .filter { it.distance <= WebPoiSearch.MAX_SANE_DISTANCE_M || it.distance == 0 }
+                        .take(8)
+                    runOnUiThread {
+                        if (list.isEmpty()) {
+                            toast("没找到「$q」")
+                        } else {
+                            pickFavoriteTarget(list, container)
+                        }
+                    }
+                }.apply { name = "fav-search"; isDaemon = true }.start()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** 搜到多条 → 让用户选一条，再起名。 */
+    private fun pickFavoriteTarget(list: List<SdkPoiSearch.Candidate>, container: LinearLayout) {
+        val names = list.map { c ->
+            if (c.distance > 0) "${c.name} · ${c.distance}米" else c.name
+        }.toTypedArray()
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Light_Dialog_Alert)
+            .setTitle("选一个地点")
+            .setItems(names) { _, which ->
+                val c = list[which]
+                askFavoriteLabel(c.name, c.address, c.lat, c.lon, c.poiId, container)
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** 方式 2：用当前位置。 */
+    private fun addFavoriteByCurrent(container: LinearLayout) {
         val loc = NavigationService.peekLocationProvider()
         if (loc == null || loc.lat == 0.0) {
             toast("还没拿到定位，稍后再试")
             return
         }
+        askFavoriteLabel(
+            address = "当前位置（${String.format("%.5f", loc.lat)}, ${String.format("%.5f", loc.lon)}）",
+            address2 = "当前位置",
+            lat = loc.lat,
+            lon = loc.lon,
+            poiId = null,
+            container = container,
+        )
+    }
+
+    /** 问名字并存下来。
+     * @param address 显示用的地址串
+     * @param address2 备用（当前位置时传"当前位置"）
+     */
+    private fun askFavoriteLabel(
+        address: String,
+        address2: String,
+        lat: Double,
+        lon: Double,
+        poiId: String?,
+        container: LinearLayout,
+    ) {
         val input = android.widget.EditText(this).apply {
-            hint = "「家」「公司」…"
-            setPadding(dp(16), dp(8), dp(16), dp(8))
+            hint = "叫它什么？比如「家」「公司」"
+            setPadding(dp(16), dp(12), dp(16), dp(12))
         }
-        AlertDialog.Builder(this)
-            .setTitle("这个名字叫什么？")
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Light_Dialog_Alert)
+            .setTitle("起个名字")
+            .setMessage(address.take(40))
             .setView(input)
             .setPositiveButton("保存") { _, _ ->
                 val label = input.text.toString().trim().ifBlank { "常去地点" }
                 val cur = NavigationSettings.load(this)
                 val fav = NavigationSettings.Favorite(
                     label = label,
-                    address = "当前位置（${String.format("%.5f", loc.lat)}, ${String.format("%.5f", loc.lon)}）",
-                    lat = loc.lat,
-                    lon = loc.lon,
+                    address = address,
+                    lat = lat,
+                    lon = lon,
+                    poiId = poiId,
                 )
                 NavigationSettings.save(this, cur.copy(favorites = cur.favorites + fav))
-                NLog.i(TAG, "新增常去地点：$label (${loc.lat},${loc.lon})")
+                NLog.i(TAG, "新增常去地点：$label → $address ($lat,$lon)")
                 renderFavorites(container)
+                toast("已添加「$label」")
             }
             .setNegativeButton("取消", null)
             .show()
     }
 
-    /** 分区标题：品牌绿 + 上方留白，浅底上层次清楚。 */
+    /** 平板风格按钮（浅底、描边），用在设置面板里。 */
+    private fun flatButton(text: String, onClick: () -> Unit): Button =
+        Button(this).apply {
+            this.text = text
+            setTextColor(Color.parseColor("#1565C0"))
+            textSize = 15f
+            isAllCaps = false
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#E3F2FD"))
+                cornerRadius = dp(8).toFloat()
+                setStroke(dp(1), Color.parseColor("#90CAF9"))
+            }
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(44),
+            ).apply { topMargin = dp(6); bottomMargin = dp(4) }
+            stateListAnimator = null
+            setOnClickListener { onClick() }
+        }
+
+    /**
+     * 分区标题。
+     *
+     * 老板反馈「二级菜单字体太大，导航行为后面的选项字体太小看不见」——
+     * 之前标题 13sp 加粗 + 选项 15sp，但在系统大字体下标题被放大得很显眼、
+     * 选项反而因为 Switch 占位被压窄显得小。
+     * 现在：标题 **12sp**（收小）、选项 **16sp**（放大），层级拉开。
+     */
     private fun sectionTitle(text: String): TextView = TextView(this).apply {
         this.text = text
         setTextColor(Color.parseColor("#0F9D58"))
-        textSize = 13f
-        setPadding(0, dp(18), 0, dp(6))
+        textSize = 12f
+        setPadding(0, dp(16), 0, dp(6))
         setTypeface(typeface, android.graphics.Typeface.BOLD)
+        letterSpacing = 0.04f
     }
 
     private fun hintText(text: String): TextView = TextView(this).apply {
@@ -617,8 +964,8 @@ class NavActivity : Activity(), AMapNaviViewListener {
         row.addView(TextView(this).apply {
             this.text = text
             setTextColor(Color.parseColor("#212121"))
-            textSize = 14f
-            setPadding(0, dp(4), 0, dp(4))
+            textSize = 15f
+            setPadding(0, dp(6), 0, dp(6))
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         })
         row.addView(TextView(this).apply {
@@ -651,7 +998,8 @@ class NavActivity : Activity(), AMapNaviViewListener {
         row.addView(TextView(this).apply {
             this.text = text
             setTextColor(Color.parseColor("#212121"))
-            textSize = 15f
+            // 16sp：老板说选项字太小看不见，放大一档
+            textSize = 16f
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         })
         row.addView(Switch(this).apply {

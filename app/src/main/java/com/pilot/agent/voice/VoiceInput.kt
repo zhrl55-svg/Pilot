@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import com.pilot.agent.Dbg
+import com.pilot.navigation.VoiceState
 import com.pilot.agent.agent.AgentSettings
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -28,12 +29,27 @@ class VoiceInput(
     private val asr: LocalAsr,
     private val wake: WakeWordDetector,
     private val gate: VoiceprintGate,
-    private val onState: (State) -> Unit = {},
-    private val onText: (String) -> Unit = {},
-    private val onError: (String) -> Unit = {},
-    private val onWake: (String) -> Unit = {},
-    private val onVoiceprint: (Float, Boolean) -> Unit = { _, _ -> },
+    onState: (State) -> Unit = {},
+    onText: (String) -> Unit = {},
+    onError: (String) -> Unit = {},
+    onWake: (String) -> Unit = {},
+    onVoiceprint: (Float, Boolean) -> Unit = { _, _ -> },
 ) {
+
+    /**
+     * 回调可变。
+     *
+     * ★ 为什么不是构造参数定死：
+     *   VoiceInput 现在是**进程级单例**（AgentRuntime 持有），
+     *   因为导航界面也要能触发语音（`TriggerActivity` 收 start_voice）。
+     *   而 UI 层的 ViewModel 会随 Activity 重建换新的，
+     *   所以每次 attach 时把回调换掉，单例本身和麦克风状态不用重建。
+     */
+    var onState: (State) -> Unit = onState
+    var onText: (String) -> Unit = onText
+    var onError: (String) -> Unit = onError
+    var onWake: (String) -> Unit = onWake
+    var onVoiceprint: (Float, Boolean) -> Unit = onVoiceprint
 
     enum class State { IDLE, WAKE_WAIT, LISTENING, RECOGNIZING, UNAVAILABLE }
 
@@ -106,6 +122,8 @@ class VoiceInput(
         vad?.reset()
         mode = Mode.LISTEN
         emitState(State.LISTENING)
+        // 通知导航界面「正在录音」（麦克风图标动起来）
+        runCatching { VoiceState.write(context, VoiceState.RECORDING) }
     }
 
     /** 提前结束这一句（用户点了"停"） */
@@ -120,6 +138,7 @@ class VoiceInput(
         capture?.stop()
         capture = null
         ring.clear()
+        runCatching { VoiceState.write(context, VoiceState.IDLE) }
         if (!busy.get()) emitState(State.IDLE)
         Dbg.i(TAG, "语音停止")
     }
@@ -287,6 +306,10 @@ class VoiceInput(
                 Dbg.i(TAG, "识别 ${ms}ms 音频")
                 val text = asr.transcribe(pcm)
                 val authorized = wakeAuthorized
+                // ★ 把识别结果写给导航界面（搜索框自动填入）
+                if (authorized && text != null) {
+                    runCatching { VoiceState.write(context, VoiceState.IDLE, text) }
+                }
                 main.post {
                     when {
                         !authorized -> onError("声纹不匹配，已忽略这句话")

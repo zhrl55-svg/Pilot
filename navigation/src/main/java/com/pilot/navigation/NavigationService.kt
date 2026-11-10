@@ -35,8 +35,25 @@ class NavigationService : Service() {
         @Volatile
         private var instance: NavigationService? = null
 
-        /** 拿当前服务的定位器（没起来就返回 null）。 */
-        fun peekLocationProvider(): LocationProvider? = instance?.location
+        /**
+         * 拿当前服务的定位器（**拿不到就创建并启动定位**）。
+         *
+         * ★ 之前是 `instance?.location` 直接读字段——但那个字段是**懒初始化**的，
+         *   只有 `startNavi()` 里调 `locationProvider()` 才会创建。
+         *   从主界面直接点「导航」进来时没人调 startNavi，字段一直是 null
+         *   → 地图永远停在北京市（老板反馈）。
+         *
+         *   现在：服务在就直接把定位器拉起来，导航界面一进来就有坐标可挪镜头。
+         */
+        fun peekLocationProvider(): LocationProvider? {
+            val svc = instance ?: return null
+            val loc = svc.location ?: LocationProvider(svc.applicationContext).also {
+                svc.location = it
+            }
+            // 还没启动就启动（幂等）
+            runCatching { loc.start() }
+            return loc
+        }
 
         /** 拿当前服务实例（NavActivity 要调 stop）。 */
         fun peek(): NavigationService? = instance
@@ -62,9 +79,8 @@ class NavigationService : Service() {
 
     /** 高德引擎（懒初始化，避免服务起来就吃 100MB+ native）。 */
     private var engine: AmapNaviEngine? = null
-    private var location: LocationProvider? = null
+    internal var location: LocationProvider? = null
     private var sdkPoi: SdkPoiSearch? = null
-    private var webPoi: WebPoiSearch? = null
     private var webRoute: WebRoutePlanner? = null
     private var guide: RouteGuide? = null
 
@@ -146,7 +162,7 @@ class NavigationService : Service() {
                 currentState = State.FAILED
                 emit(jobId, "error", msg, priority = 0, stateName = currentState.toString())
             }
-            webPoi().search(
+            WebPoiSearch.search(
                 keyword = destination,
                 city = loc.city,
                 currentLat = loc.lat,
@@ -396,12 +412,6 @@ class NavigationService : Service() {
             // 导航播报经 AIDL 回推主进程，走统一 TTS 队列（抢占式）
             emit(0, "announce", text, priority = priority, stateName = currentState.toString())
         }.also { guide = it }
-    }
-
-    /** Web API POI 搜索器（懒初始化）。 */
-    private fun webPoi(): WebPoiSearch {
-        webPoi?.let { return it }
-        return WebPoiSearch().also { webPoi = it }
     }
 
     /** SDK POI 搜索器（懒初始化）。 */

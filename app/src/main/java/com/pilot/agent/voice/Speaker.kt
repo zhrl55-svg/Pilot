@@ -3,6 +3,7 @@ package com.pilot.agent.voice
 import android.content.Context
 import com.pilot.agent.Dbg
 import com.pilot.agent.agent.AgentSettings
+import com.pilot.navigation.VoiceState
 
 /**
  * 播报路由：按设置选系统 TTS 还是 MiniMax。
@@ -116,6 +117,9 @@ class Speaker(context: Context) {
         // 播报只说重点。UI 上的日志可以很长，念出来超过 10 秒就没人听了。
         val spoken = if (t.length > 60) t.take(60) + "……" else t
 
+        // ★ 通知导航界面「正在播报」（显示喇叭动画）
+        runCatching { VoiceState.write(appContext, VoiceState.SPEAKING) }
+
         // ★ 播报前抢一下音频焦点（TRANSIENT_MAY_DUCK）：系统会把音乐压低，
         //   而不是直接停掉——「播放一会自动就停了」的另一半原因。
         // ★ 同时占住麦克风闸门：TTS 自己的声音会被麦克风录进去，
@@ -127,6 +131,7 @@ class Speaker(context: Context) {
             onDone = {
                 runCatching { gate.close() }
                 runCatching { speechFocus.close() }
+                runCatching { VoiceState.write(appContext, VoiceState.IDLE) }
                 if (isNav) onNavSpoken()
             },
             onError = { msg ->
@@ -159,6 +164,7 @@ class Speaker(context: Context) {
                 } else {
                     runCatching { gate.close() }
                     runCatching { speechFocus.close() }
+                    runCatching { VoiceState.write(appContext, VoiceState.IDLE) }
                     if (isNav) onNavSpoken()
                 }
             },
@@ -177,6 +183,7 @@ class Speaker(context: Context) {
     fun stop() {
         system?.stop()
         minimax?.stop()
+        runCatching { VoiceState.write(appContext, VoiceState.IDLE) }
     }
 
     fun release() {

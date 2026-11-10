@@ -47,6 +47,21 @@ class TriggerActivity : Activity() {
     private fun handle(intent: Intent?) {
         val i = intent ?: return
 
+        // 开始一次语音识别（导航界面点了麦克风）
+        if (i.getBooleanExtra("start_voice", false)) {
+            Dbg.i(TAG, "请求开始语音识别")
+            runCatching { com.pilot.agent.runtime.AgentRuntime.voiceInput?.startListening() }
+            return
+        }
+
+        // 让主进程播一句话（导航界面的候选播报）
+        val speakText = i.getStringExtra("speak_text")
+        if (!speakText.isNullOrBlank()) {
+            Dbg.i(TAG, "请求播报：$speakText")
+            runCatching { com.pilot.agent.runtime.AgentRuntime.speaker.speakNav(speakText) }
+            return
+        }
+
         // 停止播报（导航界面点「停止播报」时通知过来）
         if (i.getBooleanExtra("stop_speaking", false)) {
             Dbg.i(TAG, "收到停止播报指令")
