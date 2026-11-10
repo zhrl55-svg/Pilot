@@ -145,6 +145,8 @@ class AmapNaviEngine(
         strategy: Int = STRATEGY_RECOMMEND,
         startLat: Double = 0.0,
         startLon: Double = 0.0,
+        /** POI ID（有就用 NaviPoi 重载，SDK 会找正确入口）。 */
+        poiId: String? = null,
     ) {
         val n = navi ?: return
         // ★★ 起点/终点用 **String 重载**（"经度,纬度"），这是关键。
@@ -158,8 +160,6 @@ class AmapNaviEngine(
         //   「起点用"经度,纬度"字符串传给 calculateDriveRoute 的 String 重载，
         //     由 SDK 内部处理，省掉 GeocodeSearch 依赖」
         //   String 重载会走服务端纠偏，起点会吸附到最近道路 → 算路成功。
-        val startStr = "${round6(startLon)},${round6(startLat)}"
-        val endStr = "${round6(lon)},${round6(lat)}"
         routeOk = false
         routeLatch = java.util.concurrent.CountDownLatch(1)
         val pathStrategy = PathPlanningStrategy.DRIVING_MULTIPLE_ROUTES_DEFAULT
@@ -169,8 +169,32 @@ class AmapNaviEngine(
         //   不设的话算路可能直接失败（errorCode=3）。
         applyCarInfo(n)
         runCatching {
-            val ok = n.calculateDriveRoute(startStr, endStr, null, pathStrategy)
-            NLog.i(TAG, "算路 $startStr → $endStr ($name) ok=$ok strategy=$pathStrategy")
+            // ★ 有 POI ID 就用 **NaviPoi 重载**——这是解决 errorCode=6
+            //   （ERROR_ENDPOINT 终点错误）的关键。
+            //
+            //   原因：「张掖西站停车场」这类 POI 的经纬度是**停车场中心**，
+            //   不在可通行道路上，SDK 拿纯坐标算路会报终点错误。
+            //   传 POI ID 后 SDK 会查 POI 的**道路入口坐标**再算路。
+            val ok = if (poiId.isNullOrBlank()) {
+                // 没 POI ID：退回 String 重载（服务端会做纠偏）
+                n.calculateDriveRoute(
+                    "${round6(startLon)},${round6(startLat)}",
+                    "${round6(lon)},${round6(lat)}",
+                    null, pathStrategy,
+                )
+            } else {
+                val startPoi = com.amap.api.navi.model.NaviPoi(
+                    "", com.amap.api.maps.model.LatLng(round6(startLat), round6(startLon)), "起点",
+                )
+                val endPoi = com.amap.api.navi.model.NaviPoi(
+                    poiId, com.amap.api.maps.model.LatLng(round6(lat), round6(lon)), name,
+                )
+                n.calculateDriveRoute(startPoi, endPoi, null, pathStrategy)
+            }
+            NLog.i(
+                TAG,
+                "算路 起点($startLat,$startLon) → $name($lat,$lon) poiId=${poiId?.take(12)} ok=$ok",
+            )
             onStateChange("正在规划去${name}的路线")
         }.onFailure {
             NLog.e(TAG, "算路失败", it)
@@ -276,19 +300,63 @@ class AmapNaviEngine(
      *   我们只转文本，不自己发声。
      */
     override fun onGetNavigationText(type: Int, text: String?) {
-        if (stopRequested) return
-        val t = text?.trim().orEmpty()
-        if (t.isEmpty()) return
-        NLog.i(TAG, "导航播报 type=$type text=$t")
-        onAnnounce(t, priorityOf(type))
+        announceOnce(text, priorityOf(type))
     }
 
-    /** 旧版 SDK 的单参数回调（两种可能同时到达，重复播报由上层节流）。 */
+    /**
+     * 旧版 SDK 的单参数回调。
+     *
+     * ★ 两个回调**会同时到达**（实测同一句话播了两遍）。
+     *   nav-agent 的注释也写了「两种 onGetNavigationText 在各版本 SDK 中
+     *   可能只来一种，也可能同时到达」。所以必须去重。
+     */
     override fun onGetNavigationText(text: String?) {
+        announceOnce(text, PRIORITY_NAV)
+    }
+
+    /** 最近一次播报的文本 + 时间，用来去掉重复回调。 */
+    @Volatile private var lastAnnounceText: String = ""
+    @Volatile private var lastAnnounceAt: Long = 0L
+
+    /**
+     * 播报去重。
+     *
+     * 同一句话 1.5 秒内只播一次——两个 onGetNavigationText 重载会
+     * 同时触发（时间差几毫秒），不去重就重复播两遍。
+     */
+    private fun announceOnce(raw: String?, priority: Int) {
         if (stopRequested) return
-        val t = text?.trim().orEmpty()
-        if (t.isEmpty()) return
-        onAnnounce(t, PRIORITY_NAV)
+        val t = cleanText(raw) ?: return
+        val now = System.currentTimeMillis()
+        if (t == lastAnnounceText && now - lastAnnounceAt < 1500) {
+            NLog.i(TAG, "播报去重（重复回调）：$t")
+            return
+        }
+        lastAnnounceText = t
+        lastAnnounceAt = now
+        NLog.i(TAG, "导航播报 p=$priority text=$t")
+        onAnnounce(t, priority)
+    }
+
+    /**
+     * 清理高德给的播报文本。
+     *
+     * 高德会用**半角逗号**分词，而且常有连续标点：
+     *   「准备出发,,,全程二点八公里,大约需要九分钟」
+     * TTS 念出来会一顿一顿的。统一换成中文标点，去掉连续重复。
+     */
+    private fun cleanText(raw: String?): String? {
+        var t = raw?.trim().orEmpty()
+        if (t.isEmpty()) return null
+        // 连续逗号/顿号 → 一个中文逗号
+        t = t.replace(Regex("[,，、]{2,}"), "，")
+        // 半角逗号 → 中文逗号（TTS 停顿更自然）
+        t = t.replace(",", "，")
+        // 连续句号 → 一个
+        t = t.replace(Regex("[。.]{2,}"), "。")
+        // 首尾标点
+        t = t.trim(',', '，', '、', '。', '.', ' ')
+        return t.ifEmpty { null }
     }
 
     override fun onArriveDestination() {

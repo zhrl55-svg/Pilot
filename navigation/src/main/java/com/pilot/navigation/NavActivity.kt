@@ -33,6 +33,21 @@ class NavActivity : Activity() {
     companion object {
         private const val TAG = "PilotNav"
 
+        /**
+         * 初始缩放级别。
+         *
+         * 高德级别含义（数字越小范围越大）：
+         *   17f = 车道级（导航跟随时）
+         *   **14f = 街区级（能看到周边几个街区，适合刚打开地图认路）**
+         *   11f = 城区级
+         *    8f = 城市级
+         *
+         * 之前写 16f，实测老板反馈「放的有点大」——街道级太近，
+         * 看不出自己在城市哪个位置。改 14f。
+         * 算路成功后高德自己 fit 整条路线，不用我们管。
+         */
+        private const val INITIAL_ZOOM = 14f
+
         /** 拉起导航界面（已在前台就不重复拉）。 */
         fun show(context: Context, destination: String) {
             val intent = Intent(context, NavActivity::class.java).apply {
@@ -90,10 +105,10 @@ class NavActivity : Activity() {
                     runCatching {
                         naviView?.map?.moveCamera(
                             CameraUpdateFactory.newLatLngZoom(
-                                com.amap.api.maps.model.LatLng(lat, lon), 16f,
+                                com.amap.api.maps.model.LatLng(lat, lon), INITIAL_ZOOM,
                             ),
                         )
-                        NLog.i(TAG, "地图挪到当前位置 $lat,$lon")
+                        NLog.i(TAG, "地图挪到当前位置 $lat,$lon zoom=$INITIAL_ZOOM")
                     }.onFailure { NLog.w(TAG, "moveCamera 失败 \${it.message}") }
                 }
             }
@@ -104,6 +119,8 @@ class NavActivity : Activity() {
 
     /** 是否已经把镜头挪到当前位置（只挪一次，之后交给导航引擎跟随）。 */
     private var cameraMoved = false
+
+
 
     override fun onResume() {
         super.onResume()

@@ -97,6 +97,10 @@ class WebPoiSearch {
             val lat = parts[1].toDoubleOrNull() ?: continue
             all.add(
                 SdkPoiSearch.Candidate(
+                    // ★ POI ID：SDK 算路要用它找「正确入口」。
+                    //   只用坐标的话终点可能落在停车场内部/建筑里，
+                    //   SDK 报 errorCode=6 = ERROR_ENDPOINT（实测踩过）。
+                    poiId = o.optString("id").takeIf { it.isNotBlank() },
                     name = o.optString("name").ifBlank { q },
                     address = listOfNotNull(
                         o.optString("pname").takeIf { it.isNotBlank() },

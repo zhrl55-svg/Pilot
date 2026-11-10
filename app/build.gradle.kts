@@ -46,7 +46,15 @@ android {
     buildTypes {
         debug {
             isMinifyEnabled = false
-            applicationIdSuffix = ".debug"
+            // ★ 不加 applicationIdSuffix！
+            //
+            //   高德 Android 平台 Key 校验的是「Key + PackageName + SHA1签名」三件套。
+            //   带 .debug 后缀的话包名变成 com.pilot.agent.debug，
+            //   而控制台注册的是 com.pilot.agent → 报 INVALID_USER_SCODE(22)，
+            //   跟签名对不对无关（这个错误码会误导人，实际是包名不匹配）。
+            //
+            //   去掉后缀后 debug/release 同包名，高德只需注册一次。
+            //   区分环境靠 versionNameSuffix 和 BuildConfig.DEBUG。
             versionNameSuffix = "-debug"
         }
         release {

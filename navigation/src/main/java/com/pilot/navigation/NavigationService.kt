@@ -251,6 +251,7 @@ class NavigationService : Service() {
             e.startNaviToPoint(
                 best.name, best.lat, best.lon, strategy,
                 startLat = loc.lat, startLon = loc.lon,
+                poiId = best.poiId,
             )
             // 等算路回调（导航引擎线程池回调，用 CountDownLatch）
             val ok = e.awaitRoute(15_000)

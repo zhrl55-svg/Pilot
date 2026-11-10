@@ -47,6 +47,15 @@ class SdkPoiSearch(private val context: Context) {
         val lon: Double,
         val distance: Int,
         val city: String?,
+        /**
+         * POI ID。
+         *
+         * ★ SDK 算路必须用它：只用经纬度的话，终点可能落在**停车场内部/建筑里**，
+         *   SDK 报 errorCode=6 = ERROR_ENDPOINT（实测踩过——
+         *   「张掖西站停车场」的坐标是停车场中心，不是道路入口）。
+         *   传 POI ID 后 SDK 会用 POI 的**正确道路入口**算路。
+         */
+        val poiId: String? = null,
     )
 
     /**
@@ -208,6 +217,7 @@ class SdkPoiSearch(private val context: Context) {
         val lon = ll.longitude
         if (lat == 0.0 || lon == 0.0) return null
         return Candidate(
+            poiId = poiId,
             // SDK 的 PoiItem：名字是 title，地址是 snippet（javap 查过）
             name = title ?: "",
             address = snippet ?: "",
