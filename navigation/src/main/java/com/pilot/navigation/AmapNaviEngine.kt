@@ -160,6 +160,16 @@ class AmapNaviEngine(
         //   「起点用"经度,纬度"字符串传给 calculateDriveRoute 的 String 重载，
         //     由 SDK 内部处理，省掉 GeocodeSearch 依赖」
         //   String 重载会走服务端纠偏，起点会吸附到最近道路 → 算路成功。
+        //
+        //   注：errorCode 的对照表（反射 PathPlanningErrCode 打出来的）：
+        //     2 = ERROR_CONNECTION   网络问题
+        //     3 = ERROR_STARTPOINT   起点错误
+        //     6 = ERROR_ENDPOINT     终点错误
+        //     13 = INVALID_USER_KEY  Key 无效
+        //     22 = INVALID_USER_SCODE 安全码格式/值不对
+        //         ★ 高德控制台要求**带冒号**的 SHA1：
+        //           26:F6:15:CD:A0:6C:08:F4:7A:4B:BA:70:A3:20:DD:07:47:D7:91:7A
+        //           填不带冒号的会被判无效（2026-11-10 实测）。
         routeOk = false
         routeLatch = java.util.concurrent.CountDownLatch(1)
         val pathStrategy = PathPlanningStrategy.DRIVING_MULTIPLE_ROUTES_DEFAULT

@@ -42,18 +42,26 @@
 
 ## 二、为什么算路有两套通道
 
-### SDK 通道（AmapNaviEngine）
+### SDK 通道（AmapNaviEngine）— 已打通 ✅
 - 优点：高德官方渲染、车道级导航、实时路况重算、红绿灯倒计时
-- **限制：Android 平台 Key 绑包名+签名**
+- **限制：Android 平台 Key 绑包名 + 安全码（SHA1）**
 
-实测踩到的坑：
+打通过程踩了三个错误码（都不在代码，在配置/API 用法）：
+
+| 错误码 | 含义 | 真因 | 解法 |
+|---|---|---|---|
+| 3 | ERROR_STARTPOINT | `List<NaviLatLng>` 重载不纠偏，起点可能落在不可通行区域 | 改 **String 重载**（"经度,纬度"），服务端吸附到最近道路 |
+| 22 | INVALID_USER_SCODE | **安全码格式**：高德要带冒号的 SHA1 | 填 `26:F6:15:CD:A0:6C:...` |
+| 6 | ERROR_ENDPOINT | POI 经纬度是**停车场中心/建筑内部**，不在道路上 | 用 `NaviPoi(poiId, LatLng, name)` 传 **POI ID**，SDK 查道路入口 |
+
+实测成功：
 ```
-AMapNavi 初始化成功 ver=11.3.100
-算路 38.944205,100.416897 → 38.924813,100.427326 ok=true
-→ 10 秒后：算路失败 errorCode=3
+算路 起点(38.944924,100.418203) → 张掖西站停车场 poiId=B0FFMH95BV ok=true
+SDK 算路结果=true
+算路成功(errorCode=0)
+导航播报 准备出发，全程二点八公里，大约需要九分钟，左转，随后一百米左转
 ```
-Key 注册在 `com.navagent` 名下，我们的包名是 `com.pilot.agent.debug` → 被拒。
-**同一个 Web Key 走 REST 完全正常**（返回 3274m/624s/12 步完整路线）。
+界面：左上「左转 51米 进入 白塔街」、底部「2.8公里 9分钟 22:32到达」+红绿灯倒计时。
 
 ### Web 通道（WebRoutePlanner + RouteGuide）
 - 优点：不受包名绑定限制，播报完全可控
@@ -137,7 +145,9 @@ nav-agent 实测：`PoiSearch.Query("水勘院超市", "", "张掖市")` + `setC
 | # | 坑 | 表现 | 解法 |
 |---|---|---|---|
 | 1 | Key 未注入 | Web API 报 `INVALID_USER_KEY` | `local.properties` 的键不会自动进 gradle project property，必须自己读 Properties 文件（`aapt2 dump` 看到 `value=""` 才发现） |
-| 2 | SDK 算路 errorCode=3 | 算路请求成功但 10 秒后失败 | Key 绑包名，换 Web 通道 |
+| 2 | SDK 算路 errorCode=3 | 起点错误 | 用 **String 重载**（"经度,纬度"），服务端做纠偏；`List<NaviLatLng>` 重载不纠偏 |
+| 2b | SDK 算路 errorCode=6 | 终点错误 | POI 坐标是**停车场中心/建筑内**，不在道路上 → 用 `NaviPoi(poiId, LatLng, name)` 传 **POI ID** |
+| 2c | SDK 算路 errorCode=22 | 安全码不匹配 | 高德控制台要求**带冒号**的 SHA1（`26:F6:15:CD:...`），不带冒号判无效 |
 | 3 | 高德定位在副进程不回调 | APSService 起来了但 onLocationChanged 不触发 | 系统 LocationManager 兜底 |
 | 4 | 系统定位坐标精度 15 位小数 | 算路报参数错误 | 保留 6 位小数 |
 | 5 | 国产 ROM 丢 logcat | 日志完全看不到 | 写文件（`NLog`/`Dbg`） |
