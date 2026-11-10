@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  特权权限白名单。安装位置必须与 APK 分区一致：
+  - APK 在 /system/priv-app/Pilot       → 本文件放 /system/etc/permissions/
+  - APK 在 /product/priv-app/Pilot      → 本文件放 /product/etc/permissions/
+  - APK 在 /system_ext/priv-app/Pilot   → 本文件放 /system_ext/etc/permissions/
+
+  注意：只有 protectionLevel 含 privileged 的权限需要写在这里。
+  纯 signature 级的权限（如 INJECT_EVENTS）只要签名匹配自动授予，写进来反而会被 CTS 报错。
+-->
+<permissions>
+    <privapp-permissions package="com.pilot.agent">
+        <!-- AppFunctions 调用方：读全系统工具表。internal|privileged -->
+        <permission name="android.permission.EXECUTE_APP_FUNCTIONS" />
+
+        <!-- Computer Control 会话：后台虚拟屏跑目标 App。privileged，AOSP 原生可能没有此权限定义，
+             需要在 frameworks/base/core/res/AndroidManifest.xml 里自行声明，见 README。 -->
+        <permission name="android.permission.ACCESS_COMPUTER_CONTROL" />
+
+        <!-- 系统设置写入：默认助理、无障碍开关、勿扰 -->
+        <permission name="android.permission.WRITE_SECURE_SETTINGS" />
+
+        <!-- 状态栏与全局 UI -->
+        <permission name="android.permission.STATUS_BAR" />
+        <permission name="android.permission.EXPAND_STATUS_BAR" />
+
+        <!-- 跨用户 / 工作资料 -->
+        <permission name="android.permission.INTERACT_ACROSS_USERS" />
+
+        <!-- 任务栈可见性与管理 -->
+        <permission name="android.permission.MANAGE_ACTIVITY_TASKS" />
+        <permission name="android.permission.REAL_GET_TASKS" />
+
+        <!-- 使用情况统计（判断当前前台应用、做上下文推断） -->
+        <permission name="android.permission.PACKAGE_USAGE_STATS" />
+
+        <!-- 系统音频采集（语音唤醒/通话摘要场景；不用可以删） -->
+        <permission name="android.permission.CAPTURE_AUDIO_OUTPUT" />
+
+        <!-- Android 17 及以上：后台启动 Activity 的豁免，长任务从后台恢复 UI 用 -->
+        <permission name="android.permission.START_ACTIVITIES_FROM_BACKGROUND" />
+    </privapp-permissions>
+</permissions>

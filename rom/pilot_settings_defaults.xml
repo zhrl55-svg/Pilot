@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  开机默认启用无障碍服务（可选，仅政企定制/专用设备建议开启）。
+
+  用法：覆盖 SettingsProvider 的 defaults.xml。
+  字段名在不同 Android 版本上变过，先用下面的命令确认你这条分支上的真实字段：
+
+      grep -rn "accessibility" frameworks/base/packages/SettingsProvider/res/values/defaults.xml
+
+  常见形态：
+      <string name="def_enabled_accessibility_services">...</string>
+      <bool name="def_accessibility_enabled">true</bool>
+
+  写法是「包名/服务完整类名」，多个服务用冒号分隔。
+  这一步会削弱用户对无障碍的控制权，Play 兼容设备上还可能触发合规审查，
+  正式零售版建议保持默认关闭，让用户自己开。
+-->
+<resources>
+    <string name="def_enabled_accessibility_services" translatable="false">com.pilot.agent/com.pilot.agent.service.AgentAccessibilityService</string>
+    <bool name="def_accessibility_enabled">true</bool>
+</resources>

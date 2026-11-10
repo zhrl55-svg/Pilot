@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.pilot.overlay.assistant">
+
+    <!-- 覆盖 framework 的 config_defaultAssistant，让系统键唤起 Pilot -->
+    <overlay
+        android:isStatic="true"
+        android:priority="1"
+        android:targetPackage="android" />
+
+    <application android:hasCode="false" />
+</manifest>

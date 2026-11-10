@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  明文 HTTP 放行清单。
+
+  不要用 android:usesCleartextTraffic="true"——那会全局放开，所有域名都能走 HTTP。
+  这里精确到域名，其余仍强制 HTTPS。
+
+  为什么需要 music.126.net：网易云返回的播放地址是 http://m701.music.126.net/...，
+  MediaPlayer 拉流同样受 network security policy 约束，不放行就会
+  `what=1 extra=-2147483648`（MEDIA_ERROR_UNKNOWN），而且日志里完全看不出是策略拦截。
+-->
+<network-security-config>
+    <!-- 内网服务（自建网易云 API） -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">192.168.2.102</domain>
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+    </domain-config>
+
+    <!-- 网易云音乐 CDN / 封面图 -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">music.126.net</domain>
+        <domain includeSubdomains="true">music.127.net</domain>
+        <domain includeSubdomains="true">163.com</domain>
+        <domain includeSubdomains="true">126.net</domain>
+    </domain-config>
+</network-security-config>

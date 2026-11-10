@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      默认助理。改这里之后，长按 Home / 电源键、以及 ACTION_ASSIST 都会指向 Pilot。
+      值必须是 "包名/完整类名"，中间是斜杠不是点。
+    -->
+    <string name="config_defaultAssistant" translatable="false">com.pilot.agent/.ui.AssistActivity</string>
+</resources>

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  无障碍服务的运行时能力声明。系统级 agent 的关键在这几个 flag：
+  - flagRetrieveInteractiveWindows : 能看到所有窗口（含弹窗、通知栏、输入法），第三方拿不全
+  - flagIncludeNotImportantViews   : 把"不重要"的 view 也吐出来，节点树更完整
+  - flagReportViewIds              : 带 resource-id，模型定位更稳
+  - canTakeScreenshot (API 30+)    : 无障碍直出截图，不需要 MediaProjection 授权弹窗
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewClicked|typeViewFocused"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews|flagReportViewIds|flagRequestEnhancedWebAccessibility"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="true"
+    android:canTakeScreenshot="true"
+    android:description="@string/agent_service_desc"
+    android:notificationTimeout="80"
+    android:settingsActivity="com.pilot.agent.ui.MainActivity" />

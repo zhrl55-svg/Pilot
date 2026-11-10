@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Pilot</string>
+    <string name="agent_service_label">Pilot 系统操作</string>
+    <string name="agent_service_desc">允许 Pilot 读取屏幕内容并代你操作应用。这是系统级助理的核心能力，关闭后 Pilot 只能对话，不能动手。</string>
+</resources>

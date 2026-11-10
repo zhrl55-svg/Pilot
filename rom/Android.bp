@@ -1,0 +1,42 @@
+// ROM 侧构建规则（AOSP / 高通 / MTK 平台通用）
+//
+// 放置位置建议：vendor/pilot/Android.bp
+// 把 Gradle 产出的 app-release.apk 改名 Pilot.apk 一起放进来。
+
+android_app_import {
+    name: "Pilot",
+    apk: "Pilot.apk",
+    // 关键：platform 签名，否则所有 signature 级权限都拿不到
+    certificate: "platform",
+    privileged: true,
+    presigned: false,
+    dex_preopt: {
+        enabled: true,
+    },
+    // 预装到 /system/priv-app/Pilot
+    strip_media: true,
+}
+
+prebuilt_etc {
+    name: "privapp-permissions-com.pilot.agent",
+    src: "privapp-permissions-com.pilot.agent.xml",
+    sub_dir: "permissions",
+    filename_from_src: true,
+}
+
+// 可选：把 Pilot 设为默认助理，系统键直接唤起
+runtime_resource_overlay {
+    name: "PilotAssistantOverlay",
+    theme: "PilotAssistantOverlay",
+    product_specific: true,
+}
+
+// 可选：让无障碍服务开机默认启用（跳过用户手动勾选）
+// 这会降低用户可控性，正式出货建议只对政企定制版开启。
+prebuilt_etc {
+    name: "pilot_settings_defaults",
+    src: "pilot_settings_defaults.xml",
+    sub_dir: "overlay/frameworks/base/packages/SettingsProvider/res/values",
+    filename: "defaults.xml",
+    product_specific: true,
+}

@@ -1,0 +1,23 @@
+# build
+*.iml
+.gradle/
+build/
+local.properties
+app/build/
+
+# 端侧模型大文件（不进 git，走 HF mirror / 部署脚本推送，见 HANDOFF 模型清单）
+models/
+
+# IDE
+.idea/
+.DS_Store
+captures/
+
+# 签名（平台密钥永不入库）
+keystore/
+*.jks
+*.keystore
+
+# 临时
+*.log
+*.tmp

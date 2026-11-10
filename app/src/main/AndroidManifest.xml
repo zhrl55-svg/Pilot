@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- ========== 普通权限：第三方 App 也能拿 ========== -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 端侧语音识别需要自己持有麦克风（AudioRecord），系统 SpeechRecognizer 会被抢占 -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!-- ========== 系统能力直调：音量 / 亮度 / 电话 / 联系人 ========== -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.CALL_PHONE" />
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <!-- 调屏幕亮度；特殊权限，需要用户在系统设置里手动开启（会拉起授权页引导） -->
+    <uses-permission android:name="android.permission.WRITE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
+    <!-- 本地音乐库 -->
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
+
+    <!-- ========== 系统级权限：仅自研 ROM（平台签名 + priv-app 白名单）可授予 ==========
+         这些权限在普通设备上声明了也拿不到，只在 /system/priv-app 下 + 平台签名时生效。
+         白名单见 rom/privapp-permissions-com.pilot.agent.xml -->
+
+    <!-- 当 AppFunctions 的调用方：读全系统工具表 -->
+    <uses-permission android:name="android.permission.EXECUTE_APP_FUNCTIONS"
+        tools:ignore="ProtectedPermissions" />
+    <!-- 发起 Computer Control 会话：后台虚拟屏跑目标 App -->
+    <uses-permission android:name="android.permission.ACCESS_COMPUTER_CONTROL"
+        tools:ignore="ProtectedPermissions" />
+    <!-- 绕过无障碍直接注入输入事件（比 dispatchGesture 更底层、更可靠） -->
+    <uses-permission android:name="android.permission.INJECT_EVENTS"
+        tools:ignore="ProtectedPermissions" />
+    <!-- 改系统设置：默认助理、无障碍开关、勿扰等 -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.STATUS_BAR"
+        tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.INTERACT_ACROSS_USERS"
+        tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.MANAGE_ACTIVITY_TASKS"
+        tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.REAL_GET_TASKS"
+        tools:ignore="ProtectedPermissions" />
+    <!-- 抓系统音频（语音唤醒/通话场景用，可按需删） -->
+    <uses-permission android:name="android.permission.CAPTURE_AUDIO_OUTPUT"
+        tools:ignore="ProtectedPermissions" />
+
+    <application
+        android:name=".PilotApp"
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:icon="@drawable/ic_pilot"
+        android:label="@string/app_name"
+        android:largeHeap="true"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Pilot">
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 长按 Home / 电源唤起。ROM 里把 config_defaultAssistant 指到它，
+             就能像系统助理一样被系统键唤起。 -->
+        <activity
+            android:name=".ui.AssistActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:excludeFromRecents="true"
+            android:theme="@style/Theme.Pilot.Transparent">
+            <intent-filter>
+                <action android:name="android.intent.action.ASSIST" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VOICE_COMMAND" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".service.AgentAccessibilityService"
+            android:exported="true"
+            android:label="@string/agent_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/agent_accessibility" />
+        </service>
+
+        <!-- 后台触发入口：语音、系统键、外部程序通过它唤起 agent，不需要 agent 自己的界面在前台 -->
+        <receiver
+            android:name=".service.RunReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.pilot.agent.RUN" />
+            </intent-filter>
+        </receiver>
+
+    </application>
+</manifest>
