@@ -74,6 +74,19 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     var voiceprintEnrolled by mutableStateOf(false)
         private set
 
+    // ---------- 声纹注册引导 ----------
+    /** 注册采集进行中（UI 据此显示录音状态） */
+    var enrollRunning by mutableStateOf(false)
+        private set
+    /** 「2/3」这样的进度 */
+    var enrollProgress by mutableStateOf("")
+        private set
+    /** 完成结果：null=未出结果 */
+    var enrollResult by mutableStateOf<Boolean?>(null)
+        private set
+    /** 注册口令（引导文案用） */
+    val enrollPhrase = "我是小派的主人，现在开始录入我的声音"
+
     // ---------- 网易云扫码登录 ----------
     var qrBitmap by mutableStateOf<android.graphics.Bitmap?>(null)
         private set
@@ -155,7 +168,18 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                     "声纹 ${"%.2f".format(score)} ${if (pass) "通过" else "不匹配，这句话会被丢弃"}",
                 )
             },
-        )
+        ).also { v ->
+            v.onEnrollSegment = { index, total -> enrollProgress = "$index/$total" }
+            v.onEnrollDone = { ok ->
+                enrollRunning = false
+                enrollResult = ok
+                add(
+                    LogEntry.Kind.OBSERVE,
+                    if (ok) "声纹注册完成（3 句已合并入库）" else "声纹注册失败：${AgentRuntime.voiceprint.lastError ?: "样本不足"}",
+                )
+                refreshStatus()
+            }
+        }
         voice?.warmUp()
         refreshStatus()
     }
@@ -273,7 +297,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         refreshStatus()
     }
 
-    /** 用刚才说的那段音频注册声纹 */
+    /** 用刚才说的那段音频注册声纹（快捷路径，引导式注册用 startEnrollGuide） */
     fun enrollVoiceprint() {
         ensureVoice()
         val ok = voice?.enrollVoiceprint() == true
@@ -282,6 +306,57 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             if (ok) "声纹已注册，之后只认这个声音" else "声纹注册失败：${AgentRuntime.voiceprint.lastError ?: "录音不足"}",
         )
         refreshStatus()
+    }
+
+    /**
+     * 引导式声纹注册：弹窗提示口令 → 用户连说 3 句 → 自动合并入库。
+     * 旧实现要用户先随便说一句话再点按钮，音频全凭运气；现在采集会话
+     * 专管样本，VAD 分段直接计数，不足 3 句可以取消重来。
+     */
+    fun startEnrollGuide() {
+        ensureVoice()
+        enrollProgress = "0/3"
+        enrollResult = null
+        enrollRunning = voice?.startEnroll() == true
+        if (!enrollRunning) {
+            enrollResult = false
+            add(LogEntry.Kind.ERROR, "声纹注册启动失败：麦克风不可用")
+        }
+    }
+
+    fun cancelEnrollGuide() {
+        voice?.cancelEnroll()
+        enrollRunning = false
+        enrollProgress = ""
+        enrollResult = null
+    }
+
+    fun finishEnrollDialog() {
+        cancelEnrollGuide()
+    }
+
+    // ---------- 沙箱挂载目录（SAF） ----------
+
+    /** 当前挂载列表（name → 宿主路径）。 */
+    fun sandboxMounts(): List<Pair<String, String>> =
+        com.pilot.agent.sandbox.SandboxStores.mountedFolders(getApplication())
+            .entries.value.map { it.name to (it.resolvedHostPath ?: "(路径未解析)") }
+
+    /**
+     * 挂一个 SAF 目录。**重启沙箱进程后生效**——proot 的 bind mount 表在
+     * boot 时快照，运行中热挂载要动 ExecutionCoordinator（minis 原版支持，
+     * Pilot 的 v2 UI 先走冷生效，够用且稳）。
+     */
+    fun mountSandboxFolder(treeUri: android.net.Uri, displayName: String) {
+        val store = com.pilot.agent.sandbox.SandboxStores.mountedFolders(getApplication())
+        store.addFromTreeUri(displayName, treeUri)
+            .onSuccess { add(LogEntry.Kind.OBSERVE, "已挂载「$displayName」→ /var/minis/mounts/，重启沙箱进程后生效") }
+            .onFailure { add(LogEntry.Kind.ERROR, "挂载失败：${it.message}") }
+    }
+
+    fun unmountSandboxFolder(name: String) {
+        com.pilot.agent.sandbox.SandboxStores.mountedFolders(getApplication()).removeByName(name)
+        add(LogEntry.Kind.OBSERVE, "已移除挂载「$name」")
     }
 
     fun clearVoiceprint() {

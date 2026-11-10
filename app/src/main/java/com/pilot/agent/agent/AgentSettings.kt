@@ -21,6 +21,8 @@ data class AgentSettings(
     val wakeEnabled: Boolean = false,
     /** 唤醒词，逗号分隔同义变体，任一命中即可 */
     val wakeWords: String = DEFAULT_WAKE_WORDS,
+    /** 唤醒命中时播一声短提示音（ToneGenerator），告诉用户"我在听" */
+    val wakeTone: Boolean = true,
     /** 是否要求声纹匹配才响应唤醒（没注册模板时自动放行） */
     val requireVoiceprint: Boolean = true,
     /** 声纹相似度阈值，低于此值判定不是主人 */
@@ -67,6 +69,7 @@ data class AgentSettings(
         private const val K_TTS_MODEL = "tts_model"
         private const val K_WAKE_ENABLED = "wake_enabled"
         private const val K_WAKE_WORDS = "wake_words"
+        private const val K_WAKE_TONE = "wake_tone"
         private const val K_REQUIRE_VP = "require_voiceprint"
         private const val K_VP_THRESHOLD = "voiceprint_threshold"
         private const val K_VP_WINDOW = "voiceprint_window_ms"
@@ -89,6 +92,7 @@ data class AgentSettings(
                 ttsModel = p.getString(K_TTS_MODEL, null) ?: "speech-02-hd",
                 wakeEnabled = p.getBoolean(K_WAKE_ENABLED, false),
                 wakeWords = p.getString(K_WAKE_WORDS, null) ?: DEFAULT_WAKE_WORDS,
+                wakeTone = p.getBoolean(K_WAKE_TONE, true),
                 requireVoiceprint = p.getBoolean(K_REQUIRE_VP, true),
                 voiceprintThreshold = p.getFloat(K_VP_THRESHOLD, 0.30f),
                 voiceprintWindowMs = p.getInt(K_VP_WINDOW, 1500),
@@ -112,6 +116,7 @@ data class AgentSettings(
                 .putString(K_TTS_MODEL, s.ttsModel)
                 .putBoolean(K_WAKE_ENABLED, s.wakeEnabled)
                 .putString(K_WAKE_WORDS, s.wakeWords)
+                .putBoolean(K_WAKE_TONE, s.wakeTone)
                 .putBoolean(K_REQUIRE_VP, s.requireVoiceprint)
                 .putFloat(K_VP_THRESHOLD, s.voiceprintThreshold)
                 .putInt(K_VP_WINDOW, s.voiceprintWindowMs)

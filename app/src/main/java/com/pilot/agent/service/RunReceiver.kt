@@ -161,8 +161,8 @@ class RunReceiver : BroadcastReceiver() {
                 val term = com.pilot.agent.sandbox.SandboxTerminal
                 term.init(context)
                 kotlinx.coroutines.runBlocking {
-                    val r = term.run(sandboxTest, timeoutMs = 420_000)
-                    Dbg.i(TAG, "沙箱自检 exit=${r.exitCode} ${r.durationMs}ms out=${r.output.take(400)}")
+                    val r = term.run(context, sandboxTest, timeoutMs = 420_000)
+                    Dbg.i(TAG, "沙箱自检 exit=${r.exitCode} ${r.durationMs}ms mode=${com.pilot.agent.sandbox.SandboxClient.mode()} out=${r.output.take(400)}")
                 }
             }.apply { name = "sandbox-selftest"; isDaemon = true }.start()
             return

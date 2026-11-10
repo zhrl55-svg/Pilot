@@ -362,8 +362,22 @@ class AgentLoop(
                     emit(AgentEvent.Observe("通讯录里找不到「$arg」"))
                     false
                 } else {
+                    // ★ 坑 #18：HarmonyOS 后台拦截 ACTION_CALL 是静默失败
+                    //   （startActivity 不抛异常）。判据=起前后前台包有没有动过：
+                    //   没动 = 被拦，报失败；动了 = 进了通话/拨号界面（含华为变体）。
+                    val before = actions.foregroundPackage()
                     val r = actions.systemOps.call(number)
-                    if (r == null) false else { emit(AgentEvent.Observe(r)); true }
+                    if (r == null) false
+                    else {
+                        kotlinx.coroutines.delay(800)
+                        val fg = actions.foregroundPackage()
+                        if (fg != null && fg != before) {
+                            emit(AgentEvent.Observe(r)); true
+                        } else {
+                            emit(AgentEvent.Observe("拨号被系统后台拦截（前台未切换），未拨出"))
+                            false
+                        }
+                    }
                 }
             }
 
@@ -408,7 +422,7 @@ class AgentLoop(
                 val ctx = com.pilot.agent.PilotApp.instance
                 com.pilot.agent.sandbox.SandboxTerminal.init(ctx)
                 val r = withContext(Dispatchers.IO) {
-                    com.pilot.agent.sandbox.SandboxTerminal.run(arg)
+                    com.pilot.agent.sandbox.SandboxTerminal.run(ctx, arg)
                 }
                 // 非零退出但 stdout 有内容也算可用（实测 `df -h` 在华为上
                 // 个别挂载点 Permission denied → exit=1，但数据是好的）。

@@ -6,25 +6,25 @@ import com.pilot.agent.Dbg
 /**
  * 沙箱终端门面（Pilot 侧唯一入口）。
  *
- * 把 minis 搬来的 ExecutionCoordinator（object 单例，内部管 PRootKernel /
- * RootfsManager / PersistentShell / 节流与超时）包成一次 `run(command)`。
+ * 两条执行路径，接口一致：
+ * 1. **优先** `:sandbox` 独立进程（SandboxService，AIDL 异步回推）——
+ *    guest 里坏命令把 native 层搞炸只崩沙箱进程，语音 agent 不受牵连；
+ * 2. 降级 主进程内执行（bind 失败/服务进程连崩三次时）。
+ *
  * 首次调用会：解包 alpine rootfs（~30 秒）→ 建 bind mounts → 起持久 shell，
  * 之后同 session 的命令都是热壳（<100ms 启动）。
  *
- * ## W^X 提醒（HANDOFF 坑）
+ * ## W^X 提醒（HANDOFF 坑 #19）
  * Android 10+ 禁止 exec 私有目录里的文件，proot 二进制靠
- * `android:extractNativeLibs="true"` 落到 nativeLibraryDir 的 libproot.so
- * 被执行（RootfsManager.prootBinary 已写死这条路径），别改成从 assets 解压执行。
- *
- * ## 进程模型
- * ARCHITECTURE.md 规划沙箱进 `:sandbox` 独立进程；v1 先跑主进程，
- * 内存水位（rootfs 解包期 ~80MB）压出问题再拆，门面接口不变。
+ * `extractNativeLibs=true` + `useLegacyPackaging=true` 落到 nativeLibraryDir
+ * 的 libproot.so 被执行（RootfsManager.prootBinary 写死这条路径）。
  */
 object SandboxTerminal {
 
     private const val TAG = "PilotSandbox"
-    private const val SESSION = "pilot-agent"
+    const val SESSION = "pilot-agent"
     @Volatile private var ready = false
+    @Volatile private var remoteDisabled = false
 
     data class Result(val output: String, val exitCode: Int, val durationMs: Long) {
         val ok get() = exitCode == 0
@@ -38,18 +38,36 @@ object SandboxTerminal {
         synchronized(this) {
             if (ready) return
             ExecutionCoordinator.init(context)
+            // 挂载目录存储注入（UI 添加的 SAF/POSIX 目录 → PRootKernel bind mounts）。
+            // boot 是首条命令时才发生（ExecutionCoordinator 自动引导），这里注入来得及。
+            if (PRootKernel.mountedFoldersStore == null) {
+                PRootKernel.mountedFoldersStore = SandboxStores.mountedFolders(context)
+            }
             ready = true
             Dbg.i(TAG, "SandboxTerminal 就绪（rootfs 未解包，首条命令触发）")
         }
     }
 
     /**
-     * 执行一条 shell 命令。挂起函数，调用方负责线程。
-     * 首条命令含 rootfs 解包，timeout 给足 5 分钟。
+     * 执行一条 shell 命令（挂起）。优先走 :sandbox 独立进程；
+     * 远端任何不可用（超时/DeadObject/连崩）自动降级进程内执行一次，
+     * 连续失败再把 remoteDisabled 置位。
      */
-    suspend fun run(command: String, timeoutMs: Long = 300_000L): Result {
+    suspend fun run(context: Context, command: String, timeoutMs: Long = 300_000L): Result {
+        if (!remoteDisabled) {
+            val r = SandboxClient.runRemote(context, command, timeoutMs)
+            if (r != null) return r
+        }
+        return runLocal(command, timeoutMs)
+    }
+
+    /** 进程内直跑（v1 路径，也是降级路径）。 */
+    suspend fun run(command: String, timeoutMs: Long = 300_000L): Result =
+        runLocal(command, timeoutMs)
+
+    private suspend fun runLocal(command: String, timeoutMs: Long): Result {
         if (!ready) return Result("沙箱未初始化", -1, 0)
-        Dbg.i(TAG, "run: $command")
+        Dbg.i(TAG, "run(local): $command")
         val r = ExecutionCoordinator.execute(
             sessionId = SESSION,
             command = command,
@@ -59,6 +77,27 @@ object SandboxTerminal {
         return Result(r.output, r.exitCode, r.durationMs)
     }
 
+    /** :sandbox 进程里跑（SandboxService 专用，勿在主进程调）。 */
+    suspend fun runInService(context: Context, session: String, command: String, timeoutMs: Long): Triple<String, Int, Long> {
+        if (!ready) init(context)
+        val r = ExecutionCoordinator.execute(
+            sessionId = session, command = command, timeout = timeoutMs,
+        )
+        return Triple(r.output, r.exitCode, r.durationMs)
+    }
+
+    /** rootfs 状态一行字（status 通道用）。 */
+    fun rootfsState(context: Context): String {
+        val dir = java.io.File(context.filesDir, "alpine-rootfs")
+        return if (dir.isDirectory) "已解包(${java.io.File(dir, "bin").listFiles()?.size ?: 0} bins)" else "未解包"
+    }
+
     /** 当前是否已经具备热壳（自检用）。 */
-    fun isWarm(): Boolean = false // v1: ExecutionCoordinator 未暴露查询口，留待需要时加
+    fun isWarm(): Boolean = false // ExecutionCoordinator 未暴露查询口，留待需要时加
+
+    /** 服务进程连续崩溃后禁用远端（由 SandboxClient 回调）。 */
+    internal fun markRemoteBroken(reason: String) {
+        remoteDisabled = true
+        Dbg.w(TAG, "沙箱远端进程禁用：$reason（后续走进程内降级）")
+    }
 }

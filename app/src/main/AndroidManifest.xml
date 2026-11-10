@@ -7,6 +7,11 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Android 12+ 精确闹钟：后台启动 Activity 的 AlarmManager 路径 -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
     <!-- 端侧语音识别需要自己持有麦克风（AudioRecord），系统 SpeechRecognizer 会被抢占 -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
@@ -104,6 +109,30 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/agent_accessibility" />
         </service>
+
+        <!-- 常驻前台服务：后台起 Activity 的通行证（HarmonyOS 会拦 BOUND_FOREGROUND_SERVICE） -->
+        <service
+            android:name=".service.PilotForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="voice_assistant_background_activity_launch" />
+        </service>
+
+        <!-- 透明代理 Activity：绕过 HarmonyOS 后台启动 Activity 拦截（见 ForegroundProxyActivity） -->
+        <activity
+            android:name=".ui.ForegroundProxyActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- 沙箱独立进程（崩溃隔离 + 内存独立计量，见 SandboxService 头注释） -->
+        <service
+            android:name=".sandbox.SandboxService"
+            android:exported="false"
+            android:process=":sandbox" />
 
         <!-- 后台触发入口：语音、系统键、外部程序通过它唤起 agent，不需要 agent 自己的界面在前台 -->
         <receiver

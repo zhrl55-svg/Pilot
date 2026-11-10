@@ -56,6 +56,7 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+        aidl = true   // 沙箱跨进程接口（ISandboxService/ResultCallback/IHostBridge）
     }
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"

@@ -594,6 +594,8 @@ private fun SettingsDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
     var preferOnDevice by remember { mutableStateOf(vm.settings.preferOnDevice) }
     var ttsEngine by remember { mutableStateOf(vm.settings.ttsEngine) }
     var wakeWords by remember { mutableStateOf(vm.settings.wakeWords) }
+    var wakeTone by remember { mutableStateOf(vm.settings.wakeTone) }
+    var showEnroll by remember { mutableStateOf(false) }
     var requireVp by remember { mutableStateOf(vm.settings.requireVoiceprint) }
     var vpThreshold by remember {
         mutableStateOf(String.format(java.util.Locale.US, "%.2f", vm.settings.voiceprintThreshold))
@@ -612,6 +614,11 @@ private fun SettingsDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
                 SettingsSection("语音唤醒") {
                     SmallField(wakeWords, { wakeWords = it }, "唤醒词（逗号分隔）")
                     Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("唤醒提示音", fontSize = 12.sp, modifier = Modifier.weight(1f))
+                        Hint("命中唤醒词后播一声短 beep，告诉你\u201c我在听\u201d。麦克风会听到它，但只有约 100ms，识别层按唤醒回声丢弃。")
+                        CompactSwitch(wakeTone) { wakeTone = it }
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
                         Text("声纹校验", fontSize = 12.sp, modifier = Modifier.weight(1f))
                         CompactSwitch(requireVp) { requireVp = it }
                     }
@@ -621,7 +628,7 @@ private fun SettingsDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
                         KeyboardType.Decimal,
                     )
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        TextButton(onClick = { vm.enrollVoiceprint() }) {
+                        TextButton(onClick = { showEnroll = true }) {
                             Text(
                                 if (vm.voiceprintEnrolled) "重新注册" else "注册声纹",
                                 fontSize = 12.sp,
@@ -699,6 +706,28 @@ private fun SettingsDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
                             Text("清空", fontSize = 12.sp, color = colors.error)
                         }
                     }
+                    SettingsSection(title = "沙箱挂载目录", hint = "SAF 选目录 bind 进容器 /var/minis/mounts/<名字>；重启沙箱进程后生效") {
+                        val mountPicker = androidx.activity.compose.rememberLauncherForActivityResult(
+                            androidx.activity.result.contract.ActivityResultContracts.OpenDocumentTree(),
+                        ) { uri ->
+                            if (uri != null) {
+                                val name = uri.lastPathSegment?.substringAfterLast(':')?.substringAfterLast('/')
+                                    ?: "mnt"
+                                vm.mountSandboxFolder(uri, name)
+                            }
+                        }
+                        vm.sandboxMounts().forEach { (name, path) ->
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("$name → $path", fontSize = 11.sp, modifier = Modifier.weight(1f))
+                                TextButton(onClick = { vm.unmountSandboxFolder(name) }) {
+                                    Text("移除", fontSize = 11.sp, color = colors.error)
+                                }
+                            }
+                        }
+                        TextButton(onClick = { mountPicker.launch(null) }) {
+                            Text("添加挂载目录", fontSize = 12.sp)
+                        }
+                    }
                 }
             }
         },
@@ -713,6 +742,7 @@ private fun SettingsDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
                         preferOnDevice = preferOnDevice,
                         ttsEngine = ttsEngine,
                         wakeWords = wakeWords.trim().ifEmpty { AgentSettings.DEFAULT_WAKE_WORDS },
+                        wakeTone = wakeTone,
                         requireVoiceprint = requireVp,
                         voiceprintThreshold = vpThreshold.toFloatOrNull()?.coerceIn(0.1f, 0.9f) ?: 0.30f,
                     )
@@ -722,6 +752,71 @@ private fun SettingsDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
             }) { Text("保存") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
+
+    // 声纹注册引导：独立窗口（dialog 可以叠在设置弹窗上）
+    if (showEnroll) {
+        VoiceprintEnrollDialog(vm, onDismiss = { showEnroll = false })
+    }
+}
+
+/**
+ * 引导式声纹注册弹窗。
+ *
+ * 旧流程的坑：点按钮时拿的是环形缓冲里"刚才碰巧说过的那句"，
+ * 用户没说话就注册失败，说了话也不知道说的够不够。
+ * 现在：明确口令 → VAD 切满 3 句自动合并入库，进度实时显示。
+ */
+@Composable
+private fun VoiceprintEnrollDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
+    val colors = MaterialTheme.colorScheme
+    AlertDialog(
+        onDismissRequest = {
+            if (vm.enrollRunning) vm.cancelEnrollGuide()
+            onDismiss()
+        },
+        title = { Text("注册声纹", fontSize = 16.sp) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "对着手机把下面这句话清晰念 3 遍（语速正常、别背对麦克风）：",
+                    fontSize = 12.sp,
+                    lineHeight = 18.sp,
+                )
+                Text(
+                    "「${vm.enrollPhrase}」",
+                    fontSize = 14.sp,
+                    color = colors.primary,
+                )
+                when {
+                    vm.enrollRunning -> Text(
+                        "正在采集… ${vm.enrollProgress}（自动计数，说满 3 句即完成）",
+                        fontSize = 12.sp,
+                        color = colors.error,
+                    )
+                    vm.enrollResult == true -> Text(
+                        "注册完成，之后唤醒只认这个声音。",
+                        fontSize = 12.sp,
+                        color = colors.primary,
+                    )
+                    vm.enrollResult == false -> Text(
+                        "注册未完成，可重试。",
+                        fontSize = 12.sp,
+                        color = colors.error,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            if (vm.enrollRunning) {
+                TextButton(onClick = { vm.cancelEnrollGuide() }) { Text("取消采集", fontSize = 12.sp) }
+            } else {
+                TextButton(onClick = { vm.startEnrollGuide() }) {
+                    Text(if (vm.enrollResult == null) "开始" else "再来一次", fontSize = 12.sp)
+                }
+                TextButton(onClick = onDismiss) { Text("关闭", fontSize = 12.sp) }
+            }
+        },
     )
 }
 

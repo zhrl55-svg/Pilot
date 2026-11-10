@@ -21,7 +21,7 @@ import java.util.UUID
  *
  * v2 接 SAF 时再换实现，内核不用动。
  */
-class MountedFoldersStore(context: Context) {
+class MountedFoldersStore(private val appContext: Context) {
 
     data class Entry(
         val id: String = UUID.randomUUID().toString(),
@@ -36,7 +36,7 @@ class MountedFoldersStore(context: Context) {
         val effectiveWritable: Boolean get() = isWritable && userAllowWrite
     }
 
-    private val prefs = context.applicationContext
+    private val prefs = appContext.applicationContext
         .getSharedPreferences("pilot_mounted_folders", Context.MODE_PRIVATE)
 
     private val _entries = MutableStateFlow<List<Entry>>(emptyList())
@@ -95,6 +95,32 @@ class MountedFoldersStore(context: Context) {
         persist(list)
         return entry
     }
+
+    /**
+     * SAF 目录挂载（v2 引导式 UI 用）：tree uri 持久化授权 + 解析 POSIX 路径。
+     * proot bind mount 只认宿主 POSIX 路径，所以非 externalstorage 的 uri
+     * （解析不出 /storage/... ）直接拒绝并说明原因，别让 guest 挂半截。
+     */
+    fun addFromTreeUri(displayName: String, uri: Uri): Result<Boolean> {
+        val hostPath = resolveHostPathFromUri(uri.toString())
+            ?: return Result.failure(
+                IllegalStateException("这个目录不在共享存储上（$uri），proot 挂不了，请选「手机存储」下的文件夹"),
+            )
+        runCatching {
+            appContext.contentResolver.takePersistableUriPermission(
+                uri,
+                android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+            )
+        } // 授权失败不致命：POSIX 路径本来就直接可读
+        val name = displayName.ifBlank { hostPath.trimEnd('/').substringAfterLast('/') }
+            .sanitizeMountName()
+        add(name, hostPath)
+        return Result.success(true)
+    }
+
+    private fun String.sanitizeMountName(): String =
+        replace(Regex("[^\\w.\\-\\u4e00-\\u9fa5]"), "_").take(24).ifBlank { "mnt" }
 
     fun remove(id: String): Boolean {
         val list = _entries.value

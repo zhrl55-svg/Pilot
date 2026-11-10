@@ -133,7 +133,18 @@ class VoiceInput(
         }
         val v = EnergyVad(
             onSpeechStart = { Dbg.i(TAG, "VAD: 开口") },
-            onSegment = { pcm -> recognize(pcm) },
+            onSegment = { pcm ->
+                if (enrolling) {
+                    // 注册模式：句子攒样本，不走识别
+                    enrollSamples += pcm
+                    val n = enrollSamples.size
+                    Dbg.i(TAG, "注册样本 $n/$ENROLL_TARGET (${pcm.size * 1000 / AudioCapture.SAMPLE_RATE}ms)")
+                    main.post {
+                        onEnrollSegment(n, ENROLL_TARGET)
+                        if (n >= ENROLL_TARGET) finishEnroll()
+                    }
+                } else recognize(pcm)
+            },
         )
         vad = v
         val c = AudioCapture(
@@ -151,6 +162,67 @@ class VoiceInput(
     }
 
     // ------------------------------------------------------------ 音频路由
+
+    /**
+     * 声纹注册模式：开一个采集会话，VAD 切出的每一句**不进 ASR**，
+     * 直接攒进样本列表，攒够 [ENROLL_TARGET] 段自动完成。
+     * UI 侧（注册引导弹窗）负责提示用户念口令。
+     */
+    @Volatile private var enrolling = false
+    private val enrollSamples = ArrayList<ShortArray>()
+
+    /** 注册完成回调（在音频线程触发，UI 侧自行切主线程）。 */
+    var onEnrollSegment: (index: Int, total: Int) -> Unit = { _, _ -> }
+    var onEnrollDone: (Boolean) -> Unit = {}
+
+    fun startEnroll(): Boolean {
+        if (!ensureCapture()) return false
+        enrolling = true
+        enrollSamples.clear()
+        resumeToWake = false
+        vad?.reset()
+        mode = Mode.LISTEN
+        emitState(State.LISTENING)
+        Dbg.i(TAG, "声纹注册开始，目标 $ENROLL_TARGET 段")
+        return true
+    }
+
+    fun cancelEnroll() {
+        enrolling = false
+        enrollSamples.clear()
+        backToIdleOrWake()
+    }
+
+    private fun finishEnroll(): Boolean {
+        enrolling = false
+        val ok = enrollSamples.size >= ENROLL_TARGET
+        if (ok) {
+            // 三段拼起来一起提 embedding：比单句稳（对不同音量/距离更宽容）
+            val total = enrollSamples.sumOf { it.size }
+            val merged = ShortArray(total)
+            var off = 0
+            for (s in enrollSamples) { s.copyInto(merged, off); off += s.size }
+            enrollSamples.clear()
+            val saved = gate.enroll(merged)
+            main.post { onEnrollDone(saved) }
+            Dbg.i(TAG, "声纹注册 merge=${total * 1000 / AudioCapture.SAMPLE_RATE}ms saved=$saved")
+        }
+        backToIdleOrWake()
+        return ok
+    }
+
+    /** 唤醒提示音：一声短 beep，告诉用户"我在听"。
+     *  ★ 必须在切换音频模式之后播——它会被麦克风听到，
+     *    但只有 ~100ms，ASR 切出来是单字，isWakeEcho 已按单字丢弃（同 TTS 回声处理）。 */
+    private fun playWakeTone() {
+        if (!AgentSettings.load().wakeTone) return
+        runCatching {
+            val tone = android.media.ToneGenerator(android.media.AudioManager.MODE_IN_COMMUNICATION, 60)
+            tone.startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 120)
+            // 120ms 后 ToneGenerator 自己停；这里兜底释放
+            main.postDelayed({ runCatching { tone.release() } }, 400)
+        }.onFailure { Dbg.w(TAG, "提示音失败 ${it.message}") }
+    }
 
     private fun onFrame(frame: ShortArray, len: Int) {
         ring.push(frame, len)
@@ -172,6 +244,7 @@ class VoiceInput(
         wakeAuthorized = true
         emitState(State.LISTENING)
         main.post { onWake(word) }
+        playWakeTone()
         Dbg.i(TAG, "唤醒「$word」，进入聆听")
 
         val s = AgentSettings.load()
@@ -281,5 +354,8 @@ class VoiceInput(
 
     private companion object {
         const val TAG = "PilotVoice"
+
+        /** 声纹注册要采够的语句段数 */
+        const val ENROLL_TARGET = 3
     }
 }
