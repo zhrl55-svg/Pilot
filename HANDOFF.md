@@ -203,7 +203,43 @@ minis 的 `sandbox/` 24 个内核文件（7338 行）全部搬进 `com.pilot.age
 - 原 10 条回归合入后重跑：**全部通过**
 - APK 现在 ~89MB（比之前 151MB 的口径小，模型本来就不在包里）
 
-### 11. 架构规划
+### 11. 沙箱 v2 + 后台启动修复（19:00~19:25）
+
+**沙箱 v2**：`:sandbox` 独立进程（AIDL `ISandboxService`/`ResultCallback`/
+`IHostBridge`，结果异步回推，不在 binder 同步事务里等长命令）；
+offload 最小集接回（`android-device`/`android-open`，容器 CLI 调宿主，
+实测 `android-device` 返回宿主机型/电量）；SAF 挂载目录 UI；
+`apk add jq` 实测 13.5s 装成功（容器联网+写盘全通）。
+
+**后台启动（坑 #18 彻底修）**：startActivity 后回查前台窗口，不再假成功。
+四条路逐一验证：直接起✗ / 透明代理 Activity✗（代理自己也起不来）/
+前台服务✗（状态对了但 HarmonyOS 要 privileged 权限）/
+AlarmManager✗（排到 +5s 且代理仍被 Abort）。
+**唯一在用户机上真能用的路：桌面图标无障碍点击**（翻屏找图标点，0.6s 生效）。
+自研 ROM 有 `START_ACTIVITIES_FROM_BACKGROUND` 后可走前台服务，更快。
+
+**踩的坑**：BroadcastReceiver 的 context 调 bindService 抛
+`ReceiverCallNotAllowedException`，必须用 Application context。
+
+### 12. 音乐三连坑（19:25~19:45 老板真机反馈，已修）
+
+1. **「播放一会自动停了」**——MiniMax 播报和音乐播放器抢同一个流，
+   华为音频策略把音乐停掉。修法：`AudioFocusManager`（音乐 GAIN 焦点，
+   播报 TRANSIENT_MAY_DUCK）。实测持续播放 25s+ 不再断。
+2. **「播放中冒出一句『你说完了』」**——外放歌词被麦克风录进去，
+   ASR 误听成用户指令还播报出来。修法：`AudioGate`（放音期间不送 ASR，
+   音乐/TTS 各持一个令牌，引用计数）。
+3. **「播报期间要停音乐或降音量」**——两种策略可切换（设置→播报）：
+   降低音量（默认，降到 15%，播完恢复）/ 停止音乐。
+
+**关键坑**：降音量只能动 MediaPlayer 自己的 `setVolume`，**不能动系统
+STREAM_MUSIC**——动系统流会覆盖用户媒体音量，恢复时还容易永久静音
+（先静音再读音量，读到的是已经静音后的 0，恢复成 0，歌彻底哑了）。
+
+**顺序坑**：指令播报（「正在播放晴天」）发生在音乐开始**之前**，
+STOP 策略要记 `justSpoke` 窗口兜住，否则停了个寂寞。
+
+### 13. 架构规划
 
 - `ARCHITECTURE.md` 三个 App 合体的完整规划（五域架构、包体积、内存、进程模型、四阶段路线）
 
