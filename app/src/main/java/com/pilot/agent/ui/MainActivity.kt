@@ -9,6 +9,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.viewModels
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import android.os.SystemClock
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -90,6 +91,7 @@ import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -168,6 +170,10 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
     var showSettings by remember { mutableStateOf(false) }
     // 当前哪条消息处于文字选择态；点对话区空白处就清空（放弃选择）
     var selectingEntryId by remember { mutableStateOf<Long?>(null) }
+    // ★ 最近一次长按的时间戳。松手时父级也会收到一次 tap，
+    //   用它区分"用户点了别处" vs "刚长按完松手"，后者不能清选择。
+    var lastLongPressAt by remember { mutableStateOf(0L) }
+    val selectionHandler = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
     val rootFocusManager = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
     // ★ 声纹注册弹窗放在这一层：跟设置弹窗同级会互相遮挡，点「开始」看着没反应（实测）。
@@ -232,13 +238,14 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
                 //   用 clickable 而不是 focusable：不用依赖 isFocused 之类的 API，
                 //   行为也更直接（点一下就收键盘）。
                 .pointerInput(Unit) {
-                    // ★ 用 detectTapGestures 而不是 clickable：
-                    //   clickable 在长按松手时也会判成 click → 刚选中的文字立刻被清掉。
-                    //   detectTapGestures 的 onTap 只在真正短按时触发。
+                    // ★ 这里**只负责收焦点/键盘**，不清除文字选择。
+                    //   原因：父级的 onTap 和长按的抬起是同一个事件，
+                    //   无论怎么加延迟都会在"长按完松手"时误清选择（实测反复踩）。
+                    //   清除选择改由 AgentScreen 顶层统一处理：点击落在任何一条
+                    //   LogRow 之外时才清（见下方 LaunchedEffect）。
                     detectTapGestures(onTap = {
                         rootFocusManager.clearFocus(force = true)
                         keyboard?.hide()
-                        selectingEntryId = null      // 单击其他地方 = 放弃选择
                     })
                 },
         ) {
@@ -257,6 +264,7 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
                             onSelectionChange = { active ->
                                 selectingEntryId = if (active) entry.id else null
                             },
+                            onLongPress = { lastLongPressAt = SystemClock.uptimeMillis() },
                             onCopy = { text ->
                                 val cm = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
                                     as android.content.ClipboardManager
@@ -387,6 +395,46 @@ private fun Header(vm: AgentViewModel, onSettings: () -> Unit, onNavOpen: () -> 
     }
 }
 
+/**
+ * 动态音柱：几根竖条随机跳动，模拟音频波形。
+ *
+ * 播放中跳动、暂停时静止——一眼能看出"在放"还是"停着"。
+ */
+@Composable
+private fun PlayingBars(playing: Boolean, tint: androidx.compose.ui.graphics.Color) {
+    val transition = rememberInfiniteTransition(label = "bars")
+    val t by transition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            tween(900, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart,
+        ),
+        label = "t",
+    )
+    Canvas(Modifier.size(width = 18.dp, height = 16.dp)) {
+        val n = 4
+        val gap = size.width / n
+        val barW = gap * 0.45f
+        for (i in 0 until n) {
+            // 每根柱子用不同相位，避免整齐跳动
+            val phase = (t + i * 0.23f) % 1f
+            val h = if (playing) {
+                (0.25f + 0.75f * kotlin.math.abs(kotlin.math.sin(phase * Math.PI * 2).toFloat()))
+            } else {
+                0.28f
+            }
+            val barH = size.height * h
+            drawRoundRect(
+                color = tint,
+                topLeft = androidx.compose.ui.geometry.Offset(i * gap + (gap - barW) / 2, size.height - barH),
+                size = androidx.compose.ui.geometry.Size(barW, barH),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(barW / 2),
+            )
+        }
+    }
+}
+
 /** 音乐播放条：歌名 + 暂停/继续 + 停止。 */
 @Composable
 private fun MusicBar(
@@ -405,11 +453,8 @@ private fun MusicBar(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier.padding(start = 12.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
         ) {
-            Text(
-                "♪",
-                fontSize = 15.sp,
-                color = colors.onSecondaryContainer,
-            )
+            // ★ 动态音柱：播放时跳动的竖条（没有 material-icons 依赖，自己画）
+            PlayingBars(playing = !paused, tint = colors.onSecondaryContainer)
             Spacer(Modifier.width(8.dp))
             Text(
                 title,
@@ -481,6 +526,7 @@ private fun LogRow(
     entry: LogEntry,
     selectionActive: Boolean,
     onSelectionChange: (Boolean) -> Unit,
+    onLongPress: () -> Unit,
     onCopy: (String) -> Unit,
     onAddToChat: (String) -> Unit,
 ) {
@@ -592,7 +638,6 @@ private fun LogRow(
                             true
                         }
                         if (tapped != null) {
-                            Dbg.i("PilotSel", "短按 selStart=$selStart")
                             if (selStart != null) {
                                 chunkAt(down.position)?.let { c -> selStart = c; selEnd = c }
                                 onSelectionChange(true)
@@ -600,8 +645,9 @@ private fun LogRow(
                         } else {
                             // 落在文字边缘/空白处时兜底选第一块，别让长按"没反应"
                             val c = chunkAt(down.position) ?: 0
-                            Dbg.i("PilotSel", "长按命中 chunk=$c text=${entry.text.take(12)}")
                             selStart = c; selEnd = c
+                            // 通知父级"这是长按"，父级在松手时就不会清掉选择
+                            onLongPress()
                             onSelectionChange(true)
                         }
                     }
@@ -640,7 +686,6 @@ private fun LogRow(
             Box(
                 Modifier
                     .align(if (isUser) Alignment.TopEnd else Alignment.TopStart)
-                    .size(0.dp)
                     .zIndex(2f),
             ) {
             Surface(
@@ -648,7 +693,11 @@ private fun LogRow(
                 shape = RoundedCornerShape(16.dp),
                 shadowElevation = 4.dp,
                 modifier = Modifier
-                    .offset(y = (-44).dp)
+                    // ★ 用 graphicsLayer 平移而不是 offset：
+                    //   offset 会改变绘制位置但不改变布局（好），
+                    //   但外层 size(0) 的 Box 又会把菜单裁掉（坏）。
+                    //   graphicsLayer 纯视觉位移，既不占位也不被裁。
+                    .graphicsLayer { translationY = -44.dp.toPx() }
                     .widthIn(max = 330.dp),
             ) {
                 Row(
