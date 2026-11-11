@@ -494,14 +494,22 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** 按住说话：按下开始录音（不切换待命状态）。 */
-    fun startVoiceHold() {
+    /**
+     * 按住说话：按下开始录音。
+     * @return 是否真的开始录了（上一句还在识别时会返回 false，UI 好撤销"正在听"）
+     */
+    fun startVoiceHold(): Boolean {
         ensureVoice()
-        val v = voice ?: return
-        if (v.state == VoiceInput.State.LISTENING || v.state == VoiceInput.State.RECOGNIZING) return
+        val v = voice ?: return false
+        if (v.state == VoiceInput.State.LISTENING || v.state == VoiceInput.State.RECOGNIZING) {
+            add(LogEntry.Kind.OBSERVE, "上一句还在处理，等一下再按住说")
+            return false
+        }
         v.startListening(resumeWake = wakeOn)
         viewModelScope.launch {
             withContext(Dispatchers.IO) { AgentRuntime.localLlm.ensureReady() }
         }
+        return true
     }
 
     /** 按住说话：松手结束录音并送识别（识别完由 onText 自动执行）。 */

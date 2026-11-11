@@ -401,6 +401,36 @@ metadata 里带 `framework=3d-speaker`）。放到 `files/models/voiceprint/camp
 自测（不用真说话）：`--es voice_test enroll` + 三次 `--es speak_text '...'`，
 日志出现 `声纹模板已保存 dim=192` 即成功。
 
+## 输入栏结构（11-11 重写，别改回去）
+
+```
+Box
+ ├─ OutlinedTextField        永远不自己处理触摸
+ ├─ 流光边框 / "正在听…" 层   仅录音时
+ └─ 透明手势罩层             仅「未进入文本输入态」时存在，所有点击先到这
+```
+
+**为什么必须罩层**：之前把手势放在父 Box 上，和 `OutlinedTextField` 自己的
+触摸处理抢同一个 down/up。结果一连串互相打架的 bug：单击被判成长按、
+长按弹键盘、输入框一直抢焦点。前后加了 6 层补丁
+（`clearFocus` / `keyboard.hide` / `readOnly` / `focusProperties` /
+`showKeyboardOnFocus=false` / `handler.postDelayed`）都没根治，全删了。
+
+**两条硬规则**：
+
+1. `readOnly` / `disabled` 会让 TextField **停止消费指针事件**，
+   长按手势就断了 —— 要禁焦点只能用罩层或 `focusProperties(canFocus=false)`。
+2. **按住不动时不会有新指针事件**。长按判定必须用
+   `withTimeoutOrNull(450ms) { 等 up }` 靠超时主动唤醒；
+   `while(awaitPointerEvent) { 比较时间戳 }` 永远不会触发（实测踩过）。
+
+状态：`textMode=true`（已聚焦）→ 罩层撤掉，TextField 正常输入；
+失焦 → 罩层回来。键盘只在单击后由 `LaunchedEffect(textMode)` 主动
+`requestFocus + keyboard.show()`，长按从头到尾不聚焦 → 不会弹键盘。
+
+配套：`AndroidManifest` 的 MainActivity 加 `windowSoftInputMode="adjustResize"`，
+否则键盘弹出会 `adjustPan` 把标题顶出屏幕。
+
 ## 语音交互（11-11 重做）
 
 ### 状态机

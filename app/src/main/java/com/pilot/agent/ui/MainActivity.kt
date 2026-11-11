@@ -31,7 +31,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -66,6 +65,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.waitForUpOrCancellation
@@ -75,6 +75,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.RoundRect
 import androidx.compose.ui.geometry.Size
@@ -89,6 +90,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.style.TextAlign
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 
 import com.pilot.agent.agent.AgentSettings
@@ -248,11 +250,6 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
             value = input,
             onValueChange = { input = it },
             running = vm.running,
-            // ★ 只在"正在接收这一句"时才算在听。
-            //   麦克风是常驻的（唤醒词一直在跑），状态多半是 WAKE_WAIT/ACTIVE，
-            //   之前把 listening 也算进去 → 输入框一直显示"正在听…"（老板反馈的 bug）。
-            listening = vm.voiceState == com.pilot.agent.voice.VoiceInput.State.LISTENING ||
-                vm.voiceState == com.pilot.agent.voice.VoiceInput.State.RECOGNIZING,
             onSend = {
                 vm.run(input)
                 input = ""
@@ -270,6 +267,7 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
                     vm.startVoiceHold()
                 } else {
                     onRequestMic()
+                    false
                 }
             },
             onFinishVoice = { vm.finishVoiceHold() },
@@ -550,93 +548,108 @@ private fun EmptyHint() {
 /**
  * 输入栏。
  *
- * 交互按老板定的来：
- * - **点一下**输入框 → 弹键盘打字；
- * - **长按**输入框 → 开始录音，松手立即发送（识别结果直接执行）；
- * - 录音时输入框有一圈**旋转的彩色描边**，一眼看出在录；
- * - 不再有"说"按钮，发送按钮是个箭头。
+ * ## 结构（重要，别再改回"手势放父 Box 上"）
+ * ```
+ * Box
+ *  ├─ OutlinedTextField        ← 永远不自己处理触摸
+ *  ├─ 流光边框 Canvas          ← 录音时
+ *  └─ 透明手势罩层（仅未进入文本输入态时存在）← 所有点击都先到这
+ * ```
+ *
+ * 之前把手势放在父 Box 上，和 TextField 自己的触摸处理抢同一个 down/up，
+ * 结果：单击被判成长按、长按弹键盘、输入框一直抢焦点……
+ * 打了 6 层补丁（clearFocus / hide / readOnly / focusProperties /
+ * showKeyboardOnFocus / handler.postDelayed）互相打架，全删了。
+ *
+ * 现在：**文本框在"未聚焦"时完全收不到触摸**，焦点只由这里手动控制：
+ * - 单击 → 撤掉罩层 + requestFocus + 弹键盘（文本输入态）
+ * - 长按（按住 ≥450ms）→ 录音，从不聚焦 → 键盘不会弹
+ * - 点外部 → 失焦 → 罩层回来
+ *
+ * ★ 长按判定用 withTimeoutOrNull 等 up：**按住不动时不会有新指针事件**，
+ *   靠超时主动唤醒；用 while(awaitPointerEvent) 计时永远不会触发（踩过）。
  */
 @Composable
 private fun InputBar(
     value: String,
     onValueChange: (String) -> Unit,
     running: Boolean,
-    listening: Boolean,
     justSent: Boolean,
     speaking: Boolean,
     onSend: () -> Unit,
     onStop: () -> Unit,
     onStopSpeaking: () -> Unit,
-    onStartVoice: () -> Unit,
+    onStartVoice: () -> Boolean,
     onFinishVoice: () -> Unit,
 ) {
     val colors = MaterialTheme.colorScheme
     val focusReq = remember { FocusRequester() }
-    val focusManager = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
     var recording by remember { mutableStateOf(false) }
+    // 是否已进入"文本输入态"（聚焦中）。false 时罩层挡着，TextField 收不到触摸。
+    var textMode by remember { mutableStateOf(false) }
+    val handler = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
 
+    // 进入文本态后主动聚焦并弹键盘（requestFocus 后等一帧让重组生效）
+    LaunchedEffect(textMode) {
+        if (textMode) {
+            delay(50)
+            focusReq.requestFocus()
+            keyboard?.show()
+        }
+    }
 
-
-    // ★ 不要旋转着画矩形：rotate 会把圆角矩形转出界，看起来是"扭"的。
-    //   改成颜色在两个主色之间呼吸，形状稳定、也明显是"在录"。
     val spin = rememberInfiniteTransition(label = "rec")
     val phase by spin.animateFloat(
         initialValue = 0f,
         targetValue = 1f,
         animationSpec = infiniteRepeatable(
-            // ★ 放慢：1600ms 一圈太快，看着像"闪"而不是"在录"。3600ms 慢一点才从容。
-            tween(3600, easing = LinearEasing),
+            tween(3600, easing = LinearEasing),   // 慢一点，像"在录"而不是"在闪"
             repeatMode = RepeatMode.Reverse,
         ),
         label = "phase",
     )
-    // 边框流光只在**长按录音中**时亮。语音层常驻监听状态一直是 LISTENING，
-    // 用它判断会让边框一直亮着（等于没有"在录音"的提示作用）。
-    val live = recording
 
     Row(verticalAlignment = Alignment.Bottom) {
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .pointerInput(Unit) {
-                    awaitEachGesture {
-                        val down = awaitFirstDown(requireUnconsumed = false)
-                        // ★ 自己遍历指针事件，不用 waitForUpOrCancellation()：
-                        //   TextField 会消费 up 事件，那个函数就返回 null，
-                        //   结果"单击"被判成"长按"→ 输入框一直显示"正在听…"（老板反馈）。
-                        var longPressed = false
-                        val startAt = down.uptimeMillis
-                        while (true) {
-                            val event = awaitPointerEvent()
-                            val up = event.changes.any { it.changedToUpIgnoreConsumed() }
-                            if (up) break
-                            if (!longPressed && event.changes.firstOrNull()?.uptimeMillis?.let {
-                                    it - startAt > LONG_PRESS_MS
-                                } == true
-                            ) {
-                                longPressed = true
-                                // 长按 = 录音：先收键盘，否则它会挡住输入框
-                                recording = true
-                                runCatching { focusManager.clearFocus() }
-                                keyboard?.hide()
-                                onStartVoice()
-                            }
-                        }
-                        if (longPressed) {
-                            onFinishVoice()
-                            // 松手即退出"录音中"：边框收掉、文案变回提示。
-                            // 识别还在后台跑（onText 触发），但那不是"正在听"。
-                            recording = false
-                        } else {
-                            // 短按 = 文本输入：只聚焦，让键盘弹出来
-                            focusReq.requestFocus()
-                        }
-                    }
+        Box(Modifier.weight(1f)) {
+            OutlinedTextField(
+                value = value,                    // ★ 录音时不清空用户已输入的字
+                onValueChange = onValueChange,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .focusRequester(focusReq)
+                    .onFocusChanged { state ->
+                        // 失焦就退回非文本态（罩层回来），下次单击重新判定
+                        if (!state.isFocused && textMode) textMode = false
+                    },
+                placeholder = { Text("点一下输入，长按说话", fontSize = 13.sp) },
+                maxLines = 3,
+                shape = RoundedCornerShape(14.dp),
+                colors = if (recording) {
+                    OutlinedTextFieldDefaults.colors(
+                        unfocusedBorderColor = Color.Transparent,
+                        focusedBorderColor = Color.Transparent,
+                    )
+                } else {
+                    OutlinedTextFieldDefaults.colors()
                 },
-        ) {
-            if (live) {
-                // 一段亮线沿圆角边框滚动（流光），形状稳定、不随角度变形。
+            )
+
+            if (recording) {
+                // 录音时：一层淡底 + "正在听…"，盖在输入框上但看得见边框
+                Box(
+                    Modifier
+                        .matchParentSize()
+                        .background(colors.surface.copy(alpha = 0.88f), RoundedCornerShape(14.dp)),
+                    contentAlignment = Alignment.CenterStart,
+                ) {
+                    Text(
+                        "正在听…（松手发送）",
+                        fontSize = 13.sp,
+                        color = colors.primary,
+                        modifier = Modifier.padding(horizontal = 16.dp),
+                    )
+                }
                 val border = androidx.compose.ui.graphics.lerp(colors.primary, colors.tertiary, phase)
                 Canvas(Modifier.matchParentSize().padding(1.dp)) {
                     val r = CornerRadius(16.dp.toPx())
@@ -650,9 +663,7 @@ private fun InputBar(
                         )
                     }
                     val stroke = 2.5.dp.toPx()
-                    // 底：一圈很淡的边，保证任何时刻都看得出"框在这儿"
                     drawPath(path, color = border.copy(alpha = 0.25f), style = Stroke(stroke))
-                    // 上：一段占周长约 1/4 的高亮沿框流动
                     val perimeter = 2f * (size.width + size.height)
                     val dash = perimeter * 0.25f
                     drawPath(
@@ -668,43 +679,52 @@ private fun InputBar(
                     )
                 }
             }
-            OutlinedTextField(
-                value = if (live) "" else value,
-                onValueChange = onValueChange,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .focusRequester(focusReq),
-                placeholder = {
-                    Text(
-                        when {
-                            // ★ 只认"长按中"：语音层常驻监听时状态一直是 LISTENING，
-                            //   用它判断会导致单击输入框后也显示"正在听…"（老板反馈的 bug）。
-                            recording -> "正在听…（松手发送）"
-                            else -> "点一下输入，长按说话"
-                        },
-                        fontSize = 13.sp,
-                    )
-                },
-                maxLines = 3,
-                shape = RoundedCornerShape(14.dp),
-                colors = if (live) {
-                    OutlinedTextFieldDefaults.colors(
-                        unfocusedBorderColor = Color.Transparent,
-                        focusedBorderColor = Color.Transparent,
-                    )
-                } else {
-                    OutlinedTextFieldDefaults.colors()
-                },
-            )
+
+            // ★ 只在非文本输入态盖罩层：TextField 完全收不到触摸，
+            //   不会自己抢焦点、不会自己弹键盘。
+            if (!textMode && !recording) {
+                Box(
+                    Modifier.matchParentSize().pointerInput(Unit) {
+                        awaitEachGesture {
+                            awaitFirstDown(requireUnconsumed = false)
+                            // 等 up，最多 450ms。超时 = 长按（按住不动没有新事件，
+                            // 靠 timeout 主动唤醒，不能靠轮询事件时间戳）。
+                            val tapped = withTimeoutOrNull(LONG_PRESS_MS) {
+                                while (true) {
+                                    val ev = awaitPointerEvent()
+                                    if (ev.changes.any { it.changedToUpIgnoreConsumed() }) break
+                                }
+                                true
+                            }
+                            if (tapped != null) {
+                                // 单击 → 文本输入
+                                textMode = true
+                            } else {
+                                // 长按 → 录音，直到松手。
+                                // 启动失败（上一句还在识别）就别显示"正在听"，直接跳过。
+                                val started = onStartVoice()
+                                if (started) {
+                                    recording = true
+                                    while (true) {
+                                        val ev = awaitPointerEvent()
+                                        if (ev.changes.any { it.changedToUpIgnoreConsumed() }) break
+                                    }
+                                    handler.post { onFinishVoice() }
+                                    recording = false
+                                }
+                            }
+                        }
+                    },
+                )
+            }
         }
+
         Spacer(Modifier.width(8.dp))
-        // ★ 停止按钮的语义：**播报中按它 = 闭嘴**（老板原话"停止的目的是终止播报"）；
-        //   任务跑着但没在说话时按它 = 中止任务。
         val showStop = speaking || running || justSent
         Button(
             onClick = when {
-                speaking -> onStopSpeaking
-                running || justSent -> onStop
+                speaking -> onStopSpeaking       // 播报中：闭嘴 + 停任务
+                running || justSent -> onStop    // 任务中：中止任务
                 else -> onSend
             },
             enabled = showStop || value.isNotBlank(),
@@ -712,15 +732,12 @@ private fun InputBar(
             shape = RoundedCornerShape(14.dp),
             contentPadding = PaddingValues(0.dp),
             colors = ButtonDefaults.buttonColors(
-                // 空闲时按钮底色用浅色（图标是 primary 色，深底会看不清）；
-                // 停止态保持红底白块，一眼能认。
                 containerColor = if (showStop) colors.error else colors.primary.copy(alpha = 0.12f),
                 contentColor = if (showStop) colors.onError else colors.primary,
             ),
         ) {
             Canvas(Modifier.size(20.dp)) {
                 if (showStop) {
-                    // 停止：实心圆角方块（白块，红底上要看得清）
                     drawRoundRect(
                         color = androidx.compose.ui.graphics.Color(0xFFFFFFFF),
                         topLeft = Offset(size.width * 0.26f, size.height * 0.26f),
@@ -728,8 +745,7 @@ private fun InputBar(
                         cornerRadius = CornerRadius(size.width * 0.08f),
                     )
                 } else {
-                    // 发送：纸飞机（比"↑"更像发送，也更像"发出去"这个动作）。
-                    // 颜色用**输入框聚焦时的边框色**（primary），和输入框有呼应。
+                    // 纸飞机，颜色 = 输入框聚焦时的边框色（primary）
                     val p = Path().apply {
                         moveTo(size.width * 0.06f, size.height * 0.46f)
                         lineTo(size.width * 0.94f, size.height * 0.06f)
