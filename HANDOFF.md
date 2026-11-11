@@ -416,6 +416,14 @@ Box
 （`clearFocus` / `keyboard.hide` / `readOnly` / `focusProperties` /
 `showKeyboardOnFocus=false` / `handler.postDelayed`）都没根治，全删了。
 
+3. **录音时罩层不能撤**：撤掉后 `pointerInput` 协程会被取消，
+   松手事件和 `onFinishVoice()` 都执行不到 → UI 收了边框，
+   但语音层永远卡在 `LISTENING`（"松开后一直在转"）。
+   `onFinishVoice()` 必须放在 `finally` 里。
+4. **`vad.flush()` 在没说话时什么都不做**（`if (!inSpeech) return`）。
+   所以 `finishListening()` 要自己加 250ms 兜底，主动 `backToIdleOrWake()`；
+   有语音时由 `recognize()` 的 finally 回收，两者用 `finishGuard` 防重复。
+
 **两条硬规则**：
 
 1. `readOnly` / `disabled` 会让 TextField **停止消费指针事件**，

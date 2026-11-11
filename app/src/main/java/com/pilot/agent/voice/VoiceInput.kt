@@ -162,9 +162,28 @@ class VoiceInput(
         runCatching { VoiceState.write(context, VoiceState.RECORDING) }
     }
 
-    /** 提前结束这一句（用户点了"停"） */
+    /**
+     * 提前结束这一句（用户松手 / 点了"停"）。
+     *
+     * ★ 原来只调 vad.flush()，而 flush() 在"根本没检测到说话"时
+     *   `if (!inSpeech) return` 什么都不做 → 语音层永远停在 LISTENING，
+     *   状态不回收，UI 的"正在听"就一直转（老板反馈）。
+     *   现在：不管有没有声音，都保证回到待命/活跃。
+     */
+    private val finishGuard = Runnable {
+        if (mode == Mode.LISTEN && !busy.get()) {
+            Dbg.i(TAG, "松手但没检测到说话，直接回待命")
+            backToIdleOrWake()
+        }
+    }
+
     fun finishListening() {
+        main.removeCallbacks(finishGuard)
         vad?.flush()
+        // 没说出话（或 flush 没触发 onSegment）时，主动收状态。
+        // 如果 flush 真的切出了一句，recognize() 的 finally 会自己回收，
+        // 这里只在"还停在 LISTEN 且没在识别"时才补一刀。
+        main.postDelayed(finishGuard, 250)
     }
 
     fun stop() {
@@ -515,6 +534,7 @@ class VoiceInput(
             return
         }
         if (!busy.compareAndSet(false, true)) return
+        main.removeCallbacks(finishGuard)
         emitState(State.RECOGNIZING)
         worker.execute {
             try {

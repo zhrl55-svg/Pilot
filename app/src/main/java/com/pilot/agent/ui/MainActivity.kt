@@ -599,6 +599,14 @@ private fun InputBar(
         }
     }
 
+    // 兜底：万一手势协程整个被取消，recording 也要在 16 秒内归位
+    LaunchedEffect(recording) {
+        if (recording) {
+            delay(16_000)
+            recording = false
+        }
+    }
+
     val spin = rememberInfiniteTransition(label = "rec")
     val phase by spin.animateFloat(
         initialValue = 0f,
@@ -682,7 +690,10 @@ private fun InputBar(
 
             // ★ 只在非文本输入态盖罩层：TextField 完全收不到触摸，
             //   不会自己抢焦点、不会自己弹键盘。
-            if (!textMode && !recording) {
+            // ★ 录音时罩层**不能撤**：撤了 pointerInput 协程会被取消，
+            //   松手事件收不到、onFinishVoice 也调不到（语音层会永远卡在 LISTENING）。
+            //   罩层是透明的，盖在最上面不影响"正在听…"和流光边框显示。
+            if (!textMode) {
                 Box(
                     Modifier.matchParentSize().pointerInput(Unit) {
                         awaitEachGesture {
@@ -705,12 +716,21 @@ private fun InputBar(
                                 val started = onStartVoice()
                                 if (started) {
                                     recording = true
-                                    while (true) {
-                                        val ev = awaitPointerEvent()
-                                        if (ev.changes.any { it.changedToUpIgnoreConsumed() }) break
+                                    // ★ 手势协程可能被取消（重组/切后台），
+                                    //   finally 保证"正在听"一定会收掉，不会一直转。
+                                    //   再加一道 15 秒超时：手指一直按着也不无限录。
+                                    try {
+                                        withTimeoutOrNull(15_000L) {
+                                            while (true) {
+                                                val ev = awaitPointerEvent()
+                                                if (ev.changes.any { it.changedToUpIgnoreConsumed() }) break
+                                            }
+                                        }
+                                    } finally {
+                                        // ★ 无论松手、超时还是协程被取消，都必须通知语音层收状态
+                                        handler.post { onFinishVoice() }
+                                        recording = false
                                     }
-                                    handler.post { onFinishVoice() }
-                                    recording = false
                                 }
                             }
                         }
