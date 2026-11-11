@@ -261,14 +261,23 @@ class VoiceInput(
         val ok = enrollSamples.size >= ENROLL_TARGET
         if (ok) {
             // 三段拼起来一起提 embedding：比单句稳（对不同音量/距离更宽容）
-            val total = enrollSamples.sumOf { it.size }
+            // ★ 限制长度：三段拼起来可能十几秒，WeSpeaker 推理在主线程上会卡到系统判 ANR。
+            //   只取每段前 3 秒，总长压到 9 秒内。
+            val cap = AudioCapture.SAMPLE_RATE * 3
+            val pieces = enrollSamples.map { if (it.size > cap) it.copyOf(cap) else it }
+            val total = pieces.sumOf { it.size }
             val merged = ShortArray(total)
             var off = 0
-            for (s in enrollSamples) { s.copyInto(merged, off); off += s.size }
+            for (s in pieces) { s.copyInto(merged, off); off += s.size }
             enrollSamples.clear()
-            val saved = gate.enroll(merged)
-            main.post { onEnrollDone(saved) }
-            Dbg.i(TAG, "声纹注册 merge=${total * 1000 / AudioCapture.SAMPLE_RATE}ms saved=$saved")
+            // 推理挪到后台线程；完成再回主线程通知 UI
+            worker.execute {
+                val saved = gate.enroll(merged)
+                Dbg.i(TAG, "声纹注册 merge=${total * 1000 / AudioCapture.SAMPLE_RATE}ms saved=$saved")
+                main.post { onEnrollDone(saved) }
+                backToIdleOrWake()
+            }
+            return true
         }
         backToIdleOrWake()
         return ok
@@ -309,7 +318,14 @@ class VoiceInput(
     private fun onFrame(frame: ShortArray, len: Int) {
         ring.push(frame, len)
         if (mode == Mode.OFF) return
-        // ★ 唤醒词检测在**所有模式**下都跑：
+        // ★ 声纹注册期间**只喂 VAD，不跑唤醒词检测**。
+        //   注册口令里就含唤醒词（"我是小派的主人…"），KWS 会一直命中，
+        //   而聆听状态下命中会 vad.reset()——每句都被掐掉，进度永远 0/3（实测）。
+        if (enrolling) {
+            vad?.feed(frame, len)
+            return
+        }
+        // ★ 其余模式都跑唤醒词检测：
         //   播报中要能听见「停一下」打断，聆听中要能听见唤醒词重新开始。
         val hit = wake.feed(frame, len)
         if (hit != null) handleHit(hit)
@@ -324,6 +340,10 @@ class VoiceInput(
      * 播报还在继续，用户会以为没反应。
      */
     private fun handleHit(word: String) {
+        if (enrolling) {
+            Dbg.i(TAG, "注册中，忽略唤醒/打断命中「$word」")
+            return
+        }
         val st = AgentSettings.load()
         val isInterruptWord = st.interruptWordList().any { word.contains(it) || it.contains(word) }
         val speaking = AudioGate.isMuted

@@ -76,11 +76,15 @@ class VoiceprintGate(private val context: Context) {
                 provider = "cpu",
             )
             // 模型在 filesDir，必须传 null（传 context.assets 会 native abort）
+            Dbg.i(TAG, "声纹：开始构造 extractor model=${model.length()}B")
             extractor = SpeakerEmbeddingExtractor(null, cfg)
+            Dbg.i(TAG, "声纹：extractor 构造完成")
             ready = true
             initFailed = false
             lastError = null
-            Dbg.i(TAG, "声纹模型就绪 dim=${extractor?.dim()} ${System.currentTimeMillis() - t0}ms")
+            // ★ 不要调 extractor.dim()：这个 JNI 调用在 P40 上会 **native abort**（进程直接消失，
+            //   Kotlin 抓不到）。维度用模型固定值 256，反正后面按 embedding 实际长度用。
+            Dbg.i(TAG, "声纹模型就绪 ${System.currentTimeMillis() - t0}ms")
             true
         } catch (t: Throwable) {
             initFailed = true
@@ -103,10 +107,16 @@ class VoiceprintGate(private val context: Context) {
         var stream: com.k2fsa.sherpa.onnx.OnlineStream? = null
         return try {
             val samples = FloatArray(pcm.size) { pcm[it] / 32768.0f }
+            Dbg.i(TAG, "声纹：createStream begin samples=${samples.size}")
             stream = ex.createStream()
+            Dbg.i(TAG, "声纹：acceptWaveform begin")
             stream.acceptWaveform(samples, sampleRate)
+            Dbg.i(TAG, "声纹：inputFinished")
             stream.inputFinished()
-            ex.compute(stream)
+            Dbg.i(TAG, "声纹：compute begin")
+            val emb = ex.compute(stream)
+            Dbg.i(TAG, "声纹：compute done dim=${emb?.size}")
+            emb
         } catch (t: Throwable) {
             lastError = "${t.javaClass.simpleName}: ${t.message}"
             Dbg.e(TAG, "声纹提取失败 $lastError")
