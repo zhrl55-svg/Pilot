@@ -101,12 +101,22 @@ class VoiceInput(
     @Volatile
     private var activeUntil: Long = 0L
 
+    /**
+     * 这次休眠是不是用户主动要求的（说了"你休息一会"）。
+     *
+     * 自动休眠是常态，不用提示；主动免打扰要告诉用户"怎么叫醒我"。
+     */
+    @Volatile
+    var dndRequested: Boolean = false
+        private set
+
     private val sleepTick = Runnable {
         if (mode == Mode.ACTIVE && SystemClock.uptimeMillis() >= activeUntil) {
             Dbg.i(TAG, "活跃期结束，进入休眠（仍可唤醒）")
             mode = Mode.WAKE
             wake.reset()
             vad?.reset()
+            dndRequested = false   // 自动休眠，不是用户主动要的免打扰
             emitState(State.ASLEEP)
         }
     }
@@ -148,6 +158,35 @@ class VoiceInput(
         emitState(State.WAKE_WAIT)
         Dbg.i(TAG, "进入待命，KWS 词表=$allWords")
         return true
+    }
+
+    /**
+     * 进入休眠（用户主动版的"免打扰"）。
+     *
+     * ★ 老板的判断：这就是"等待一段时间没语音自动休眠"的同一个逻辑，
+     *   只是触发方式不同——一个是超时自动睡，一个是用户说
+     *   「你休息一会」「我先忙一会」「别打扰我」主动让它歇着。
+     *   所以直接复用休眠状态（ASLEEP），不另造一个 DND 模式。
+     *
+     * 行为：不再聆听、不再识别指令，只保留唤醒词检测。
+     * 退出方式：再喊一次唤醒词，或长按输入框。
+     */
+    fun enterDoNotDisturb() {
+        main.removeCallbacks(sleepTick)
+        activeUntil = 0L
+        mode = Mode.WAKE          // 只跑唤醒词，和休眠完全一样
+        wake.reset()
+        wakeAuthorized = false
+        dndRequested = true
+        vad?.reset()
+        vad?.flush()
+        emitState(State.ASLEEP)
+        Dbg.i(TAG, "进入免打扰（休眠），等唤醒词或长按输入框恢复")
+    }
+
+    /** 自检：模拟识别到一句话（走 onText 链路）。 */
+    fun debugSay(text: String) {
+        main.post { onText(text) }
     }
 
     /** 直接听一整句（点按钮） */
@@ -491,6 +530,7 @@ class VoiceInput(
     private fun onWakeHit(word: String) {
         // 立刻切聆听：用户接下来的话不能丢
         mode = Mode.LISTEN
+        dndRequested = false
         vad?.reset()
         wakeAuthorized = true
         emitState(State.LISTENING)

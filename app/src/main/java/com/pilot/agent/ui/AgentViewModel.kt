@@ -30,6 +30,9 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
 
     private companion object {
         const val TAG = "PilotVM"
+
+        /** 用户说"你休息一会"时的回应 */
+        const val DND_REPLY = "我先休息了，有事叫我啊"
     }
 
     var settings by mutableStateOf(AgentSettings.load())
@@ -164,6 +167,10 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     var voiceState by mutableStateOf(VoiceInput.State.IDLE)
         private set
 
+    /** 用户主动要求免打扰（说了"你休息一会"），不是自动休眠。 */
+    var dndRequested by mutableStateOf(false)
+        private set
+
     /** 待命模式（常驻听唤醒词）是否开启 */
     var wakeOn by mutableStateOf(false)
         private set
@@ -229,6 +236,9 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                     voiceState = st
                     Dbg.i(TAG, "语音状态 → $st")
                 }
+                // 免打扰标记（用户主动要求的休眠才显示提示）
+                val dnd = AgentRuntime.voiceInput?.dndRequested == true
+                if (dnd != dndRequested) dndRequested = dnd
                 // 音乐播放状态（给顶部播放条用）
                 val mp = com.pilot.agent.music.MusicPlayer.get(getApplication())
                 val title = mp.nowPlaying()
@@ -338,10 +348,21 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                     add(LogEntry.Kind.USER, text)
                 }
                 if (!dup) {
-                    when (IntentGate.classify(text)) {
-                        IntentGate.Kind.TASK -> run(text)
-                        IntentGate.Kind.QUERY -> query(text)
-                        IntentGate.Kind.CHAT -> chat(text)
+                    // ★ 「你休息一会 / 我先忙一会 / 别打扰我」→ 进免打扰：
+                    //   退出聆听状态，直到用户再喊唤醒词或长按输入框。
+                    if (IntentGate.isDoNotDisturb(text)) {
+                        // 回一句再睡：让用户知道听到了、并且知道怎么叫醒它
+                        add(LogEntry.Kind.OBSERVE, "进入免打扰（休眠）")
+                        // 先睡再回：enterDoNotDisturb 会把 vad 清掉、停止聆听，
+                        //   之后播报这句不会又被自己当成新指令听进去。
+                        voice?.enterDoNotDisturb()
+                        AgentRuntime.speaker.speak(DND_REPLY)
+                    } else {
+                        when (IntentGate.classify(text)) {
+                            IntentGate.Kind.TASK -> run(text)
+                            IntentGate.Kind.QUERY -> query(text)
+                            IntentGate.Kind.CHAT -> chat(text)
+                        }
                     }
                 }
             }

@@ -83,6 +83,16 @@ class TriggerActivity : Activity() {
                         val ok = vv.startEnroll()
                         Dbg.i(TAG, "自检：声纹注册 startEnroll=$ok")
                     }
+                    // 自检：模拟识别到一句话（测意图分流用）
+                    "say" -> {
+                        val text = i.getStringExtra("say_text").orEmpty()
+                        com.pilot.agent.runtime.AgentRuntime.voiceInput?.debugSay(text)
+                    }
+                    // 自检：直接进免打扰
+                    "dnd" -> {
+                        vv.enterDoNotDisturb()
+                        Dbg.i(TAG, "自检：进入免打扰")
+                    }
                     else -> vv.debugHit(voiceTest)
                 }
                 Dbg.i(TAG, "自检后：${vv.debugStatus()}")
