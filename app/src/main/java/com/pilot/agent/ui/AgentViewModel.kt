@@ -769,7 +769,10 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         }
         refreshStatus()
         if (!accessibilityOn || AgentRuntime.loop == null) {
-            add(LogEntry.Kind.ERROR, "无障碍服务还没开。打开系统设置 → 无障碍 → Pilot 系统操作，然后回来。")
+            // ★ 不再往对话区写这条错误：顶部「操作权限 未开启」卡片已经带了
+            //   「去开启」按钮，重复一遍反而把「操作权限」下面堆满字（老板要求删）。
+            //   只刷新一次状态，卡片会自己显示"未开启"。
+            refreshStatus()
             return
         }
         add(LogEntry.Kind.USER, g)
