@@ -465,11 +465,12 @@ class VoiceInput(
         //   原来的注册流程要念 3 遍固定口令，太重，而且口令必须和唤醒词一致
         //   用户很难记住——改成"第一次说话就认下主人"，门槛降到零。
         if (!gate.hasTemplate()) {
+            // 唤醒词那句直接注册（比后面那句干净，没有指令混在里面）
             val snapshot0 = ring.snapshot()
             worker.execute {
                 val ok = gate.enrollIfAbsent(snapshot0)
                 if (ok) {
-                    Dbg.i(TAG, "首句注册成功，已认下主人")
+                    Dbg.i(TAG, "首句注册成功（用唤醒词注册的），已认下主人")
                     main.post { onEnrolled() }
                 }
             }
@@ -521,6 +522,15 @@ class VoiceInput(
                 Dbg.i(TAG, "识别 ${ms}ms 音频")
                 val text = asr.transcribe(pcm)
                 val authorized = wakeAuthorized
+                // ★ 首句注册：还没有模板时，**任何一句被识别的话**都拿来注册。
+                //   之前挂在"唤醒词命中"上，用户不喊唤醒词直接说话就不会注册（实测踩到）。
+                if (authorized && text != null && !gate.hasTemplate() && isRegisterable(text)) {
+                    val ok = gate.enrollIfAbsent(pcm)
+                    if (ok) {
+                        Dbg.i(TAG, "首句注册成功，已认下主人")
+                        main.post { onEnrolled() }
+                    }
+                }
                 // ★ 把识别结果写给导航界面（搜索框自动填入）
                 if (authorized && text != null) {
                     runCatching { VoiceState.write(context, VoiceState.IDLE, text) }
@@ -542,6 +552,29 @@ class VoiceInput(
                 backToIdleOrWake()
             }
         }
+    }
+
+    /**
+     * 这句话能不能当声纹模板。
+     *
+     * 排除两类：
+     * - **问句**（「注册了吗」「我的声纹好了没」）——那是来问状态的，不是自报身份；
+     * - **太短的应答**（「嗯」「啊」「好」）——1 秒多一点的咳嗽式应答，
+     *   算出来的 embedding 没有代表性。
+     */
+    private fun isRegisterable(text: String): Boolean {
+        val t = text.trim()
+        if (t.length < 4) {
+            Dbg.i(TAG, "首句注册：文本太短「$t」，不注册")
+            return false
+        }
+        if (t.contains('?') || t.contains('？') ||
+            Regex("(吗|呢|没有|好了吗|注册了吗|是不是|怎么样|多少|为什么|什么)").containsMatchIn(t)
+        ) {
+            Dbg.i(TAG, "首句注册：像是提问「$t」，不注册")
+            return false
+        }
+        return true
     }
 
     /**
