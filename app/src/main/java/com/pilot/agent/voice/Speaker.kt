@@ -89,6 +89,33 @@ class Speaker(context: Context) {
     fun speak(text: String) = speakInternal(text, isNav = false)
 
     /**
+     * 轻量播报：**不占麦克风闸门**。
+     *
+     * 用途：唤醒时的「我在」这种极短回应。
+     * 为什么要特殊对待：正常播报会占闸（AudioGate.hold("tts")），
+     * 那样用户"喊完唤醒词马上接指令"的那半句会被当成放音内容丢掉。
+     * 「我在」只有两个字、且是固定内容，就算被麦克风听到也不会是有效指令。
+     */
+    fun speakQuiet(text: String) {
+        val t = text.trim()
+        if (t.isEmpty()) return
+        val s = AgentSettings.load()
+        val engine: SpeechOutput = when (s.ttsEngine) {
+            AgentSettings.TTS_OFF -> return
+            AgentSettings.TTS_MINIMAX -> {
+                if (s.apiKey.isBlank()) {
+                    system ?: SystemTts(appContext).also { system = it }
+                } else {
+                    minimax ?: MiniMaxTts(appContext).also { minimax = it }
+                }
+            }
+            else -> system ?: SystemTts(appContext).also { system = it }
+        }
+        // 不占闸、不抢音频焦点：麦克风继续听用户的下一句
+        engine.speak(t, onDone = {}, onError = { Dbg.w(TAG, "轻量播报失败：$it") })
+    }
+
+    /**
      * 实际播报。
      * @param isNav true = 导航播报（独占、播完释放锁）
      */

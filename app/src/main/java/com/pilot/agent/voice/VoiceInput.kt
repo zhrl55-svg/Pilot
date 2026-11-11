@@ -670,6 +670,9 @@ class VoiceInput(
     private fun isWakeEcho(text: String): Boolean {
         val t = text.trim()
         if (t.length <= 1) return true
+        // ★ 唤醒时那句"我在"（轻量播报不占闸，麦克风会把它听进去）→ 丢掉，
+        //   否则它会变成一条莫名其妙的用户消息。
+        if (t == "我在" || t == "我在在" || t == "我在了") return true
         val words = AgentSettings.load().wakeWordList()
         if (words.any { t.contains(it) }) return true
         val chars = words.joinToString("").toSet()

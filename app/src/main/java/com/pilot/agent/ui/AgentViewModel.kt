@@ -33,6 +33,9 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
 
         /** 用户说"你休息一会"时的回应 */
         const val DND_REPLY = "我先休息了，有事叫我啊"
+
+        /** 唤醒时的回应 */
+        const val WAKE_REPLY = "我在"
     }
 
     var settings by mutableStateOf(AgentSettings.load())
@@ -367,7 +370,12 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
             v.onError = { msg -> add(LogEntry.Kind.ERROR, msg) }
-            v.onWake = { word -> add(LogEntry.Kind.OBSERVE, "唤醒「$word」，说吧") }
+            v.onWake = { word ->
+                add(LogEntry.Kind.OBSERVE, "唤醒「$word」，说吧")
+                // 回应一声"我在"：让用户确认它醒了（原来只有一声 beep，不够明确）。
+                // 用 speakQuiet：不占麦克风闸门，用户紧接着说的指令不会被丢掉。
+                AgentRuntime.speaker.speakQuiet(WAKE_REPLY)
+            }
             v.onVoiceprint = { score, pass ->
                 voiceprintInfo = "%.2f".format(score) + if (pass) " 通过" else " 拒绝"
                 add(
@@ -394,7 +402,10 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 }
             },
             onError = { msg -> add(LogEntry.Kind.ERROR, msg) },
-            onWake = { word -> add(LogEntry.Kind.OBSERVE, "唤醒「$word」，说吧") },
+            onWake = { word ->
+                add(LogEntry.Kind.OBSERVE, "唤醒「$word」，说吧")
+                AgentRuntime.speaker.speakQuiet(WAKE_REPLY)
+            },
             onVoiceprint = { score, pass ->
                 voiceprintInfo = "%.2f".format(score) + if (pass) " 通过" else " 拒绝"
                 add(
