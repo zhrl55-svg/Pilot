@@ -32,8 +32,13 @@ data class AgentSettings(
     val requireVoiceprint: Boolean = true,
     /** 声纹相似度阈值，低于此值判定不是主人 */
     val voiceprintThreshold: Float = 0.30f,
-    /** 喂给声纹的音频长度（毫秒），太短算不准 */
-    val voiceprintWindowMs: Int = 1500,
+    /**
+     * 喂给声纹的音频长度（毫秒），太短算不准。
+     *
+     * 默认 3000：KWS 命中时唤醒词可能已经说完，1.5 秒窗口里只剩后面的静默，
+     * 算出来的分数没意义（实测 0.20，会把主人自己挡在外面）。
+     */
+    val voiceprintWindowMs: Int = 3000,
     /**
      * 对话结束后多久没有有效语音就休眠（秒）。0 = 不休眠，一直留在活跃期。
      *
@@ -146,7 +151,7 @@ data class AgentSettings(
                 wakeTone = p.getBoolean(K_WAKE_TONE, true),
                 requireVoiceprint = p.getBoolean(K_REQUIRE_VP, true),
                 voiceprintThreshold = p.getFloat(K_VP_THRESHOLD, 0.30f),
-                voiceprintWindowMs = p.getInt(K_VP_WINDOW, 1500),
+                voiceprintWindowMs = p.getInt(K_VP_WINDOW, 3000),
                 idleSleepSeconds = p.getInt(K_IDLE_SLEEP, 60),
                 interruptEnabled = p.getBoolean(K_INTERRUPT, true),
                 interruptWords = p.getString(K_INTERRUPT_WORDS, null)

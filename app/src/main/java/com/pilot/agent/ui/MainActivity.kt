@@ -261,7 +261,15 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
     }
 
     if (showEnroll) {
-        VoiceprintEnrollDialog(vm, onDismiss = { showEnroll = false })
+        VoiceprintEnrollDialog(
+            vm,
+            onDismiss = {
+                // ★ 关弹窗必须停掉采集会话：否则 enrolling 卡在 true，
+                //   唤醒词命中全被忽略 → 用户体验就是"没反应"（实测）。
+                vm.cancelEnrollGuide()
+                showEnroll = false
+            },
+        )
     }
 
     // 二维码单独一层：不嵌在设置弹窗里，扫码时设置可以先关掉

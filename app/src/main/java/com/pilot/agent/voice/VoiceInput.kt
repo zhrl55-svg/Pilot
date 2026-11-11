@@ -194,6 +194,9 @@ class VoiceInput(
                 if (enrolling) {
                     // 注册模式：句子攒样本，不走识别
                     enrollSamples += pcm
+                    lastEnrollSampleAt = SystemClock.uptimeMillis()
+                    main.removeCallbacks(enrollWatchdog)
+                    main.postDelayed(enrollWatchdog, ENROLL_IDLE_TIMEOUT_MS)
                     val n = enrollSamples.size
                     Dbg.i(TAG, "注册样本 $n/$ENROLL_TARGET (${pcm.size * 1000 / AudioCapture.SAMPLE_RATE}ms)")
                     main.post {
@@ -233,9 +236,25 @@ class VoiceInput(
     var onEnrollSegment: (index: Int, total: Int) -> Unit = { _, _ -> }
     var onEnrollDone: (Boolean) -> Unit = {}
 
+    /** 注册看门狗：多久没有新样本就判定用户放弃了（毫秒） */
+    @Volatile
+    private var lastEnrollSampleAt = 0L
+
+    private val enrollWatchdog = Runnable {
+        if (!enrolling) return@Runnable
+        val idle = SystemClock.uptimeMillis() - lastEnrollSampleAt
+        if (idle > ENROLL_IDLE_TIMEOUT_MS) {
+            Dbg.w(TAG, "注册看门狗：${idle}ms 没有新样本，自动取消")
+            cancelEnroll()
+        }
+    }
+
     fun startEnroll(): Boolean {
         if (!ensureCapture()) return false
         enrolling = true
+        lastEnrollSampleAt = SystemClock.uptimeMillis()
+        main.removeCallbacks(enrollWatchdog)
+        main.postDelayed(enrollWatchdog, ENROLL_IDLE_TIMEOUT_MS)
         enrollSamples.clear()
         // 注册期间不走 VAD→ASR，但**注册结束要回到原来的待命状态**，
         // 否则麦克风被关掉、待命丢失，用户还得手动再点一次（实测"注册完就没反应了"）。
@@ -250,6 +269,7 @@ class VoiceInput(
 
     fun cancelEnroll() {
         enrolling = false
+        main.removeCallbacks(enrollWatchdog)
         enrollSamples.clear()
         resumeToWake = enrollResumeWake
         backToIdleOrWake()
@@ -257,6 +277,7 @@ class VoiceInput(
 
     private fun finishEnroll(): Boolean {
         enrolling = false
+        main.removeCallbacks(enrollWatchdog)
         resumeToWake = enrollResumeWake
         val ok = enrollSamples.size >= ENROLL_TARGET
         if (ok) {
@@ -428,6 +449,9 @@ class VoiceInput(
             Dbg.i(TAG, "未注册声纹，跳过校验")
             return
         }
+        // ★ 声纹取的是环形缓冲里最近 1.5 秒——但 KWS 命中时"小派"可能已经说完了，
+        //   窗口里剩下的可能是后面的静默/杂音，判出来的分数没有意义（实测 0.20）。
+        //   所以把窗口临时拉长到 3 秒再取，覆盖整个唤醒词。
         val snapshot = ring.snapshot()
         worker.execute {
             val score = gate.verify(snapshot)
@@ -580,6 +604,9 @@ class VoiceInput(
 
     private companion object {
         const val TAG = "PilotVoice"
+
+        /** 注册时多久没有新样本就自动取消（用户放弃了） */
+        const val ENROLL_IDLE_TIMEOUT_MS = 20_000L
 
         /** 放音结束后多久内录到的音频一律当回声丢掉 */
         const val ECHO_GUARD_MS = 900L
