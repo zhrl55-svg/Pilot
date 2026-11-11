@@ -1,7 +1,10 @@
 # 交接文档
 
-> 最后更新：2026-11-11 00:15
+> 最后更新：2026-11-11 21:45
 > 写给明天的自己（或者接手的人）。看完这一份就能接着干。
+>
+> **今天改动很大**：语音交互整块重做了一遍（声纹/输入栏/长按选字/音乐条/音色/免打扰）。
+> 老章节里描述的交互**部分已过时**，以「11-11 傍晚」那章为准。
 
 ---
 
@@ -11,7 +14,7 @@
 
 1. 读本文件的「一句话现状」和「明天的开工清单」
 2. 跑 `bash scripts/deploy-device.sh 192.168.2.32:5555`（编译+装+推模型+自检一条龙）
-3. 跑「开工清单」第 0 条的 10 条回归
+3. 跑「回归清单（11-11 重做后的版本）」的 12 条
 
 **给新会话的开场白可以直接复制这段**：
 
@@ -36,11 +39,13 @@ Pilot 已经是一个**能在真机上跑通语音 agent** 的 App：喊「小�
 **已具备**：
 - 沙箱终端（proot + Alpine，语音直接跑 shell 命令；SAF 热挂载 + 空闲回收都通了）
 - **导航全链路**（高德 SDK 官方导航界面 + 语音选候选 + 播报接管，11-10 深夜打通）
+- **完整的语音交互**（11-11 重做，见「11-11 傍晚」章）：
+  声纹首句自动注册 / 罩层式输入栏 / 长按选文字 / 音乐播放条 / 双引擎音色+预听 / 免打扰
 
 **还没做的**：多模块拆分落地（方案已定，见 NAV_MODULE_PLAN.md）、ROM 预置。
 **卡住的**：
-- 在线音乐（网易云频率风控）
-- 云端 TTS 音色（MiniMax Key 未配，现在走系统华为智慧语音）
+- 在线音乐（网易云频率风控 + 试听 URL 限时，约 1 分钟就断流；登录后能好）
+- 沙箱挂载目录的 proot bind 参数联动（设置里能挂上，热壳重启那步还没通）
 
 ---
 
@@ -467,6 +472,237 @@ adb shell "am start -n com.pilot.agent/com.pilot.agent.ui.TriggerActivity --es s
 adb shell "am start -n com.pilot.agent/com.pilot.agent.ui.TriggerActivity --es voice_test 停一下"
 ```
 
+
+---
+
+## 回归清单（11-11 重做后的版本，照这个跑）
+
+> 旧的 10 条回归是 11-10 的，交互变了。**先跑这 12 条**。
+
+```bash
+D=192.168.2.32:5555
+A="adb -s $D"
+L() { $A shell "run-as com.pilot.agent cat files/pilot.log" | tr -d '\r' | grep -E "$1" | tail -${2:-3}; }
+
+# 0. 编译 + 部署 + 推模型
+bash scripts/deploy-device.sh $D
+
+# 1. 唤醒：应有「我在」+ 进入聆听
+$A shell "am start -n com.pilot.agent/com.pilot.agent.ui.TriggerActivity --es voice_test wake"
+L "唤醒|语音状态" 2
+
+# 2. 声纹：清除后第一句话应自动注册
+#    （设置 → 语音唤醒 → 清除；然后说一句话）
+L "首句注册|模板已保存" 2
+
+# 3. 免打扰：说休息类话术应回应并休眠
+$A shell "am start -n com.pilot.agent/com.pilot.agent.ui.TriggerActivity --es voice_test say --es say_text '你休息一会'"
+L "免打扰|ASLEEP" 2
+
+# 4. 免打扰能被唤醒词叫醒
+$A shell "am start -n com.pilot.agent/com.pilot.agent.ui.TriggerActivity --es voice_test wake"
+L "唤醒" 1
+
+# 5. 打断词在非播报状态不唤醒（不该有"进入活跃期"）
+$A shell "am start -n com.pilot.agent/com.pilot.agent.ui.TriggerActivity --es voice_test 停一下"
+L "打断词" 1
+
+# 6. 播报中停止按钮：应出现红底白方块，点击后焦点释放
+$A shell "am start -n com.pilot.agent/com.pilot.agent.ui.TriggerActivity --es speak_text '一段长播报内容用来测试停止按钮'"
+sleep 2   # 截图确认按钮
+
+# 7. 音乐：应有播放条（♪ 动态音柱 + 歌名 + 暂停/停止）
+#    「播放一首王菲的歌曲」
+L "开始播放" 1
+
+# 8. 音色预听：设置 → 播报 → 音色下拉 → 点「试听」
+#    MiniMax 需要 API Key；系统 TTS 无需网络
+
+# 9. 长按选文字：长按消息应有蓝色高亮 + 手柄 + 浮层菜单
+
+# 10. 输入栏：单击弹键盘（标题不被顶出屏幕）、长按录音（不弹键盘）
+
+# 11. 沙箱挂载：设置 → 维护 → 手动填路径 /storage/emulated/0/Download
+L "已挂载|挂载失败" 1
+
+# 12. 无障碍权限开着时，任务能跑完
+$A shell "am start -n com.pilot.agent/com.pilot.agent.ui.MainActivity --es goal '声音大一点'"
+L "识别|音量" 3
+```
+
+**看日志的正确姿势**（EMUI 会丢弃 logcat 的第三方 `Log.i`，只能读文件日志）：
+```bash
+$A shell "run-as com.pilot.agent cat files/pilot.log" | tr -d '\r' | tail -50
+```
+
+## 11-11 傍晚（16:00~21:40）做了什么
+
+> 这一段全是**交互层面**的返工，代码不难但坑极多。
+> 每一条都写了「为什么这么写」，照着改回去会重踩。
+
+### 声纹：注册流程推倒重做
+
+**最终交互**：清除声纹后，**说第一句话就自动注册**（不用念固定口令）。
+
+```
+清除声纹 → 设置里显示"未注册 —— 说第一句话时自动注册"
+   ↓ 说任意一句（≥1.5s、非问句）
+声纹已记住（用你说的第一句话注册的）
+   ↓
+之后只认这个声音
+```
+
+**为什么推翻原来的"念 3 遍口令"**：
+口令必须**包含唤醒词**（声纹校验拿「注册音频」和「唤醒时那段音频」比余弦，
+两句得是同一段话），用户记不住；而且 3 遍太重。
+
+**排除项**：问句（「注册了吗」）和太短的应答（「嗯」）不算，
+否则状态询问会变成模板。
+
+### ★★ 崩了 5 次才定位的坑：声纹模型缺 metadata
+
+`sherpa-onnx` 构造 `SpeakerEmbeddingExtractor` 时**静默失败返回空指针**（不抛异常），
+下一次 `createStream()` 直接 `SIGSEGV`——进程消失，Kotlin 完全接不住。
+
+sherpa 自己在 logcat 里说了：
+```
+sherpa-onnx: No model_type in the metadata!
+sherpa-onnx: Please make sure you have added metadata to the model.
+```
+
+原始 WeSpeaker 的 `cnceleb_resnet34_LM.onnx` **没有 sherpa 认的 metadata**。
+
+**解法**：换 sherpa 官方打包的
+`3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx`
+（27MB、192 维、metadata 带 `framework=3d-speaker`），
+放 `files/models/voiceprint/campplus_sv_zh_16k.onnx`。
+代码按 `MODEL_CANDIDATES` 优先找它。
+
+**排查手法（以后 native 崩溃照这个来）**：
+```bash
+adb logcat -d -b crash          # native 崩溃栈（EMUI 只丢第三方 Log.i，native stderr 还在）
+adb logcat -d | grep sherpa-onnx   # sherpa 自己的原生报错
+```
+Kotlin 的 try/catch 抓不到 native abort，这两条命令才是关键。
+
+### 输入栏：结构重写（6 层补丁换来的教训）
+
+**最终结构**：
+```
+Box
+ ├─ OutlinedTextField        永远不自己处理触摸
+ ├─ 流光边框 / "正在听…" 层   仅录音时
+ └─ 透明手势罩层             仅「未进入文本输入态」时存在
+```
+
+**四条硬规则**（违反任一条都会重踩）：
+
+1. `readOnly` / `disabled` 会让 TextField **停止消费指针事件**，
+   长按手势就断了。要禁焦点只能用**罩层**或 `focusProperties(canFocus=false)`。
+2. **按住不动时不会有新指针事件**。长按判定必须用
+   `withTimeoutOrNull(450ms) { 等 up }` 靠超时主动唤醒；
+   `while(awaitPointerEvent) { 比较时间戳 }` **永远不会触发**。
+3. **父级 `detectTapGestures(onTap)` 和长按的抬起是同一个事件**——
+   无论加多少延迟都会在"长按完松手"时误清选择。
+   父级只管收焦点，"清选择"要用 `lastLongPressAt` 时间戳区分。
+4. 浮层菜单不能套 `size(0)` 的 Box（**会被裁掉**），
+   也不能只靠 `offset`（父 Box 仍会裁）。
+   正确做法：`graphicsLayer { translationY }` 做纯视觉位移。
+
+**配套**：manifest 加 `android:windowSoftInputMode="adjustResize"`，
+否则键盘弹出会 `adjustPan` 把标题顶出屏幕。
+
+### 长按选文字：浮在原文上的选择条
+
+```
+长按消息 → 蓝色高亮直接画在原文字上 + 两端竖线和圆点手柄
+        → 半透明横向菜单浮在文字上方：复制 / 添加到输入框 / 全选
+        → 点别处放弃选择
+```
+
+- 文字按分隔符切块（中文标点/问叹分冒号/空格），**保留末尾标点**。
+  不要用英文句点/逗号分隔，否则 `3680.64` 会被切成 `3680.` / `64`。
+- 手柄**要能反复拖**：`pointerInput` 协程里捕获的 `selRange` 是旧快照，
+  必须用 `rememberUpdatedState` 读最新值。
+- 「添加到输入框」后**光标自动到句末**：输入框得用 `TextFieldValue` 而不是 `String`。
+- 菜单浮层用 `Dialog` 承载（普通 Box 叠层会被后面的内容盖住）。
+
+### 音乐：播放条 + 语音输入时暂停
+
+**聊天区上部**：♪ 动态音柱（4 根不同相位跳动，播放中动/暂停时静）+ 歌名 + 暂停/继续 + 停止。
+
+**语音输入时自动暂停音乐**（不是停止，保留播放位置），说完自动恢复。
+
+> ★★ 踩坑：**暂停必须释放麦克风闸门**（`AudioGate.hold("music")`）。
+> 不释放的话，麦克风仍被判为"放音中不可信"→ **录不到人声**（用户反馈"暂停了但无法录入"）。
+> `resume()` 时要重新占闸。
+
+### 音色：双引擎可选 + 预听
+
+设置 → 播报，按当前引擎只显示对应选择器：
+
+- **MiniMax**：内置 12 个官方系统音色（青涩青年男/御姐女声/主持人…）
+- **系统 TTS**：**运行时向引擎枚举**，列出所有中文相关音色
+  （`zh` / `zh-CN` / `zh-TW` / `cmn` / `yue`，只按 `startsWith("zh")` 会漏）
+
+> ★ 枚举音色**必须复用 Speaker 里已经在播报的那个 SystemTts 实例**，
+> 新建一个的话引擎初始化还没完成，枚举出来是空的（实测一个都没有）。
+> 还要等 `initLatch`（引擎初始化是异步的）。
+> 华为引擎所有中文音色的 `name` 都叫 `"zh"`，标签得靠 序号+locale+features 区分。
+
+**预听**：`MiniMax` 走 `voiceOverride` 合成；系统 TTS 是 `setVoice` 播完 3.5 秒切回原音色。
+
+> ★ 试听按钮用 `pointerInput` 消费点击事件时会踩坑：
+> `awaitFirstDown(requireUnconsumed=false)` 之后又写了
+> `awaitFirstDown(requireUnconsumed=true)`——**第二个等的是下一个 down**，
+> 一次点击只有一个 down，所以永远挂住、试听从不执行。
+> 正确做法：**结构上分离**——整行不挂 clickable，左半边（文字）负责选中，
+> 右半边（试听）独立 TextButton。
+
+### 免打扰（老板定的：和自动休眠是同一个逻辑）
+
+用户说「你休息一会 / 我先忙一会 / 别打扰我」→ **复用休眠**（`Mode.WAKE` + `State.ASLEEP`），
+只跑唤醒词，不聆听、不识别指令。唤醒词或长按输入框才醒。
+
+- **不要另造 DND 模式**——这就是"超时自动休眠"的同一条逻辑，只是触发方式不同。
+- 回应一句「我先休息了，有事叫我啊」，顺序是**先休眠再播报**
+  （反过来这句会被自己当成新指令听进去）。
+- 按老板要求**不挂任何提示条**。
+- 话术含操作动词的不算（"我休息好了放音乐"仍是任务）。
+
+### 唤醒时说「我在」
+
+用**新的 `speakQuiet`**（不占麦克风闸门、不抢音频焦点）：
+正常播报会 `AudioGate.hold("tts")`，那样用户"喊完唤醒词马上接指令"的那半句会被丢掉。
+
+`isWakeEcho` 要排除「我在/我在在/我在了」——不占闸的话麦克风会把它听进去。
+
+### 其它零碎
+
+- **打断词在非播报状态一律忽略**。原来会调 `backToIdleOrWake()` 把 `WAKE` 切成 `ACTIVE`，
+  活跃期免唤醒监听 → 环境音被当对话 → **"莫名被唤醒"**（用户反馈）。
+- **放音期间连 VAD 都不喂**并 `reset()`。只在 `recognize()` 入口拦不够——
+  VAD 一直在攒播报声，播完整段被切出来 → ASR 误识别 → **自激循环**（日志里连着 6 轮）。
+- **同内容 3 秒内去重**：长按松手时 VAD flush 一句、麦克风还在录，紧接着又切一段 → 显示两遍。
+- **AI 回答删末尾括号补充**：「音量 86% 调到 100%（+14%，已到最大）」→「音量 86% 调到 100%」。
+  只删含中文/加号/百分号的那组，「型号 (X100)」要留着。
+- **删除「无障碍服务还没开…」提示**：顶部「操作权限 未开启」卡片已有「去开启」按钮，重复。
+- **删除「声纹不匹配，已忽略这句」**：那是防误触发的正常路径，不是错误，写进对话区像出故障。
+- **沙箱挂载目录**：manifest 补 `MANAGE_EXTERNAL_STORAGE` 等权限；
+  SAF 的 `OpenDocumentTree` 在部分 ROM 上不弹/不返回 → 加「手动填路径」入口
+  （proot bind mount 真正需要的只是宿主 POSIX 路径）。
+
+### 新增自检入口
+
+```bash
+# 模拟识别到一句话（测意图分流用，不用真说话）
+adb shell "am start -n com.pilot.agent/com.pilot.agent.ui.TriggerActivity \
+  --es voice_test say --es say_text '你休息一会'"
+
+# 直接进免打扰
+adb shell "am start -n com.pilot.agent/com.pilot.agent.ui.TriggerActivity --es voice_test dnd"
+```
+
 ## 踩过的坑（别重复踩）
 
 ### 华为 / 真机
@@ -544,6 +780,10 @@ adb shell "am start -n com.pilot.agent/com.pilot.agent.ui.TriggerActivity --es v
 
 ## 下次的开工清单
 
+> ⚠️ 下面的 `regress.sh` 是 11-10 的版本（10 条，验的是旧交互）。
+> **先跑上面「回归清单（11-11 重做后的版本）」的 12 条**，
+> 再跑 `regress.sh` 补验设备操作那部分。
+
 **第 0 条：回归（必跑）**
 ```bash
 bash scripts/regress.sh            # 10 条，逐条打结论（设备默认 192.168.2.32:5555）
@@ -618,14 +858,21 @@ offload handler 按需接回（Pilot 已有等价能力，只缺「容器内 CLI
 ```
 agent/AgentLoop.kt          主循环（意图分流、planner 链、执行 dispatch）
 agent/HeuristicPlanner.kt   规则层（顺序：系统直调 → 直达 → App 入口 → 应用启动 → 按键 → 点击）
-agent/IntentGate.kt         意图三分类（改这个记得同步 TASK_VERBS）
+agent/IntentGate.kt         意图三分类 + 免打扰话术（改这个记得同步 TASK_VERBS）
 agent/PlannerRouter.kt      planner 链（规则 → 端侧 → 云端）
 action/SystemOps.kt         音量/亮度/电话
 action/ActionCatalog.kt     系统 action 静态表
 action/AppLaunchIndex.kt    2532 条 App 入口索引
 query/QueryEngine.kt        查询调度
 voice/*                     语音全链路
+  voice/VoiceInput.kt       状态机（WAKE/ACTIVE/LISTEN/ASLEEP）+ 首句声纹注册
+  voice/VoiceprintGate.kt   声纹门禁（余弦比对，失败一律放行）
+  voice/SystemTts.kt        系统 TTS（音色枚举/预听）
+  voice/MiniMaxTts.kt       云端 TTS（voice_id/预听）
+  voice/Speaker.kt          播报门面（speak 正常 / speakQuiet 不占闸）
+  voice/AudioGate.kt        麦克风闸门（放音时不可信）
 music/*                     在线音乐
+  music/MusicPlayer.kt      播放器（pause 必须释放麦克风闸门！）
 sandbox/SandboxTerminal.kt  沙箱门面（agent 唯一入口）
 sandbox/*                   proot 内核（minis 移植，7338 行）
 sandbox/shim/*              minis 依赖桩（AppLogger/MountedFoldersStore/network）
