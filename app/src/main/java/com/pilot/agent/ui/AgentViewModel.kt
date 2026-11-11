@@ -102,7 +102,14 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     var enrollResult by mutableStateOf<Boolean?>(null)
         private set
     /** 注册口令（引导文案用） */
-    val enrollPhrase = "我是小派的主人，现在开始录入我的声音"
+    /**
+     * 声纹注册口令。
+     *
+     * ★ 必须**包含唤醒词**：声纹校验拿的是"注册音频"和"唤醒时那段音频"比，
+     *   两句得是同一段话，否则主人自己喊唤醒词时分数偏低会被拒。
+     * ★ 也天然覆盖打断词（先停一下 / 等我说完），注册时顺带验证这两条链路。
+     */
+    val enrollPhrase = "小派你好，小派小派，先停一下，等我说完你再说话"
 
     // ---------- 网易云扫码登录 ----------
     var qrBitmap by mutableStateOf<android.graphics.Bitmap?>(null)

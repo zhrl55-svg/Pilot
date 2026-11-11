@@ -189,6 +189,7 @@ class VoiceInput(
             return false
         }
         val v = EnergyVad(
+            minSilenceMs = { silenceThresholdMs },
             onSpeechStart = { Dbg.i(TAG, "VAD: 开口") },
             onSegment = { pcm ->
                 if (enrolling) {
@@ -236,6 +237,16 @@ class VoiceInput(
     var onEnrollSegment: (index: Int, total: Int) -> Unit = { _, _ -> }
     var onEnrollDone: (Boolean) -> Unit = {}
 
+    /**
+     * 当前 VAD 的静音阈值（毫秒）。
+     *
+     * 普通指令 800ms 就切句；**声纹注册时用 2500ms**——
+     * 注册口令「小派你好，小派小派，先停一下，等我说完你再说话」里有好几处逗号停顿，
+     * 800ms 会把它切成一堆碎片，攒不满 3 段。
+     */
+    @Volatile
+    private var silenceThresholdMs = 800
+
     /** 注册看门狗：多久没有新样本就判定用户放弃了（毫秒） */
     @Volatile
     private var lastEnrollSampleAt = 0L
@@ -252,6 +263,7 @@ class VoiceInput(
     fun startEnroll(): Boolean {
         if (!ensureCapture()) return false
         enrolling = true
+        silenceThresholdMs = ENROLL_SILENCE_MS
         lastEnrollSampleAt = SystemClock.uptimeMillis()
         main.removeCallbacks(enrollWatchdog)
         main.postDelayed(enrollWatchdog, ENROLL_IDLE_TIMEOUT_MS)
@@ -269,6 +281,7 @@ class VoiceInput(
 
     fun cancelEnroll() {
         enrolling = false
+        silenceThresholdMs = NORMAL_SILENCE_MS
         main.removeCallbacks(enrollWatchdog)
         enrollSamples.clear()
         resumeToWake = enrollResumeWake
@@ -277,6 +290,7 @@ class VoiceInput(
 
     private fun finishEnroll(): Boolean {
         enrolling = false
+        silenceThresholdMs = NORMAL_SILENCE_MS
         main.removeCallbacks(enrollWatchdog)
         resumeToWake = enrollResumeWake
         val ok = enrollSamples.size >= ENROLL_TARGET
@@ -605,8 +619,19 @@ class VoiceInput(
     private companion object {
         const val TAG = "PilotVoice"
 
-        /** 注册时多久没有新样本就自动取消（用户放弃了） */
-        const val ENROLL_IDLE_TIMEOUT_MS = 20_000L
+        /** 普通指令的断句静音阈值 */
+        const val NORMAL_SILENCE_MS = 800
+
+        /** 声纹注册的断句静音阈值（口令里有逗号停顿，要切得慢） */
+        const val ENROLL_SILENCE_MS = 2500
+
+        /**
+         * 注册时多久没有新样本就自动取消（用户放弃了）。
+         *
+         * 45 秒：一句口令约 3~5 秒，用户念 3 遍中间可能停顿思考，
+         * 20 秒太短会把还在进行的注册判成"放弃"（实测第 3 段被吃掉）。
+         */
+        const val ENROLL_IDLE_TIMEOUT_MS = 45_000L
 
         /** 放音结束后多久内录到的音频一律当回声丢掉 */
         const val ECHO_GUARD_MS = 900L

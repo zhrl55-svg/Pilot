@@ -997,14 +997,27 @@ private fun VoiceprintEnrollDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
                     fontSize = 12.sp,
                     lineHeight = 18.sp,
                 )
+                Surface(
+                    color = colors.primary.copy(alpha = 0.10f),
+                    shape = RoundedCornerShape(10.dp),
+                ) {
+                    Text(
+                        "「${vm.enrollPhrase}」",
+                        fontSize = 14.sp,
+                        color = colors.primary,
+                        lineHeight = 21.sp,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                    )
+                }
                 Text(
-                    "「${vm.enrollPhrase}」",
-                    fontSize = 14.sp,
-                    color = colors.primary,
+                    "这句必须原样念（它包含唤醒词和打断词，念别的注册了也认不出来）。念完停顿 3 秒算一句。",
+                    fontSize = 11.sp,
+                    color = colors.onSurfaceVariant,
+                    lineHeight = 16.sp,
                 )
                 when {
                     vm.enrollRunning -> Text(
-                        "正在采集… ${vm.enrollProgress}（自动计数，说满 3 句即完成）",
+                        "正在采集 ${vm.enrollProgress}（说满 3 句即完成）",
                         fontSize = 12.sp,
                         color = colors.error,
                     )
