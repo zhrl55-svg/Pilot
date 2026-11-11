@@ -91,8 +91,18 @@ class MusicPlayer private constructor(private val context: Context) {
             if (mp.isPlaying) mp.pause()
             isPlaying = false
             paused = true
+            // ★ 暂停必须释放麦克风闸门！
+            //   闸门是"放音中麦克风不可信"的标记，不释放的话
+            //   语音输入时麦克风仍被判为不可信 → 录不到人声（实测）。
+            releaseGate()
             Dbg.i(TAG, "音乐已暂停：$currentTitle")
         }.onFailure { Dbg.w(TAG, "暂停失败 ${it.message}") }
+    }
+
+    /** 释放麦克风闸门（暂停时用；恢复播放会重新占上）。 */
+    private fun releaseGate() {
+        runCatching { audioGate?.close() }
+        audioGate = null
     }
 
     /** 恢复播放（从暂停点继续） */
@@ -103,6 +113,10 @@ class MusicPlayer private constructor(private val context: Context) {
             mp.start()
             isPlaying = true
             paused = false
+            // 恢复播放要重新占闸（暂停时释放了）
+            if (audioGate == null) {
+                audioGate = com.pilot.agent.voice.AudioGate.hold("music")
+            }
             Dbg.i(TAG, "音乐已恢复：$currentTitle")
         }.onFailure { Dbg.w(TAG, "恢复失败 ${it.message}") }
     }
