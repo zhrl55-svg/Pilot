@@ -174,6 +174,10 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     private var loginJob: kotlinx.coroutines.Job? = null
 
     private var voice: VoiceInput? = null
+
+    /** 最近一次用户说的话（用于去重） */
+    private var lastUserText: String? = null
+    private var lastUserTextAt = 0L
     private var seq = 0L
 
     init {
@@ -288,11 +292,24 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             // 单例复用：把回调换成当前 ViewModel 的
             v.onState = { voiceState = it }
             v.onText = { text ->
-                add(LogEntry.Kind.USER, text)
-                when (IntentGate.classify(text)) {
-                    IntentGate.Kind.TASK -> run(text)
-                    IntentGate.Kind.QUERY -> query(text)
-                    IntentGate.Kind.CHAT -> chat(text)
+                // ★ 去重：同一条内容短时间内重复到达只显示一次。
+                //   长按录音松手时，VAD 会 flush 出一句；麦克风还在录，
+                //   紧接着又切出一段内容相近的 → 用户看到"显示了两遍"（实测）。
+                val now = System.currentTimeMillis()
+                val dup = lastUserText == text.trim() && now - lastUserTextAt < 3000L
+                if (dup) {
+                    add(LogEntry.Kind.OBSERVE, "（重复内容已忽略）")
+                } else {
+                    lastUserText = text.trim()
+                    lastUserTextAt = now
+                    add(LogEntry.Kind.USER, text)
+                }
+                if (!dup) {
+                    when (IntentGate.classify(text)) {
+                        IntentGate.Kind.TASK -> run(text)
+                        IntentGate.Kind.QUERY -> query(text)
+                        IntentGate.Kind.CHAT -> chat(text)
+                    }
                 }
             }
             v.onError = { msg -> add(LogEntry.Kind.ERROR, msg) }
@@ -874,6 +891,10 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         t = dedup.joinToString(" ")
         // 去掉机械后缀
         t = t.removeSuffix(" 已完成").removeSuffix("已完成").trim()
+        // ★ 去掉括号里的补充说明："音量 86% 调到 100%（+14%，已到最大）" → "音量 86% 调到 100%"
+        //   只删**含中文或百分比/加号**的那组（+14%、已到最大这种），
+        //   "型号 (X100)"这种正经括号内容要留着。
+        t = t.replace(Regex("[（(][^（()）]*(?:[\u4e00-\u9fa5]|[+±]|%)[^（()）]*[)）]\\s*$"), "").trim()
         if (t == "完成" || t.isEmpty()) return "好了"
         return t
     }

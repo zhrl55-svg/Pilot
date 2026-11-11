@@ -445,7 +445,8 @@ private fun MusicBar(
 ) {
     val colors = MaterialTheme.colorScheme
     Surface(
-        color = colors.secondaryContainer.copy(alpha = 0.55f),
+        // 浅灰半透明：跟内容区一个调子，不抢视线
+        color = androidx.compose.ui.graphics.Color(0x66FFFFFF).copy(alpha = 0.28f),
         shape = RoundedCornerShape(12.dp),
         modifier = Modifier.fillMaxWidth(),
     ) {
@@ -459,7 +460,7 @@ private fun MusicBar(
             Text(
                 title,
                 fontSize = 13.sp,
-                color = colors.onSecondaryContainer,
+                color = colors.onSurface,
                 maxLines = 1,
                 overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f),
