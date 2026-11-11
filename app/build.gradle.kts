@@ -27,6 +27,14 @@ android {
         // （老 Key 绑在 nav-agent 包名下，SDK 算路会被拒，但 POI/定位还能用）
         manifestPlaceholders["AMAP_KEY"] =
             localProp("AMAP_KEY_PILOT").ifBlank { localProp("AMAP_KEY") }
+
+        // ★ 只打 arm64-v8a。
+        //   原来四个架构全打：arm64 52MB + x86 14MB + x86_64 14MB + v7a 11MB（压缩后），
+        //   后三个加起来 39MB 纯粹是给模拟器和 32 位老机用的，真机一个字节都用不上。
+        //   需要模拟器调试时加 -PallAbis=true 打全架构。
+        if (providers.gradleProperty("allAbis").orNull != "true") {
+            ndk { abiFilters += "arm64-v8a" }
+        }
     }
 
     signingConfigs {
