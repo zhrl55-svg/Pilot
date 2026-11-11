@@ -327,7 +327,13 @@ class DeviceActions(
         val target = expectPkg ?: hit.activityInfo.packageName
         val before = foregroundPackage()
         val started = runCatching { service.startActivity(intent) }
-            .onFailure { Dbg.w(TAG, "启动失败 ${it.javaClass.simpleName}: ${it.message}") }
+            .onFailure {
+                Dbg.w(TAG, "启动失败 ${it.javaClass.simpleName}: ${it.message}")
+                // 设置页被系统拒绝（未导出）就记下来，下次别再撞墙
+                if (it is SecurityException && intent.action != null) {
+                    SettingsShortcuts.markDead(intent.action!!)
+                }
+            }
             .isSuccess
         if (!started) return false
         // 目标本来就在前台（同包内换页），回查不出差别，放行
@@ -375,7 +381,7 @@ class DeviceActions(
         }.getOrDefault(target)
         // 首选「系统搜索」：桌面下滑 → 输入应用名 → 回车，一次直达，不受图标在第几屏、
         // 是否被塞进文件夹影响（华为把一堆系统应用收进了大文件夹）。
-        if (globalSearch(displayLabel, target)) return true
+        if (globalSearch(displayLabel, target, listOf("已安装的应用", "应用"))) return true
         // 最后手段才是翻屏点图标。
         if (launchViaLauncherGesture(target, displayLabel)) return awaitForeground(target, 2500L)
         Dbg.w(TAG, "搜索和桌面图标都没能把 $target 拉到前台")
@@ -396,7 +402,11 @@ class DeviceActions(
      * @param query     输入的关键词
      * @param expectPkg 期望落到的包；null 表示只要求「点了某条结果」
      */
-    private suspend fun globalSearch(query: String, expectPkg: String?): Boolean {
+    private suspend fun globalSearch(
+        query: String,
+        expectPkg: String?,
+        wantSections: List<String>? = null,
+    ): Boolean {
         val w = service.resources.displayMetrics.widthPixels
         val h = service.resources.displayMetrics.heightPixels
 
@@ -484,7 +494,7 @@ class DeviceActions(
             Dbg.w(TAG, "全局搜索：联想为空，提交搜索 entered=$entered")
             if (expectPkg != null && awaitForeground(expectPkg, 3000L)) return true
             delay(800)
-            list = candidates(query, searchPkg)
+            list = candidates(query, searchPkg, wantSections)
         }
         if (list.isEmpty()) {
             Dbg.w(TAG, "全局搜索：没有匹配「$query」的结果")
@@ -531,83 +541,88 @@ class DeviceActions(
     }
 
     /**
-     * 收集联想列表的候选：**「最佳匹配」分区优先，其次按匹配强度 + 靠上**，最多 5 个。
+     * 收集搜索结果候选，**按分区限定**。
      *
-     * 为什么返回一串而不是一个：
-     * - 只取"最靠上"会点到「图片中找到的文字」缩略图，点完停在搜索页；
-     * - 只按字符串打分又会点到列表深处不相干的条目。
-     * 所以改成"给一串候选，点一个验一个"——点完没离开搜索页就点下一个。
+     * 桌面搜索的结果页是分区结构：最佳匹配 / 设置 / 应用市场 / 搜索网络结果 /
+     * 资讯 / 玩机技巧 / 小视频 / 已安装的应用……每块上面有个小标题。
+     * 之前的做法是"全页找文字 + 打分"，结果点到过图片缩略图、应用市场条目、内嵌网页。
+     * 现在的做法很直接：**认标题、算分区，只在指定分区里取候选**。
      *
-     * 排除：输入框自身（它的文字必然含关键词）、WebView 里的文字（那是网页搜索结果）。
+     * @param wantSections 只在这些分区里找；null 表示不限定（兜底用）
      */
-    private suspend fun candidates(keyword: String, searchPkg: String?): List<AccessibilityNodeInfo> =
-        withTimeoutOrNull(4000L) {
-            val roots = runCatching { service.windows.mapNotNull { it.root } }.getOrDefault(emptyList())
-            val mine = roots.filter { r ->
-                val p = r.packageName?.toString().orEmpty()
-                !p.contains("inputmethod", true) && (searchPkg == null || p == searchPkg)
-            }
-            val rect = android.graphics.Rect()
+    private suspend fun candidates(
+        keyword: String,
+        searchPkg: String?,
+        wantSections: List<String>? = null,
+    ): List<AccessibilityNodeInfo> = withTimeoutOrNull(4000L) {
+        val roots = runCatching { service.windows.mapNotNull { it.root } }.getOrDefault(emptyList())
+        val mine = roots.filter { r ->
+            val p = r.packageName?.toString().orEmpty()
+            !p.contains("inputmethod", true) && (searchPkg == null || p == searchPkg)
+        }
+        val rect = android.graphics.Rect()
 
-            // 先定位「最佳匹配」分区标题的 y：它下面的条目优先
-            var bestMatchY = Int.MAX_VALUE
-            for (root in mine) {
-                val st = ArrayDeque<AccessibilityNodeInfo>()
-                st.add(root)
-                var g = 0
-                while (st.isNotEmpty() && g++ < 800) {
-                    val n = st.removeLast()
-                    if (n.text?.toString()?.contains("最佳匹配") == true &&
-                        runCatching { n.getBoundsInScreen(rect) }.isSuccess
-                    ) {
-                        bestMatchY = minOf(bestMatchY, rect.top)
-                    }
-                    for (i in 0 until n.childCount) n.getChild(i)?.let { st.add(it) }
+        // 第一遍：把分区标题的 y 记下来（"设置"/"已安装的应用"/"应用市场"…）
+        val headers = mutableListOf<Pair<String, Int>>()
+        for (root in mine) {
+            val st = ArrayDeque<AccessibilityNodeInfo>()
+            st.add(root)
+            var g = 0
+            while (st.isNotEmpty() && g++ < 1200) {
+                val n = st.removeLast()
+                val t = n.text?.toString().orEmpty()
+                if (t in SECTION_TITLES && runCatching { n.getBoundsInScreen(rect) }.isSuccess) {
+                    headers += t to rect.top
                 }
+                for (i in 0 until n.childCount) n.getChild(i)?.let { st.add(it) }
             }
+        }
 
-            val out = mutableListOf<Triple<AccessibilityNodeInfo, Int, Int>>() // node, rank, top
-            for (root in mine) {
-                val st = ArrayDeque<AccessibilityNodeInfo>()
-                st.add(root)
-                var g = 0
-                while (st.isNotEmpty() && g++ < 1200) {
-                    val n = st.removeLast()
-                    if (!n.isEditable && !underWebView(n)) {
-                        val label = n.text?.toString().orEmpty()
-                        val web = label.contains("百度") || label.contains("网页") || label.contains("查看更多")
-                        val score = when {
-                            label.isBlank() || web -> 0
-                            label.equals(keyword, ignoreCase = true) -> 3
-                            label.startsWith(keyword, ignoreCase = true) -> 2
-                            label.contains(keyword, ignoreCase = true) && label.length <= keyword.length + 24 -> 1
-                            else -> 0
-                        }
-                        if (score > 0 && runCatching { n.getBoundsInScreen(rect) }.isSuccess && rect.height() > 0) {
-                            val rank = if (bestMatchY != Int.MAX_VALUE && rect.top > bestMatchY) score * 10 else score
-                            out += Triple(n, rank, rect.top)
-                        }
+        // 第二遍：取候选，并算出它属于哪个分区（最近的上方标题）
+        val out = mutableListOf<Triple<AccessibilityNodeInfo, Int, Int>>() // node, score, top
+        for (root in mine) {
+            val st = ArrayDeque<AccessibilityNodeInfo>()
+            st.add(root)
+            var g = 0
+            while (st.isNotEmpty() && g++ < 1200) {
+                val n = st.removeLast()
+                if (!n.isEditable && !underWebView(n)) {
+                    val label = n.text?.toString().orEmpty()
+                    val score = when {
+                        label.isBlank() -> 0
+                        label.equals(keyword, ignoreCase = true) -> 3
+                        label.startsWith(keyword, ignoreCase = true) -> 2
+                        label.contains(keyword, ignoreCase = true) && label.length <= keyword.length + 24 -> 1
+                        else -> 0
                     }
-                    for (i in 0 until n.childCount) n.getChild(i)?.let { st.add(it) }
+                    if (score > 0 && runCatching { n.getBoundsInScreen(rect) }.isSuccess && rect.height() > 0) {
+                        val section = nearestHeader(headers, rect.top)
+                        val sectionOk = wantSections == null || section == null || section in wantSections
+                        if (sectionOk) out += Triple(n, score, rect.top)
+                    }
                 }
+                for (i in 0 until n.childCount) n.getChild(i)?.let { st.add(it) }
             }
-            out.sortedWith(
-                compareByDescending<Triple<AccessibilityNodeInfo, Int, Int>> { it.second }.thenBy { it.third },
-            ).map { it.first }
-                .distinctBy { node ->
-                    val r = android.graphics.Rect()
-                    runCatching { node.getBoundsInScreen(r) }
-                    "${r.top}/${r.left}"
-                }
-                .take(5)
-        } ?: emptyList()
+        }
+        out.sortedWith(compareByDescending<Triple<AccessibilityNodeInfo, Int, Int>> { it.second }.thenBy { it.third })
+            .map { it.first }
+            .distinctBy { node ->
+                val r = android.graphics.Rect()
+                runCatching { node.getBoundsInScreen(r) }
+                "${r.top}/${r.left}"
+            }
+            .take(5)
+    } ?: emptyList()
+
+    /** 某个 y 属于哪个分区：取它上方最近的那个标题。 */
+    private fun nearestHeader(headers: List<Pair<String, Int>>, top: Int): String? =
+        headers.filter { it.second < top }.maxByOrNull { it.second }?.first
 
     /**
      * 当前页面是不是"网页"（点错建议时会进到搜索 App 内嵌的网页里）。
      *
      * ★ 不能按包名判：华为搜索的网页是**它自己内嵌 WebView 打开的**，
      *   前台包一直是 com.huawei.search，看不到任何 browser 包（实测 dump 确认）。
-     *   所以按内容判：有 WebView 节点，或页面上出现"百度一下"这种网页标志。
      */
     private fun looksLikeWebPage(): Boolean {
         val roots = runCatching { service.windows.mapNotNull { it.root } }.getOrDefault(emptyList())
@@ -616,8 +631,7 @@ class DeviceActions(
         var guard = 0
         while (stack.isNotEmpty() && guard++ < 1200) {
             val n = stack.removeLast()
-            val cls = n.className?.toString().orEmpty()
-            if (cls.contains("WebView", ignoreCase = true)) return true
+            if (n.className?.toString()?.contains("WebView", ignoreCase = true) == true) return true
             val t = n.text?.toString().orEmpty()
             if (t.contains("百度一下") || t.contains("相关搜索") || t.contains("网页快照")) return true
             for (i in 0 until n.childCount) n.getChild(i)?.let { stack.add(it) }
@@ -903,7 +917,7 @@ class DeviceActions(
      */
     suspend fun searchSettings(keyword: String): Boolean {
         if (keyword.isBlank()) return false
-        return globalSearch(keyword, "com.android.settings")
+        return globalSearch(keyword, "com.android.settings", listOf("设置"))
     }
 
     private suspend fun swipeDown(w: Int, h: Int, from: Float, to: Float) {
@@ -1054,6 +1068,18 @@ class DeviceActions(
          * 在卡片上横滑会被卡片吞掉。所以换几个高度各试一次，翻不动再判死。
          */
         private val SWIPE_YS = listOf(0.82f, 0.30f, 0.55f)
+
+        /**
+         * 桌面搜索页的分区标题。
+         *
+         * 华为搜索结果页固定是这几块：最佳匹配 / 设置 / 应用市场 / 搜索网络结果 /
+         * 资讯 / 玩机技巧 / 小视频 / 已安装的应用。按标题切区，才知道该点哪一条。
+         */
+        private val SECTION_TITLES = setOf(
+            "最佳匹配", "设置", "应用", "已安装的应用", "应用市场",
+            "搜索网络结果", "资讯", "玩机技巧", "小视频", "网页", "视频",
+            "相关搜索", "热门", "猜你想搜",
+        )
 
         /** 输入后等联想列表浮出来（输入即搜，不用回车） */
         private const val SUGGEST_WAIT_MS = 2000L

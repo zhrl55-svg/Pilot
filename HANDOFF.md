@@ -439,7 +439,16 @@ adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent.debug --ez imp
     `jniLibs.useLegacyPackaging = true`，否则 AGP 无视 manifest，so 不解包，
     nativeLibraryDir 里没有可执行的 libproot.so。Android 10+ 唯一可 exec 的位置
     就是 nativeLibraryDir（proot 伪装成 .so 放 jniLibs 的原因）。
-24. **AGP mergeDebugAssets 自动把 `.tar.gz` 解成 `.tar`**：源码里放 .gz，APK 里只有 .tar
+24. **设置子页大多「未导出」，第三方跳不进去**：`com.android.settings.EyeComfortSettings`
+    （护眼）看着在 resolver 表里，实际 `startActivity` 报
+    `SecurityException: not exported from uid 1000`——只有设置自己（uid 1000）能进。
+    所以「打开护眼模式」只能走**设置内搜索**。这类 action 试一次失败就拉黑，
+    别再撞墙（`SettingsShortcuts.markDead`）。
+25. **桌面搜索结果是分区结构**：最佳匹配 / 设置 / 应用市场 / 搜索网络结果 / 资讯 /
+    玩机技巧 / 小视频 / 已安装的应用。**必须按标题切区取候选**——搜 App 只点
+    「已安装的应用」，搜设置项只点「设置」。不分区的结果就是点到应用市场、点到
+    内嵌百度页（都实测踩过）。
+26. **AGP mergeDebugAssets 自动把 `.tar.gz` 解成 `.tar`**：源码里放 .gz，APK 里只有 .tar
     （RootfsManager 双名兜底所以没事，但别在 APK 里找 .gz 找不到就慌）。
     rootfs/proot 类资源记得加 `androidResources.noCompress`，`assets.openFd` 依赖不解压。
 

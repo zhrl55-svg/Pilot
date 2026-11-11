@@ -114,7 +114,70 @@ class AppLaunchIndex(private val pm: PackageManager) {
 
     fun size(): Int = entries.size
 
+    /**
+     * 按中文关键词在**设置 App** 里找对应页面。
+     *
+     * 为什么需要它：设置里那些子页面的 label 大多就是"设置"，
+     * 靠 [resolve]（按 label 匹配）根本区分不出来，于是「打开护眼模式」只能退到搜索 UI，
+     * 而搜索页分区杂乱、容易点错。
+     * 这里改按**类名**找：护眼 → `Settings$EyeComfortSettingsActivity`。
+     * 表里没有的词返回 null，调用方继续走搜索兜底，不会更差。
+     */
+    fun resolveSettingsItem(keyword: String): Entry? {
+        if (!built || entries.isEmpty()) {
+            Dbg.w(TAG, "设置项直达：索引未就绪 built=$built size=${entries.size}")
+            return null
+        }
+        val frag = SETTINGS_CLASS_HINTS.entries
+            .filter { keyword.contains(it.key) }
+            .maxByOrNull { it.key.length }
+            ?.value ?: return null
+        val hit = entries.firstOrNull { e ->
+            val pkg = e.component.packageName
+            pkg.contains("settings", ignoreCase = true) &&
+                e.component.className.contains(frag, ignoreCase = true)
+        }
+        Dbg.i(TAG, "设置项直达：$keyword → 片段 $frag → ${hit?.component?.className ?: "未命中"}")
+        return hit
+    }
+
     private companion object {
         const val TAG = "Pilot"
+
+        /**
+         * 中文关键词 → 设置页类名里的英文片段。
+         * 键用 AOSP 命名，华为/小米基本沿用；找不到就返回 null 走搜索兜底。
+         */
+        val SETTINGS_CLASS_HINTS = linkedMapOf(
+            "护眼" to "EyeComfort",
+            "夜间" to "NightDisplay",
+            "深色" to "NightDisplay",
+            "蓝牙" to "BluetoothSettings",
+            "电池" to "Battery",
+            "省电" to "BatterySaver",
+            "显示" to "Display",
+            "亮度" to "Display",
+            "存储" to "Storage",
+            "定位" to "Location",
+            "位置" to "Location",
+            "语言" to "Language",
+            "输入法" to "InputMethod",
+            "无障碍" to "Accessibility",
+            "开发者" to "Development",
+            "关于手机" to "About",
+            "系统更新" to "SystemUpdate",
+            "通知" to "Notification",
+            "锁屏" to "Security",
+            "指纹" to "Fingerprint",
+            "账户" to "Account",
+            "账号" to "Account",
+            "流量" to "DataUsage",
+            "热点" to "Tethering",
+            "飞行" to "Airplane",
+            "备份" to "Backup",
+            "恢复出厂" to "Reset",
+            "声音" to "Sound",
+        )
     }
+
 }

@@ -83,6 +83,38 @@ class HeuristicPlanner(
             val off = Regex("关闭|关掉|停用|禁用|取消|关一下").containsMatchIn(goal)
             val on = Regex("打开|开启|启用|开一下|亮起|启动").containsMatchIn(goal) && !off
             if (on || off) {
+                // ① 先想办法把这一项的页面打开：按类名在索引里找（护眼→EyeComfortSettingsActivity），
+                //    这比搜索页稳得多、快得多。打开后下一轮再拨开关。
+                val openedAlready = req.history.any { it.startsWith("直达") && it.contains(kw) && it.contains("ok") }
+                // 直达失败过就别再试：华为很多设置子页**没导出**（`not exported from uid 1000`），
+                // 重试一万次也是同一个 SecurityException，只会把步数烧完。
+                val openFailed = req.history.any { it.startsWith("直达") && it.contains(kw) && it.contains("fail") }
+                if (!openedAlready && !openFailed) {
+                    // ① 系统暴露的标准 action（android.settings.* / 厂商私有 action）最稳：
+                    //    一条 Intent 直接进页面，不经过搜索 UI。表里没有的词再往下走。
+                    com.pilot.agent.action.SettingsShortcuts.resolve(kw).firstOrNull()?.let { action ->
+                        return AgentDecision(
+                            thought = "设置页直达：$kw → $action",
+                            action = AgentAction(
+                                action = "shortcut",
+                                target = action,
+                                summary = "设置 $kw",
+                            ),
+                        )
+                    }
+                    // ② 没有 action 就按类名在入口索引里找
+                    appIndexProvider()?.resolveSettingsItem(kw)?.let { e ->
+                        return AgentDecision(
+                            thought = "设置项直达：${e.label}",
+                            action = AgentAction(
+                                action = "component",
+                                target = "${e.component.packageName}/${e.component.className}",
+                                summary = "设置 ${e.label}",
+                            ),
+                        )
+                    }
+                }
+                // ② 没有直达入口才交给"搜索 → 拨开关"
                 return AgentDecision(
                     thought = "设置开关：$kw → ${if (on) "开" else "关"}",
                     action = AgentAction(
