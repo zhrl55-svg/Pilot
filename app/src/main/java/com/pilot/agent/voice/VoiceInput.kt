@@ -3,6 +3,7 @@ package com.pilot.agent.voice
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import com.pilot.agent.Dbg
 import com.pilot.navigation.VoiceState
 import com.pilot.agent.agent.AgentSettings
@@ -51,9 +52,26 @@ class VoiceInput(
     var onWake: (String) -> Unit = onWake
     var onVoiceprint: (Float, Boolean) -> Unit = onVoiceprint
 
-    enum class State { IDLE, WAKE_WAIT, LISTENING, RECOGNIZING, UNAVAILABLE }
+    /**
+     * 语音打断时回调（播报中听到「停一下」这类）。
+     * AgentRuntime 注入成 `speaker.stop()`——VoiceInput 不直接依赖播报器。
+     */
+    var onInterrupt: (String) -> Unit = {}
 
-    private enum class Mode { OFF, WAKE, LISTEN }
+    enum class State {
+        IDLE,
+        /** 休眠：只跑唤醒词，省电 */
+        ASLEEP,
+        /** 待命：等唤醒词（启动后默认） */
+        WAKE_WAIT,
+        /** 活跃期：对话结束后的一段时间内，不用喊唤醒词，直接说话即可 */
+        ACTIVE,
+        LISTENING,
+        RECOGNIZING,
+        UNAVAILABLE,
+    }
+
+    private enum class Mode { OFF, WAKE, ACTIVE, LISTEN }
 
     private val main = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor { r ->
@@ -79,6 +97,20 @@ class VoiceInput(
     var state: State = State.IDLE
         private set
 
+    /** 活跃期截止时间（uptimeMillis），到点自动休眠。0 表示不计时 */
+    @Volatile
+    private var activeUntil: Long = 0L
+
+    private val sleepTick = Runnable {
+        if (mode == Mode.ACTIVE && SystemClock.uptimeMillis() >= activeUntil) {
+            Dbg.i(TAG, "活跃期结束，进入休眠（仍可唤醒）")
+            mode = Mode.WAKE
+            wake.reset()
+            vad?.reset()
+            emitState(State.ASLEEP)
+        }
+    }
+
     private val ring: RecentAudio by lazy {
         RecentAudio(AgentSettings.load().voiceprintWindowMs)
     }
@@ -96,12 +128,16 @@ class VoiceInput(
 
     /** 待命：常驻听唤醒词 */
     fun startWake(): Boolean {
-        val words = AgentSettings.load().wakeWordList()
+        val st = AgentSettings.load()
+        val words = st.wakeWordList()
         if (words.isEmpty()) {
             onError("唤醒词为空")
             return false
         }
-        if (!wake.load(words)) {
+        // ★ 打断词和唤醒词一起喂给 KWS：KWS 常驻在跑，顺带就能听见「停一下」，
+        //   不用另开一条识别链路（省算力，也避免两条链路抢麦克风）。
+        val allWords = if (st.interruptEnabled) (words + st.interruptWordList()).distinct() else words
+        if (!wake.load(allWords)) {
             onError(wake.lastError ?: "唤醒词加载失败")
             return false
         }
@@ -110,7 +146,7 @@ class VoiceInput(
         resumeToWake = true
         ring.clear()
         emitState(State.WAKE_WAIT)
-        Dbg.i(TAG, "进入待命，唤醒词=$words")
+        Dbg.i(TAG, "进入待命，KWS 词表=$allWords")
         return true
     }
 
@@ -132,6 +168,8 @@ class VoiceInput(
     }
 
     fun stop() {
+        main.removeCallbacks(sleepTick)
+        activeUntil = 0L
         mode = Mode.OFF
         vad?.flush()
         vad = null
@@ -233,26 +271,118 @@ class VoiceInput(
     /** 唤醒提示音：一声短 beep，告诉用户"我在听"。
      *  ★ 必须在切换音频模式之后播——它会被麦克风听到，
      *    但只有 ~100ms，ASR 切出来是单字，isWakeEcho 已按单字丢弃（同 TTS 回声处理）。 */
-    private fun playWakeTone() {
-        if (!AgentSettings.load().wakeTone) return
+    private fun playBeep(interrupt: Boolean = false) {
+        if (!interrupt && !AgentSettings.load().wakeTone) return
         runCatching {
-            val tone = android.media.ToneGenerator(android.media.AudioManager.MODE_IN_COMMUNICATION, 60)
-            tone.startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 120)
-            // 120ms 后 ToneGenerator 自己停；这里兜底释放
-            main.postDelayed({ runCatching { tone.release() } }, 400)
+            val tone = android.media.ToneGenerator(android.media.AudioManager.MODE_IN_COMMUNICATION, 70)
+            // 打断用双短音（"bi-bi"），和唤醒的单短音区分开——用户一听就知道"它停了"
+            if (interrupt) {
+                tone.startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 90)
+                main.postDelayed({
+                    runCatching { tone.startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 70) }
+                }, 130)
+            } else {
+                tone.startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 120)
+            }
+            main.postDelayed({ runCatching { tone.release() } }, 500)
         }.onFailure { Dbg.w(TAG, "提示音失败 ${it.message}") }
+    }
+
+    /** 重置活跃窗口：对话结束后还有 [AgentSettings.idleSleepSeconds] 秒可以免唤醒说话。 */
+    private fun resetActiveWindow() {
+        val sec = AgentSettings.load().idleSleepSeconds
+        if (sec <= 0) {
+            activeUntil = 0L
+            return
+        }
+        activeUntil = SystemClock.uptimeMillis() + sec * 1000L
+        main.removeCallbacks(sleepTick)
+        main.postDelayed(sleepTick, sec * 1000L + 50)
     }
 
     private fun onFrame(frame: ShortArray, len: Int) {
         ring.push(frame, len)
-        when (mode) {
-            Mode.WAKE -> {
-                val hit = wake.feed(frame, len)
-                if (hit != null) onWakeHit(hit)
-            }
+        if (mode == Mode.OFF) return
+        // ★ 唤醒词检测在**所有模式**下都跑：
+        //   播报中要能听见「停一下」打断，聆听中要能听见唤醒词重新开始。
+        val hit = wake.feed(frame, len)
+        if (hit != null) handleHit(hit)
+        if (mode == Mode.LISTEN || mode == Mode.ACTIVE) vad?.feed(frame, len)
+    }
 
-            Mode.LISTEN -> vad?.feed(frame, len)
-            Mode.OFF -> Unit
+    /**
+     * KWS 命中分流：打断词 / 播报中打断 / 唤醒。
+     *
+     * 判据顺序很关键——**先在"正在播报"时判断能不能打断**，
+     * 否则播报中说「停一下」会被当成普通唤醒，结果只是"重新开始听"，
+     * 播报还在继续，用户会以为没反应。
+     */
+    private fun handleHit(word: String) {
+        val st = AgentSettings.load()
+        val isInterruptWord = st.interruptWordList().any { word.contains(it) || it.contains(word) }
+        val speaking = AudioGate.isMuted
+
+        if (st.interruptEnabled && speaking && (isInterruptWord || word.isNotEmpty())) {
+            tryInterrupt(word, isInterruptWord)
+            return
+        }
+        if (isInterruptWord && !speaking) {
+            // 没在播报时说「停一下」→ 结束这次对话，回待命
+            Dbg.i(TAG, "收到打断词「$word」（未播报），结束本次对话")
+            runCatching { onInterrupt(word) }
+            backToIdleOrWake()
+            return
+        }
+        if (mode == Mode.LISTEN || state == State.RECOGNIZING) {
+            // 正在听指令又喊唤醒词：当作重新开始，丢掉半句
+            Dbg.i(TAG, "聆听中命中「$word」，重置这一句")
+            vad?.reset()
+            return
+        }
+        onWakeHit(word)
+    }
+
+    /**
+     * 播报中尝试打断。
+     *
+     * 条件按老板定的：**声纹符合 + 唤醒词或打断词**。
+     * 声纹校验用的是刚录到的那段音频（含播报回声，所以阈值放宽一半；
+     * 没注册模板就直接放行——「宁可放过，不可错杀」，不然用户永远打断不了）。
+     */
+    private fun tryInterrupt(word: String, isInterruptWord: Boolean) {
+        val st = AgentSettings.load()
+        val snapshot = ring.snapshot()
+        val needVerify = st.requireVoiceprint && gate.hasTemplate()
+        val proceed = {
+            Dbg.i(TAG, "语音打断「$word」（打断词=$isInterruptWord）")
+            runCatching { onInterrupt(word) }
+            playBeep(interrupt = true)
+            // 立刻进入聆听，接着说的话就是新指令
+            mode = Mode.LISTEN
+            vad?.reset()
+            wakeAuthorized = true
+            emitState(State.LISTENING)
+            resetActiveWindow()
+        }
+        if (!needVerify) {
+            proceed()
+            return
+        }
+        worker.execute {
+            val score = gate.verify(snapshot)
+            if (score == null) {
+                Dbg.w(TAG, "打断声纹不可用（${gate.lastError}），放行")
+                main.post { proceed() }
+                return@execute
+            }
+            // 播报中的录音混着扬声器声音，阈值放宽一半
+            val pass = score >= st.voiceprintThreshold * 0.5f
+            Dbg.i(TAG, "打断声纹 %.2f 阈值 %.2f → %s".format(score, st.voiceprintThreshold * 0.5f, if (pass) "通过" else "拒绝"))
+            if (pass) {
+                main.post { proceed() }
+            } else {
+                main.post { onVoiceprint(score, false) }
+            }
         }
     }
 
@@ -263,7 +393,7 @@ class VoiceInput(
         wakeAuthorized = true
         emitState(State.LISTENING)
         main.post { onWake(word) }
-        playWakeTone()
+        playBeep()
         Dbg.i(TAG, "唤醒「$word」，进入聆听")
 
         val s = AgentSettings.load()
@@ -349,10 +479,21 @@ class VoiceInput(
 
     private fun backToIdleOrWake() {
         if (resumeToWake) {
-            mode = Mode.WAKE
-            wake.reset()
-            ring.clear()
-            emitState(State.WAKE_WAIT)
+            val sec = AgentSettings.load().idleSleepSeconds
+            if (sec > 0) {
+                // 活跃期：不用再喊唤醒词，直接说话；超时自动休眠
+                mode = Mode.ACTIVE
+                wake.reset()
+                vad?.reset()
+                resetActiveWindow()
+                emitState(State.ACTIVE)
+                Dbg.i(TAG, "进入活跃期 ${sec}s")
+            } else {
+                mode = Mode.WAKE
+                wake.reset()
+                ring.clear()
+                emitState(State.WAKE_WAIT)
+            }
         } else {
             mode = Mode.OFF
             capture?.stop()
@@ -371,6 +512,26 @@ class VoiceInput(
             return false
         }
         return gate.enroll(pcm)
+    }
+
+    // ------------------------------------------------------------ 自检钩子
+
+    /** 自检：模拟 KWS 命中（不用真说话就能测打断/唤醒链路）。 */
+    fun debugHit(word: String) {
+        Dbg.i(TAG, "自检：模拟命中「$word」")
+        handleHit(word)
+    }
+
+    /** 自检：模拟"这段对话结束"，看活跃期与休眠计时。 */
+    fun debugEndTurn() {
+        Dbg.i(TAG, "自检：模拟对话结束")
+        backToIdleOrWake()
+    }
+
+    /** 自检：报告当前状态（模式 + 活跃期剩余）。 */
+    fun debugStatus(): String {
+        val left = if (activeUntil > 0L) ((activeUntil - SystemClock.uptimeMillis()) / 1000L) else -1L
+        return "state=$state mode=$mode 活跃期剩余=${left}s"
     }
 
     fun release() {

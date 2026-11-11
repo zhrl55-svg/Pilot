@@ -1,5 +1,7 @@
 package com.pilot.agent.runtime
 
+import com.pilot.agent.Dbg
+
 import com.pilot.agent.PilotApp
 import com.pilot.agent.action.AppLaunchIndex
 import com.pilot.agent.action.DeviceActions
@@ -87,7 +89,14 @@ object AgentRuntime {
             asr = asr,
             wake = wakeDetector,
             gate = voiceprint,
-        ).also { voiceInput = it }
+        ).also { v ->
+            // 语音打断 = 停播报。VoiceInput 不直接依赖 Speaker，用回调解耦。
+            v.onInterrupt = { word ->
+                Dbg.i("PilotVoice", "打断：停止播报（触发词=$word）")
+                runCatching { speaker.stop() }
+            }
+            voiceInput = v
+        }
     }
 
     /**

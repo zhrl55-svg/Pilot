@@ -379,6 +379,34 @@ adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent.debug --ez imp
 
 ---
 
+## 语音交互（11-11 重做）
+
+### 状态机
+```
+启动 App → 自动开麦（KWS 常驻）
+  ├ 唤醒词命中 → LISTENING（说指令）
+  │     └ 说完 → ACTIVE（可设置秒数，默认 60s：不用再喊唤醒词，直接说话）
+  │            └ 超时 → ASLEEP（只跑 KWS，仍可唤醒）
+  └ 播报中命中「唤醒词 / 打断词」+ 声纹通过 → 立即停播 → 双短音 bi-bi → LISTENING
+```
+
+- 开关在「设置 → 语音唤醒」：**对话结束后多久休眠**（0=不休眠）、**语音打断**、**打断词**。
+- 打断词和唤醒词**一起喂给同一个 KWS**（一次加载，词表见日志 `KWS 就绪 words=[...]`），
+  不额外开识别链路。
+- 播报中声纹阈值**自动放宽一半**：麦克风录到的是"喇叭声+人声"混合，
+  按原阈值会永远打断不了；没注册模板则直接放行。
+- 打断提示音是**双短音**（bi-bi），唤醒是单短音，听感上能区分。
+
+### 自检（不用说话就能验）
+```bash
+# 模拟唤醒 / 对话结束 / 看状态 / 发打断词（播报中用）
+adb shell "am start -n com.pilot.agent/com.pilot.agent.ui.TriggerActivity --es voice_test wake"
+adb shell "am start -n com.pilot.agent/com.pilot.agent.ui.TriggerActivity --es voice_test end"
+adb shell "am start -n com.pilot.agent/com.pilot.agent.ui.TriggerActivity --es voice_test status"
+adb shell "am start -n com.pilot.agent/com.pilot.agent.ui.TriggerActivity --es speak_text '一段长播报…'"
+adb shell "am start -n com.pilot.agent/com.pilot.agent.ui.TriggerActivity --es voice_test 停一下"
+```
+
 ## 踩过的坑（别重复踩）
 
 ### 华为 / 真机

@@ -320,6 +320,8 @@ private fun StatusCard(vm: AgentViewModel, onEnable: () -> Unit, onToggleWake: (
                 Text(
                     when (vm.voiceState) {
                         com.pilot.agent.voice.VoiceInput.State.WAKE_WAIT -> "待命中，说唤醒词就能用"
+                        com.pilot.agent.voice.VoiceInput.State.ASLEEP -> "已休眠，说唤醒词或点一下麦克风"
+                        com.pilot.agent.voice.VoiceInput.State.ACTIVE -> "在等你接着说（不用再喊唤醒词）"
                         com.pilot.agent.voice.VoiceInput.State.LISTENING -> "在听，说完停顿一下"
                         com.pilot.agent.voice.VoiceInput.State.RECOGNIZING -> "识别中…"
                         else -> "未开启语音"
@@ -625,6 +627,9 @@ private fun SettingsDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
     var sandboxIdleMin by remember { mutableStateOf(vm.settings.sandboxIdleMinutes.toString()) }
     var wakeWords by remember { mutableStateOf(vm.settings.wakeWords) }
     var wakeTone by remember { mutableStateOf(vm.settings.wakeTone) }
+    var idleSleep by remember { mutableStateOf(vm.settings.idleSleepSeconds.toString()) }
+    var interruptOn by remember { mutableStateOf(vm.settings.interruptEnabled) }
+    var interruptWords by remember { mutableStateOf(vm.settings.interruptWords) }
     var showEnroll by remember { mutableStateOf(false) }
     var requireVp by remember { mutableStateOf(vm.settings.requireVoiceprint) }
     var vpThreshold by remember {
@@ -657,6 +662,19 @@ private fun SettingsDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
                         "声纹阈值 0.1~0.9（越低越宽松）",
                         KeyboardType.Decimal,
                     )
+                    SmallField(
+                        idleSleep, { idleSleep = it },
+                        "对话结束后多久休眠（秒，0=不休眠）",
+                        KeyboardType.Number,
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("语音打断", fontSize = 12.sp, modifier = Modifier.weight(1f))
+                        Hint("播报中说出打断词即可立刻停播并开始听。要求声纹通过——播报时录到的声音里混着喇叭声，阈值自动放宽一半。")
+                        CompactSwitch(interruptOn) { interruptOn = it }
+                    }
+                    if (interruptOn) {
+                        SmallField(interruptWords, { interruptWords = it }, "打断词（逗号分隔）")
+                    }
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         TextButton(onClick = { showEnroll = true }) {
                             Text(
@@ -797,6 +815,9 @@ private fun SettingsDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
                         wakeTone = wakeTone,
                         requireVoiceprint = requireVp,
                         voiceprintThreshold = vpThreshold.toFloatOrNull()?.coerceIn(0.1f, 0.9f) ?: 0.30f,
+                        idleSleepSeconds = idleSleep.toIntOrNull()?.coerceIn(0, 600) ?: 60,
+                        interruptEnabled = interruptOn,
+                        interruptWords = interruptWords.trim().ifEmpty { "停一下,停下来,不说了,别说了" },
                     )
                 )
                 vm.refreshStatus()

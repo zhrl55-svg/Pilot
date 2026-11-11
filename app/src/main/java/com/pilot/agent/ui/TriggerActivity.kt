@@ -69,6 +69,23 @@ class TriggerActivity : Activity() {
             return
         }
 
+        // 语音链路自检（不用说话就能测打断/活跃期/休眠）
+        val voiceTest = i.getStringExtra("voice_test")
+        if (!voiceTest.isNullOrBlank()) {
+            val v = com.pilot.agent.runtime.AgentRuntime.voiceInput
+            Thread {
+                val vv = v ?: com.pilot.agent.runtime.AgentRuntime.ensureVoiceInput()
+                when (voiceTest) {
+                    "wake" -> vv.debugHit("小派")
+                    "end" -> vv.debugEndTurn()
+                    "status" -> Dbg.i(TAG, "自检状态：${vv.debugStatus()}")
+                    else -> vv.debugHit(voiceTest)
+                }
+                Dbg.i(TAG, "自检后：${vv.debugStatus()}")
+            }.apply { name = "trigger-voice"; isDaemon = true }.start()
+            return
+        }
+
         // 沙箱自检
         val sandboxTest = i.getStringExtra("sandbox_test")?.trim()
         if (!sandboxTest.isNullOrEmpty()) {

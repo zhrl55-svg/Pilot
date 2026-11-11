@@ -122,6 +122,24 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             }
             refreshStatus()
         }
+        // ★ 进 App 就开麦：常驻听唤醒词（KWS）+ 唤醒时验声纹。
+        //   不这么做的话，麦克风要等用户手动点"待命"才开，体验上是"喊它没反应"。
+        //   设置里关掉待命（wakeEnabled=false）就不自动开。
+        viewModelScope.launch {
+            val on = AgentSettings.load().wakeEnabled
+            if (!on) return@launch
+            ensureVoice()
+            val v = voice ?: return@launch
+            if (v.isWakeMode) {
+                wakeOn = true
+                return@launch
+            }
+            // 等 ASR 预热那一步先跑完，避免和模型加载抢线程
+            val ok = withContext(Dispatchers.IO) { v.startWake() }
+            wakeOn = ok
+            if (ok) add(LogEntry.Kind.OBSERVE, "麦克风已常驻，喊「${AgentSettings.load().wakeWordList().first()}」唤醒")
+            refreshStatus()
+        }
     }
 
     fun refreshStatus() {
