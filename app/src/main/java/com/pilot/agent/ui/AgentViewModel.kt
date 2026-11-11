@@ -373,6 +373,13 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
      * 专管样本，VAD 分段直接计数，不足 3 句可以取消重来。
      */
     fun startEnrollGuide() {
+        if (!AgentRuntime.voiceprint.engineAvailable) {
+            enrollRunning = false
+            enrollResult = false
+            enrollProgress = ""
+            add(LogEntry.Kind.ERROR, "声纹引擎暂不可用：sherpa 的声纹提取在真机上会崩，已暂停注册。唤醒与打断仍按\u201c声纹不可用则放行\u201d工作。")
+            return
+        }
         ensureVoice()
         enrollProgress = "0/3"
         enrollResult = null

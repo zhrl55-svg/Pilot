@@ -50,6 +50,15 @@ class VoiceprintGate(private val context: Context) {
 
     fun abiSupported(): Boolean = isSupportedAbi()
 
+    /**
+     * 声纹提取引擎是否可用。
+     *
+     * ★ 当前置 false：P40 实测 `SpeakerEmbeddingExtractor.createStream()` 直接 native abort
+     *   （进程消失、Kotlin 接不住），所以先关掉入口，避免用户点一下就闪退。
+     *   修好 sherpa 版本（或换实现）后改回 true 即可恢复注册。
+     */
+    val engineAvailable: Boolean = false
+
     fun ensureReady(): Boolean {
         if (ready) return true
         if (initTried && initFailed) return false
