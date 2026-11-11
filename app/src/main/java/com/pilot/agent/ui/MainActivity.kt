@@ -250,6 +250,12 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
             value = input,
             onValueChange = { input = it },
             running = vm.running,
+            sessionListening = run {
+                val st = vm.voiceState
+                st == com.pilot.agent.voice.VoiceInput.State.ACTIVE ||
+                    st == com.pilot.agent.voice.VoiceInput.State.LISTENING ||
+                    st == com.pilot.agent.voice.VoiceInput.State.RECOGNIZING
+            },
             onSend = {
                 vm.run(input)
                 input = ""
@@ -292,6 +298,11 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
         SettingsDialog(vm, onDismiss = { showSettings = false })
     }
 
+    // 技能列表放这一层：嵌在设置弹窗里会被遮住（跟声纹注册同一个坑）
+    if (vm.showSkillList) {
+        SkillListDialog(vm, onDismiss = { vm.closeSkillList() })
+    }
+
     // 二维码单独一层：不嵌在设置弹窗里，扫码时设置可以先关掉
     val qr = vm.qrBitmap
     if (qr != null) {
@@ -325,12 +336,7 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
 private fun Header(vm: AgentViewModel, onSettings: () -> Unit, onNavOpen: () -> Unit) {
     val colors = MaterialTheme.colorScheme
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-        Box(
-            Modifier
-                .size(10.dp)
-                .background(if (vm.accessibilityOn) colors.primary else colors.error, CircleShape)
-        )
-        Spacer(Modifier.width(10.dp))
+        // ★ 老板要求：标题左侧不要圆点
         Column(Modifier.weight(1f)) {
             Text("Pilot", fontSize = 20.sp, fontWeight = FontWeight.Medium, color = colors.onBackground)
             Text(
@@ -576,6 +582,8 @@ private fun InputBar(
     running: Boolean,
     justSent: Boolean,
     speaking: Boolean,
+    /** 会话已激活、麦克风正在收这一句（唤醒/长按后的连续对话） */
+    sessionListening: Boolean,
     onSend: () -> Unit,
     onStop: () -> Unit,
     onStopSpeaking: () -> Unit,
@@ -618,6 +626,12 @@ private fun InputBar(
         label = "phase",
     )
 
+    // ★ 老板要求：语音唤醒或长按激活后进入连续对话，只要麦克风还在收，
+    //   输入框就要显示「正在听…」+ 流光边框。
+    //   但排除 WAKE_WAIT/ASLEEP（常驻待命也在开麦，那不算"在听"）——
+    //   这正是之前"输入框一直显示正在听"的坑，靠 sessionListening 区分。
+    val live = recording || sessionListening
+
     Row(verticalAlignment = Alignment.Bottom) {
         Box(Modifier.weight(1f)) {
             OutlinedTextField(
@@ -633,7 +647,7 @@ private fun InputBar(
                 placeholder = { Text("点一下输入，长按说话", fontSize = 13.sp) },
                 maxLines = 3,
                 shape = RoundedCornerShape(14.dp),
-                colors = if (recording) {
+                colors = if (live) {
                     OutlinedTextFieldDefaults.colors(
                         unfocusedBorderColor = Color.Transparent,
                         focusedBorderColor = Color.Transparent,
@@ -643,8 +657,8 @@ private fun InputBar(
                 },
             )
 
-            if (recording) {
-                // 录音时：一层淡底 + "正在听…"，盖在输入框上但看得见边框
+            if (live) {
+                // 在听时：一层淡底 + "正在听…"，盖在输入框上但看得见边框
                 Box(
                     Modifier
                         .matchParentSize()
@@ -652,7 +666,7 @@ private fun InputBar(
                     contentAlignment = Alignment.CenterStart,
                 ) {
                     Text(
-                        "正在听…（松手发送）",
+                        if (recording) "正在听…（松手发送）" else "正在听…",
                         fontSize = 13.sp,
                         color = colors.primary,
                         modifier = Modifier.padding(horizontal = 16.dp),
@@ -752,8 +766,16 @@ private fun InputBar(
             shape = RoundedCornerShape(14.dp),
             contentPadding = PaddingValues(0.dp),
             colors = ButtonDefaults.buttonColors(
-                containerColor = if (showStop) colors.error else colors.primary.copy(alpha = 0.12f),
-                contentColor = if (showStop) colors.onError else colors.primary,
+                containerColor = if (showStop) {
+                    androidx.compose.ui.graphics.Color(0xFFE53935)   // 明确的正红
+                } else {
+                    colors.primary.copy(alpha = 0.12f)
+                },
+                contentColor = if (showStop) {
+                    androidx.compose.ui.graphics.Color(0xFFFFFFFF)
+                } else {
+                    colors.primary
+                },
             ),
         ) {
             Canvas(Modifier.size(20.dp)) {
@@ -1111,7 +1133,15 @@ private fun SettingsDialog(
                 // ---------------- 维护 ----------------
                 SettingsSection("维护") {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("已学技能 ${vm.skillCount} 条", fontSize = 12.sp, modifier = Modifier.weight(1f))
+                        Text(
+                            "已学技能 ${vm.skillCount} 条（点击查看）",
+                            fontSize = 12.sp,
+                            color = colors.primary,
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable { vm.openSkillList() }
+                                .padding(vertical = 6.dp),
+                        )
                         TextButton(onClick = { vm.clearSkills() }) {
                             Text("清空", fontSize = 12.sp, color = colors.error)
                         }
@@ -1176,6 +1206,53 @@ private fun SettingsDialog(
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )
 
+}
+
+/** 已学技能列表。 */
+@Composable
+private fun SkillListDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
+    val colors = MaterialTheme.colorScheme
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("已学技能 ${vm.skillList.size} 条", fontSize = 16.sp) },
+        text = {
+            if (vm.skillList.isEmpty()) {
+                Text("还没有学到技能。成功执行过的操作会自动记下来。", fontSize = 12.sp)
+            } else {
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(vm.skillList, key = { it.id }) { skill ->
+                        Surface(
+                            color = colors.surfaceVariant.copy(alpha = 0.4f),
+                            shape = RoundedCornerShape(10.dp),
+                        ) {
+                            Column(Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
+                                Text(skill.goal, fontSize = 13.sp, color = colors.onBackground)
+                                Text(
+                                    buildString {
+                                        if (skill.appPkg.isNotBlank()) append(skill.appPkg)
+                                        append(" · ${skill.steps.size} 步 · 成功 ${skill.successes} 次")
+                                    },
+                                    fontSize = 11.sp,
+                                    color = colors.onSurfaceVariant,
+                                )
+                                if (skill.steps.isNotEmpty()) {
+                                    Text(
+                                        skill.steps.joinToString(" → ") { it.label.ifBlank { it.action } },
+                                        fontSize = 11.sp,
+                                        color = colors.onSurfaceVariant,
+                                        lineHeight = 15.sp,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("关闭", fontSize = 12.sp) }
+        },
+    )
 }
 
 private fun openAccessibilitySettings(ctx: Context) {

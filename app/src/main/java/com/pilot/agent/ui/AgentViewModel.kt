@@ -90,6 +90,23 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     var skillCount by mutableStateOf(0)
         private set
 
+    /** 已学技能列表（点设置里"已学技能 N 条"时展示） */
+    var skillList by mutableStateOf<List<com.pilot.agent.agent.Skill>>(emptyList())
+        private set
+
+    var showSkillList by mutableStateOf(false)
+        private set
+
+    fun openSkillList() {
+        skillList = AgentRuntime.skills.all()
+        skillCount = skillList.size
+        showSkillList = true
+    }
+
+    fun closeSkillList() {
+        showSkillList = false
+    }
+
     var foreground by mutableStateOf("")
         private set
 
@@ -155,11 +172,18 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             AgentRuntime.events.collect { handle(it) }
         }
-        // ★ 常驻轮询播报状态：停止按钮要在播报**一开始**就出现。
-        //   只在 Finished 事件里起轮询有竞态——任务完成得快的话按钮来不及出现。
+        // ★ 常驻轮询播报状态 + 语音状态：
+        //   VoiceInput 是单例，onState 回调只在 ensureVoice() 时挂；
+        //   启动流程没走到那步（或 VM 重建）时 UI 就永远收不到状态变化，
+        //   导致"在听"不显示（实测踩到）。这里直接读单例状态，不依赖回调。
         viewModelScope.launch {
             while (true) {
                 syncSpeaking()
+                val st = AgentRuntime.voiceInput?.state
+                if (st != null && st != voiceState) {
+                    voiceState = st
+                    Dbg.i(TAG, "语音状态 → $st")
+                }
                 delay(100)
             }
         }
@@ -207,6 +231,22 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     fun refreshStatus() {
         accessibilityOn = AgentSettings.isAccessibilityEnabled(getApplication())
         skillCount = AgentRuntime.skills.all().size
+        // ★ cookie 存在但 neteaseNick 为空（App 重启后）时，查一次昵称。
+        //   原来昵称只在扫码成功那一刻赋值，重启后设置页就一直显示"未登录"（老板反馈）。
+        val cookie = AgentSettings.load().neteaseCookie
+        if (cookie.isNotBlank() && neteaseNick.isBlank()) {
+            neteaseNick = "已登录"   // 先给个兜底，别一直显示"未登录"
+            viewModelScope.launch {
+                val nick = withContext(Dispatchers.IO) {
+                    com.pilot.agent.music.NeteaseApi.loginStatus(
+                        AgentSettings.load().musicBaseUrl, cookie,
+                    )
+                }
+                neteaseNick = nick ?: "已登录"
+            }
+        } else if (cookie.isBlank()) {
+            neteaseNick = ""
+        }
 
         val asr = AgentRuntime.asr
         asrReady = asr.ready
