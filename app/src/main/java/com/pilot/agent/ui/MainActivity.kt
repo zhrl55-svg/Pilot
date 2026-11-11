@@ -150,7 +150,6 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
     var input by remember { mutableStateOf("") }
     var showSettings by remember { mutableStateOf(false) }
     // ★ 声纹注册弹窗放在这一层：跟设置弹窗同级会互相遮挡，点「开始」看着没反应（实测）。
-    var showEnroll by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val colors = MaterialTheme.colorScheme
 
@@ -250,26 +249,7 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
     }
 
     if (showSettings) {
-        SettingsDialog(
-            vm,
-            onDismiss = { showSettings = false },
-            onEnrollRequest = {
-                showSettings = false
-                showEnroll = true
-            },
-        )
-    }
-
-    if (showEnroll) {
-        VoiceprintEnrollDialog(
-            vm,
-            onDismiss = {
-                // ★ 关弹窗必须停掉采集会话：否则 enrolling 卡在 true，
-                //   唤醒词命中全被忽略 → 用户体验就是"没反应"（实测）。
-                vm.cancelEnrollGuide()
-                showEnroll = false
-            },
-        )
+        SettingsDialog(vm, onDismiss = { showSettings = false })
     }
 
     // 二维码单独一层：不嵌在设置弹窗里，扫码时设置可以先关掉
@@ -761,7 +741,6 @@ private fun Hint(text: String) {
 private fun SettingsDialog(
     vm: AgentViewModel,
     onDismiss: () -> Unit,
-    onEnrollRequest: () -> Unit,
 ) {
     var baseUrl by remember { mutableStateOf(vm.settings.baseUrl) }
     var apiKey by remember { mutableStateOf(vm.settings.apiKey) }
@@ -820,21 +799,31 @@ private fun SettingsDialog(
                     if (interruptOn) {
                         SmallField(interruptWords, { interruptWords = it }, "打断词（逗号分隔）")
                     }
+                    // ★ 不再有"注册声纹"按钮：清除后**第一句话**自动注册。
+                    //   原来那套要念 3 遍固定口令，既重又要求口令与唤醒词一致。
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        TextButton(onClick = onEnrollRequest) {
-                            Text(
-                                if (vm.voiceprintEnrolled) "重新注册" else "注册声纹",
-                                fontSize = 12.sp,
-                            )
-                        }
-                        TextButton(onClick = { vm.clearVoiceprint() }) {
-                            Text("清除", fontSize = 12.sp, color = colors.error)
-                        }
-                        Spacer(Modifier.weight(1f))
                         Text(
-                            if (vm.voiceprintEnrolled) "已注册" else "未注册",
+                            if (vm.voiceprintEnrolled) {
+                                "已注册，只认这个声音"
+                            } else {
+                                "未注册 —— 说第一句话时自动注册"
+                            },
+                            fontSize = 12.sp,
+                            color = if (vm.voiceprintEnrolled) colors.primary else colors.onSurfaceVariant,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (vm.voiceprintEnrolled) {
+                            TextButton(onClick = { vm.clearVoiceprint() }) {
+                                Text("清除", fontSize = 12.sp, color = colors.error)
+                            }
+                        }
+                    }
+                    if (!vm.voiceprintEnrolled) {
+                        Text(
+                            "清除后，下一次说唤醒词时会把那句话记成你的声纹。",
                             fontSize = 11.sp,
                             color = colors.onSurfaceVariant,
+                            lineHeight = 16.sp,
                         )
                     }
                 }
@@ -972,79 +961,6 @@ private fun SettingsDialog(
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )
 
-}
-
-/**
- * 引导式声纹注册弹窗。
- *
- * 旧流程的坑：点按钮时拿的是环形缓冲里"刚才碰巧说过的那句"，
- * 用户没说话就注册失败，说了话也不知道说的够不够。
- * 现在：明确口令 → VAD 切满 3 句自动合并入库，进度实时显示。
- */
-@Composable
-private fun VoiceprintEnrollDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
-    val colors = MaterialTheme.colorScheme
-    AlertDialog(
-        onDismissRequest = {
-            if (vm.enrollRunning) vm.cancelEnrollGuide()
-            onDismiss()
-        },
-        title = { Text("注册声纹", fontSize = 16.sp) },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(
-                    "对着手机把下面这句话清晰念 3 遍（语速正常、别背对麦克风）：",
-                    fontSize = 12.sp,
-                    lineHeight = 18.sp,
-                )
-                Surface(
-                    color = colors.primary.copy(alpha = 0.10f),
-                    shape = RoundedCornerShape(10.dp),
-                ) {
-                    Text(
-                        "「${vm.enrollPhrase}」",
-                        fontSize = 14.sp,
-                        color = colors.primary,
-                        lineHeight = 21.sp,
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-                    )
-                }
-                Text(
-                    "这句必须原样念（它包含唤醒词和打断词，念别的注册了也认不出来）。念完停顿 3 秒算一句。",
-                    fontSize = 11.sp,
-                    color = colors.onSurfaceVariant,
-                    lineHeight = 16.sp,
-                )
-                when {
-                    vm.enrollRunning -> Text(
-                        "正在采集 ${vm.enrollProgress}（说满 3 句即完成）",
-                        fontSize = 12.sp,
-                        color = colors.error,
-                    )
-                    vm.enrollResult == true -> Text(
-                        "注册完成，之后唤醒只认这个声音。",
-                        fontSize = 12.sp,
-                        color = colors.primary,
-                    )
-                    vm.enrollResult == false -> Text(
-                        "注册未完成，可重试。",
-                        fontSize = 12.sp,
-                        color = colors.error,
-                    )
-                }
-            }
-        },
-        confirmButton = {
-            if (vm.enrollRunning) {
-                TextButton(onClick = { vm.cancelEnrollGuide() }) { Text("取消采集", fontSize = 12.sp) }
-            } else {
-                TextButton(onClick = { vm.startEnrollGuide() }) {
-                    Text(if (vm.enrollResult == null) "开始" else "再来一次", fontSize = 12.sp)
-                }
-                TextButton(onClick = onDismiss) { Text("关闭", fontSize = 12.sp) }
-            }
-        },
-    )
 }
 
 private fun openAccessibilitySettings(ctx: Context) {

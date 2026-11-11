@@ -237,6 +237,9 @@ class VoiceInput(
     var onEnrollSegment: (index: Int, total: Int) -> Unit = { _, _ -> }
     var onEnrollDone: (Boolean) -> Unit = {}
 
+    /** 首句自动注册成功（没有模板时，第一句唤醒词直接认下主人）。 */
+    var onEnrolled: () -> Unit = {}
+
     /**
      * 当前 VAD 的静音阈值（毫秒）。
      *
@@ -458,11 +461,21 @@ class VoiceInput(
         Dbg.i(TAG, "唤醒「$word」，进入聆听")
 
         val s = AgentSettings.load()
-        if (!s.requireVoiceprint) return
+        // ★ 还没有模板 → 这句唤醒词就是第一句，直接拿它注册。
+        //   原来的注册流程要念 3 遍固定口令，太重，而且口令必须和唤醒词一致
+        //   用户很难记住——改成"第一次说话就认下主人"，门槛降到零。
         if (!gate.hasTemplate()) {
-            Dbg.i(TAG, "未注册声纹，跳过校验")
+            val snapshot0 = ring.snapshot()
+            worker.execute {
+                val ok = gate.enrollIfAbsent(snapshot0)
+                if (ok) {
+                    Dbg.i(TAG, "首句注册成功，已认下主人")
+                    main.post { onEnrolled() }
+                }
+            }
             return
         }
+        if (!s.requireVoiceprint) return
         // ★ 声纹取的是环形缓冲里最近 1.5 秒——但 KWS 命中时"小派"可能已经说完了，
         //   窗口里剩下的可能是后面的静默/杂音，判出来的分数没有意义（实测 0.20）。
         //   所以把窗口临时拉长到 3 秒再取，覆盖整个唤醒词。

@@ -151,6 +151,28 @@ class VoiceprintGate(private val context: Context) {
         }
     }
 
+    /**
+     * 首句自动注册：还没有模板时，第一句够长的有效语音直接成为主人声纹。
+     *
+     * 为什么要有这条：注册弹窗那套（念 3 遍口令）太重，用户懒得念；
+     * 而且**口令必须和唤醒词一致**才判得准，用户很难记住。
+     * 改成"第一次说话就注册"，门槛降到零。
+     *
+     * @param minSeconds 这句至少要多少秒，太短（咳嗽、清嗓子）不认
+     * @return true = 已用这句注册成功
+     */
+    fun enrollIfAbsent(pcm: ShortArray, minSeconds: Float = 1.5f): Boolean {
+        if (hasTemplate()) return false
+        val seconds = pcm.size.toDouble() / AudioCapture.SAMPLE_RATE
+        if (seconds < minSeconds) {
+            Dbg.i(TAG, "首句注册：音频 ${"%.1f".format(seconds)}s 太短，不注册")
+            return false
+        }
+        val ok = enroll(pcm)
+        Dbg.i(TAG, "首句注册：${"%.1f".format(seconds)}s → saved=$ok")
+        return ok
+    }
+
     /** 用这段音频覆盖模板（注册 / 重新注册） */
     fun enroll(pcm: ShortArray): Boolean {
         val emb = embed(pcm) ?: return false

@@ -236,6 +236,12 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             },
         ).also { v ->
             v.onEnrollSegment = { index, total -> enrollProgress = "$index/$total" }
+            // 首句自动注册成功（清除声纹后说第一句话）
+            v.onEnrolled = {
+                voiceprintEnrolled = true
+                add(LogEntry.Kind.OBSERVE, "声纹已记住（用你说的第一句话注册的），之后只认这个声音")
+                refreshStatus()
+            }
             v.onEnrollDone = { ok ->
                 enrollRunning = false
                 enrollResult = ok
@@ -433,9 +439,13 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun clearVoiceprint() {
+        voiceprintEnrolled = false
+        enrollProgress = ""
+        enrollResult = null
+        enrollRunning = false
         AgentRuntime.voiceprint.clearTemplate()
         voiceprintInfo = ""
-        add(LogEntry.Kind.OBSERVE, "声纹模板已清除")
+        add(LogEntry.Kind.OBSERVE, "声纹已清除，下次说唤醒词时用第一句话重新注册")
         refreshStatus()
     }
 
