@@ -26,7 +26,35 @@ import org.json.JSONObject
  * ```
  * 解码后写临时文件，用 MediaPlayer 播。
  */
+/** MiniMax 音色选项（voice_id + 中文名）。 */
+data class MiniMaxVoice(val id: String, val label: String)
+
 class MiniMaxTts(private val context: Context) : SpeechOutput {
+
+    companion object {
+        private const val TAG = "PilotTts"
+
+        /**
+         * 可选音色。
+         *
+         * ★ 用的是 MiniMax 官方系统音色 ID（male-qn-qingse / female-shaonv 等），
+         *   这些是**免费/通用**音色，填错会返回业务错误 1013。
+         */
+        val VOICES: List<MiniMaxVoice> = listOf(
+            MiniMaxVoice("male-qn-qingse", "青涩青年男"),
+            MiniMaxVoice("male-qn-jingying", "精英青年男"),
+            MiniMaxVoice("male-qn-badao", "霸道青年男"),
+            MiniMaxVoice("male-qn-daxuesheng", "青年大学生男"),
+            MiniMaxVoice("female-shaonv", "少女女声"),
+            MiniMaxVoice("female-yujie", "御姐女声"),
+            MiniMaxVoice("female-chengshu", "成熟女声"),
+            MiniMaxVoice("female-tianmei", "甜美女声"),
+            MiniMaxVoice("presenter_male", "男性主持人"),
+            MiniMaxVoice("presenter_female", "女性主持人"),
+            MiniMaxVoice("audiobook_male_1", "有声书男声"),
+            MiniMaxVoice("audiobook_female_1", "有声书女声"),
+        )
+    }
 
     private val main = Handler(Looper.getMainLooper())
 
@@ -218,9 +246,5 @@ class MiniMaxTts(private val context: Context) : SpeechOutput {
             out[i] = ((hi shl 4) or lo).toByte()
         }
         return out
-    }
-
-    private companion object {
-        const val TAG = "PilotTts"
     }
 }

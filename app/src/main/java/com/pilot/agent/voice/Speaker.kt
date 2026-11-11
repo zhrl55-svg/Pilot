@@ -193,6 +193,27 @@ class Speaker(context: Context) {
         if (interrupt) speakNav(text) else speak(text)
     }
 
+    /**
+     * 列出系统 TTS 可用音色。
+     *
+     * ★ 复用 Speaker 自己的 system 实例（和实际播报同一个引擎），
+     *   不能新建一个——新建的引擎初始化还没完成，枚举出来是空的（实测）。
+     */
+    fun systemVoices(): List<SystemVoice> {
+        val t = system ?: SystemTts(appContext).also { system = it }
+        return t.availableVoices()
+    }
+
+    /**
+     * 应用系统 TTS 音色（设置里切换后立即生效）。
+     *
+     * 只影响系统 TTS；MiniMax 的音色是每次请求带 voice_id，下次播报就变。
+     */
+    fun applyVoice(voiceName: String) {
+        if (voiceName.isBlank()) return
+        system?.applyVoice(voiceName)
+    }
+
     fun stop() {
         system?.stop()
         minimax?.stop()

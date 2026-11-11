@@ -27,6 +27,14 @@ data class AgentSettings(
      */
     val chatContextTurns: Int = 4,
     val ttsVoiceId: String = "male-qn-qingse",
+    /**
+     * 系统 TTS 的音色名（TextToSpeech 的 Voice 名称）。
+     *
+     * 不同 ROM 的可用音色不一样（华为智慧语音、小米、Pixel 各不相同），
+     * 所以这个值由运行时枚举出来后在设置页选，不是写死的列表。
+     * 空 = 用引擎默认音色。
+     */
+    val systemTtsVoice: String = "",
     val ttsModel: String = "speech-02-hd",
     // ---------- 语音唤醒与声纹 ----------
     /** 待命模式：开着就一直听唤醒词（默认开：进 App 就开麦），命中后自动进入聆听 */
@@ -108,6 +116,7 @@ data class AgentSettings(
         private const val K_SANDBOX_IDLE = "sandbox_idle_minutes"
         private const val K_CHAT_CONTEXT = "chat_context_turns"
         private const val K_TTS_VOICE = "tts_voice_id"
+        private const val K_SYS_TTS_VOICE = "system_tts_voice"
         private const val K_TTS_MODEL = "tts_model"
         private const val K_WAKE_ENABLED = "wake_enabled"
         private const val K_WAKE_WORDS = "wake_words"
@@ -154,6 +163,7 @@ data class AgentSettings(
                 sandboxIdleMinutes = p.getInt(K_SANDBOX_IDLE, 5),
                 chatContextTurns = p.getInt(K_CHAT_CONTEXT, 4),
                 ttsVoiceId = p.getString(K_TTS_VOICE, null) ?: "male-qn-qingse",
+                systemTtsVoice = p.getString(K_SYS_TTS_VOICE, null) ?: "",
                 ttsModel = p.getString(K_TTS_MODEL, null) ?: "speech-02-hd",
                 wakeEnabled = p.getBoolean(K_WAKE_ENABLED, true),
                 wakeWords = p.getString(K_WAKE_WORDS, null) ?: DEFAULT_WAKE_WORDS,
@@ -185,6 +195,7 @@ data class AgentSettings(
                 .putInt(K_SANDBOX_IDLE, s.sandboxIdleMinutes)
                 .putInt(K_CHAT_CONTEXT, s.chatContextTurns)
                 .putString(K_TTS_VOICE, s.ttsVoiceId)
+                .putString(K_SYS_TTS_VOICE, s.systemTtsVoice)
                 .putString(K_TTS_MODEL, s.ttsModel)
                 .putBoolean(K_WAKE_ENABLED, s.wakeEnabled)
                 .putString(K_WAKE_WORDS, s.wakeWords)

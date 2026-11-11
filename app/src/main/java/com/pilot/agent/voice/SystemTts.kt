@@ -7,6 +7,7 @@ import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import com.pilot.agent.Dbg
+import com.pilot.agent.agent.AgentSettings
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -20,6 +21,34 @@ import java.util.concurrent.TimeUnit
  * 初始化是异步的（onInit 回调），所以用 latch 等它完成，别在没就绪时 speak——
  * 那会静默失败，表现为「agent 干完活一声不吭」。
  */
+/** 系统 TTS 的一个音色。 */
+data class SystemVoice(
+    val name: String,
+    val needsNetwork: Boolean,
+    val quality: Int,
+    /** locale，如 zh-CN / zh-TW */
+    val locale: String = "",
+    /** 引擎自定义特性串（华为引擎靠它区分不同音色） */
+    val features: String = "",
+) {
+    /**
+     * 显示用的标签。
+     *
+     * ★ 华为引擎（com.huawei.hiai）所有中文音色的 name 都是 "zh"，
+     *   光看名字分不出区别。只能靠 locale / features / 序号来标。
+     */
+    fun label(index: Int): String = buildString {
+        append("音色 ").append(index + 1)
+        if (locale.isNotBlank() && locale != "zh") {
+            append(" (").append(locale).append(")")
+        }
+        if (features.isNotBlank() && features != "[]") {
+            append(" ").append(features)
+        }
+        if (needsNetwork) append("·联网")
+    }
+}
+
 class SystemTts(context: Context) : SpeechOutput {
 
     private val appContext = context.applicationContext
@@ -61,6 +90,8 @@ class SystemTts(context: Context) : SpeechOutput {
                         }
                     }
                     tts?.setSpeechRate(1.0f)
+                    // 应用用户选择的音色（可能为空 = 默认）
+                    applyVoice(AgentSettings.load().systemTtsVoice)
                     tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                         override fun onStart(utteranceId: String?) = Unit
                         override fun onDone(utteranceId: String?) {
@@ -87,6 +118,62 @@ class SystemTts(context: Context) : SpeechOutput {
             lastError = "${t.javaClass.simpleName}: ${t.message}"
             Dbg.e(TAG, "系统 TTS 创建失败 $lastError")
             initLatch.countDown()
+        }
+    }
+
+    /**
+     * 枚举当前引擎可用的音色。
+     *
+     * ★ 各 ROM 完全不同（华为智慧语音、小米、Pixel 各有各的），
+     *   所以只能运行时问引擎要，不能写死列表。
+     */
+    fun availableVoices(): List<SystemVoice> {
+        // 引擎初始化是异步的，没就绪就一个音色都列不出来。
+        // 最多等 3 秒。
+        runCatching { initLatch.await(3, TimeUnit.SECONDS) }
+        val t = tts ?: return emptyList()
+        val out = mutableListOf<SystemVoice>()
+        runCatching {
+            t.voices?.forEach { v ->
+                val name = v.name ?: return@forEach
+                val loc = v.locale ?: return@forEach
+                // 只列中文音色（和播报用途一致），但中文判断放宽到 zh
+                if (loc.language.startsWith("zh")) {
+                    out += SystemVoice(
+                        name = name,
+                        needsNetwork = v.isNetworkConnectionRequired,
+                        quality = v.quality,
+                        locale = loc.toString(),
+                        features = runCatching {
+                            v.features?.toString()
+                                ?.removePrefix("[")
+                                ?.removeSuffix("]")
+                                ?.split(",")
+                                ?.map { it.trim().removePrefix("name=").trim('"') }
+                                ?.filter { it.isNotEmpty() && it != "none" }
+                                ?.joinToString(",")
+                                ?.take(28)
+                                .orEmpty()
+                        }.getOrDefault(""),
+                    )
+                }
+            }
+        }
+        return out.sortedBy { it.name }
+    }
+
+    /** 切到指定音色（名字为空 = 用引擎默认）。 */
+    fun applyVoice(voiceName: String) {
+        val t = tts ?: return
+        if (voiceName.isBlank()) return
+        runCatching {
+            val v = t.voices?.firstOrNull { it.name == voiceName } ?: return
+            val r = t.setVoice(v)
+            if (r == TextToSpeech.SUCCESS) {
+                Dbg.i(TAG, "系统 TTS 切换音色：$voiceName")
+            } else {
+                Dbg.w(TAG, "切换音色失败 $voiceName code=$r")
+            }
         }
     }
 

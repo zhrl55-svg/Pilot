@@ -86,6 +86,39 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     var musicPaused by mutableStateOf(false)
         private set
 
+    /**
+     * 系统 TTS 可用音色（运行时向引擎枚举）。
+     *
+     * 各 ROM 的音色表完全不同（华为/小米/Pixel 各有各的），
+     * 必须运行时问引擎要，写死列表会列出一堆这台机器上不存在的音色。
+     */
+    var systemVoices by mutableStateOf<List<com.pilot.agent.voice.SystemVoice>>(emptyList())
+        private set
+
+    /** 加载系统 TTS 音色列表（打开设置时调一次）。 */
+    fun loadSystemVoices() {
+        if (systemVoices.isNotEmpty() || systemVoicesLoading) return
+        systemVoicesLoading = true
+        viewModelScope.launch {
+            // 引擎初始化是异步的（onInit 回调），要等它就绪再枚举，
+            // 否则拿到的是空列表（实测：新建实例立刻枚举 → 一个都没有）。
+            var list: List<com.pilot.agent.voice.SystemVoice> = emptyList()
+            repeat(12) {
+                list = withContext(Dispatchers.IO) { AgentRuntime.speaker.systemVoices() }
+                if (list.isNotEmpty()) return@repeat
+                delay(400)
+            }
+            systemVoices = list
+            systemVoicesLoading = false
+            if (list.isEmpty()) {
+                Dbg.i(TAG, "系统 TTS 没有可用音色（引擎未提供 zh 音色）")
+            }
+        }
+    }
+
+    @Volatile
+    private var systemVoicesLoading = false
+
     var confirm by mutableStateOf<ConfirmUi?>(null)
         private set
 
@@ -838,8 +871,15 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun updateSettings(next: AgentSettings) {
+        // 音色变了要立刻生效（不用重启 App）：
+        // 系统 TTS 是 setVoice，MiniMax 是下一次请求的 voice_id。
+        val voiceChanged = next.systemTtsVoice != settings.systemTtsVoice ||
+            next.ttsVoiceId != settings.ttsVoiceId
         AgentSettings.save(next)
         settings = next
+        if (voiceChanged) {
+            AgentRuntime.speaker.applyVoice(next.systemTtsVoice)
+        }
     }
 
     fun clearSkills() {

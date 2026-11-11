@@ -317,6 +317,9 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
         )
     }
 
+    // 打开设置时把系统音色列表拉出来（要等 TTS 引擎初始化）
+    LaunchedEffect(Unit) { vm.loadSystemVoices() }
+
     vm.confirm?.let { c ->
         AlertDialog(
             onDismissRequest = { vm.answerConfirm(false) },
@@ -1173,6 +1176,8 @@ private fun SettingsDialog(
     var maxTurns by remember { mutableStateOf(vm.settings.maxTurns.toString()) }
     var preferOnDevice by remember { mutableStateOf(vm.settings.preferOnDevice) }
     var ttsEngine by remember { mutableStateOf(vm.settings.ttsEngine) }
+    var ttsVoiceId by remember { mutableStateOf(vm.settings.ttsVoiceId) }
+    var systemVoice by remember { mutableStateOf(vm.settings.systemTtsVoice) }
     var musicPolicy by remember { mutableStateOf(vm.settings.musicPolicy) }
     var sandboxIdleMin by remember { mutableStateOf(vm.settings.sandboxIdleMinutes.toString()) }
     var wakeWords by remember { mutableStateOf(vm.settings.wakeWords) }
@@ -1280,6 +1285,41 @@ private fun SettingsDialog(
                         selected = ttsEngine,
                         onSelect = { ttsEngine = it },
                     )
+                    // ★ 音色选择：系统 TTS 和 MiniMax 各有各的音色表，
+                    //   只显示当前引擎对应的那一个。
+                    when (ttsEngine) {
+                        AgentSettings.TTS_MINIMAX -> {
+                            Text(
+                                "MiniMax 音色",
+                                fontSize = 12.sp,
+                                color = colors.onSurfaceVariant,
+                            )
+                            OptionChips(
+                                options = com.pilot.agent.voice.MiniMaxTts.VOICES.map { it.id to it.label },
+                                selected = ttsVoiceId,
+                                onSelect = { ttsVoiceId = it },
+                            )
+                        }
+                        AgentSettings.TTS_SYSTEM -> {
+                            Text(
+                                "系统音色",
+                                fontSize = 12.sp,
+                                color = colors.onSurfaceVariant,
+                            )
+                            if (vm.systemVoices.isEmpty()) {
+                                Hint("正在读取系统引擎的音色…")
+                            } else {
+                                OptionChips(
+                                    // ★ 华为引擎的音色 name 就是 "zh"，看不出区别。
+                                    //   用 quality + 网络标记做可辨识的标签。
+                                    options = listOf("" to "默认") +
+                                        vm.systemVoices.mapIndexed { i, v -> v.name to v.label(i) },
+                                    selected = systemVoice,
+                                    onSelect = { systemVoice = it },
+                                )
+                            }
+                        }
+                    }
                     Text(
                         "播报时音乐",
                         fontSize = 12.sp,
@@ -1396,6 +1436,8 @@ private fun SettingsDialog(
                         requireVoiceprint = requireVp,
                         voiceprintThreshold = vpThreshold.toFloatOrNull()?.coerceIn(0.1f, 0.9f) ?: 0.30f,
                         idleSleepSeconds = idleSleep.toIntOrNull()?.coerceIn(0, 600) ?: 60,
+                        ttsVoiceId = ttsVoiceId,
+                        systemTtsVoice = systemVoice,
                         chatContextTurns = chatTurns.toIntOrNull()?.coerceIn(0, 20) ?: 4,
                         interruptEnabled = interruptOn,
                         interruptWords = interruptWords.trim().ifEmpty { "停一下,停下来,不说了,别说了" },
