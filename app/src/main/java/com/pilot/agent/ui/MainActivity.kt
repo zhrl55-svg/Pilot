@@ -63,6 +63,8 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.waitForUpOrCancellation
@@ -202,7 +204,21 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.fillMaxSize(),
                 ) {
-                    items(vm.chatLogs, key = { it.id }) { LogRow(it) }
+                    items(vm.chatLogs, key = { it.id }) { entry ->
+                        LogRow(
+                            entry = entry,
+                            onCopy = { text ->
+                                val cm = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                                    as android.content.ClipboardManager
+                                cm.setPrimaryClip(android.content.ClipData.newPlainText("Pilot", text))
+                                android.widget.Toast.makeText(ctx, "已复制", android.widget.Toast.LENGTH_SHORT).show()
+                            },
+                            onAddToChat = { text ->
+                                // "添加到对话"：把这段文本放进输入框，用户可以直接改再发
+                                input = if (input.isBlank()) text else "$input $text"
+                            },
+                        )
+                    }
                 }
             }
         }
@@ -218,6 +234,7 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
                 vm.run(input)
                 input = ""
             },
+            justSent = vm.justSent,
             onStop = { vm.stop() },
             onStartVoice = {
                 // 长按说话要先有录音权限；没有就当场申请，授权后立刻开始
@@ -355,42 +372,135 @@ private fun StatusCard(vm: AgentViewModel, onEnable: () -> Unit) {
  * 版式（老板定的）：**用户靠右带气泡、AI 靠左无气泡**。
  * 只渲染三种：用户说的话、AI 的回答、出错提示；
  * 过程类（思考/执行/观察）不显示——那是给人调试看的，不是给用户看的。
+ *
+ * 长按弹菜单：选择 / 复制 / 添加到对话。
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun LogRow(entry: LogEntry) {
+private fun LogRow(
+    entry: LogEntry,
+    onCopy: (String) -> Unit,
+    onAddToChat: (String) -> Unit,
+) {
     val colors = MaterialTheme.colorScheme
     val isUser = entry.kind == LogEntry.Kind.USER
     val textColor = if (entry.kind == LogEntry.Kind.ERROR) colors.error else colors.onBackground
+    var menuOpen by remember { mutableStateOf(false) }
+    var selected by remember { mutableStateOf(false) }
 
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start,
-    ) {
-        if (isUser) {
-            Surface(
-                color = colors.primary.copy(alpha = 0.20f),
-                shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomEnd = 4.dp, bottomStart = 16.dp),
-            ) {
+    Box {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start,
+        ) {
+            if (isUser) {
+                Surface(
+                    color = colors.primary.copy(alpha = 0.20f),
+                    shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomEnd = 4.dp, bottomStart = 16.dp),
+                ) {
+                    Text(
+                        text = entry.text,
+                        fontSize = 14.sp,
+                        color = textColor,
+                        lineHeight = 21.sp,
+                        modifier = Modifier
+                            .widthIn(max = 280.dp)
+                            .combinedClickable(
+                                onClick = {},
+                                onLongClick = { menuOpen = true },
+                            )
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                    )
+                }
+            } else {
                 Text(
                     text = entry.text,
                     fontSize = 14.sp,
                     color = textColor,
                     lineHeight = 21.sp,
                     modifier = Modifier
-                        .widthIn(max = 280.dp)
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                        .widthIn(max = 300.dp)
+                        .combinedClickable(
+                            onClick = {},
+                            onLongClick = { menuOpen = true },
+                        ),
                 )
             }
-        } else {
-            Text(
-                text = entry.text,
-                fontSize = 14.sp,
-                color = textColor,
-                lineHeight = 21.sp,
-                modifier = Modifier.widthIn(max = 300.dp),
-            )
+        }
+
+        // 长按菜单：选择 / 复制 / 添加到对话
+        if (menuOpen) {
+            androidx.compose.ui.window.Dialog(
+                onDismissRequest = { menuOpen = false },
+                properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false),
+            ) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(androidx.compose.ui.graphics.Color(0x66000000))
+                        .pointerInput(Unit) {
+                            awaitEachGesture {
+                                awaitFirstDown(requireUnconsumed = false)
+                                waitForUpOrCancellation()
+                                menuOpen = false
+                            }
+                        },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Surface(
+                        color = colors.surface,
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier.widthIn(max = 280.dp),
+                    ) {
+                        Column(Modifier.padding(vertical = 4.dp)) {
+                            Text(
+                                entry.text,
+                                fontSize = 13.sp,
+                                color = colors.onBackground,
+                                lineHeight = 19.sp,
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                            )
+                            androidx.compose.material3.HorizontalDivider(
+                                color = colors.outlineVariant.copy(alpha = 0.4f),
+                            )
+                            MenuRow("选择") {
+                                selected = true
+                                menuOpen = false
+                            }
+                            MenuRow("复制") {
+                                onCopy(entry.text)
+                                menuOpen = false
+                            }
+                            MenuRow("添加到对话") {
+                                onAddToChat(entry.text)
+                                menuOpen = false
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // "选择"后把文本填进输入框
+        if (selected) {
+            selected = false
+            onAddToChat(entry.text)
         }
     }
+}
+
+@Composable
+private fun MenuRow(label: String, onClick: () -> Unit) {
+    val colors = MaterialTheme.colorScheme
+    Text(
+        label,
+        fontSize = 14.sp,
+        color = colors.onBackground,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 11.dp),
+    )
 }
 
 @Composable
@@ -427,6 +537,7 @@ private fun InputBar(
     onValueChange: (String) -> Unit,
     running: Boolean,
     listening: Boolean,
+    justSent: Boolean,
     onSend: () -> Unit,
     onStop: () -> Unit,
     onStartVoice: () -> Unit,
@@ -450,7 +561,8 @@ private fun InputBar(
         initialValue = 0f,
         targetValue = 1f,
         animationSpec = infiniteRepeatable(
-            tween(1600, easing = LinearEasing),
+            // ★ 放慢：1600ms 一圈太快，看着像"闪"而不是"在录"。3600ms 慢一点才从容。
+            tween(3600, easing = LinearEasing),
             repeatMode = RepeatMode.Reverse,
         ),
         label = "phase",
@@ -469,15 +581,15 @@ private fun InputBar(
                             waitForUpOrCancellation()
                         }
                         if (upInTime == null) {
+                            // 长按 = 录音：先收键盘，否则它会挡住输入框
                             recording = true
-                            // 收起键盘：录音时它会挡住输入框
                             runCatching { focusManager.clearFocus() }
                             keyboard?.hide()
                             onStartVoice()
                             waitForUpOrCancellation()
                             onFinishVoice()
-                            // 实际状态由 listening 驱动，这里只兜底
                         } else {
+                            // 短按 = 文本输入：只聚焦，让键盘弹出来
                             focusReq.requestFocus()
                         }
                     }
@@ -524,7 +636,11 @@ private fun InputBar(
                     .focusRequester(focusReq),
                 placeholder = {
                     Text(
-                        if (live) "正在听…" else "点一下输入，长按说话",
+                        when {
+                            recording -> "正在听…（松手发送）"
+                            listening -> "正在听…"
+                            else -> "点一下输入，长按说话"
+                        },
                         fontSize = 13.sp,
                     )
                 },
@@ -541,19 +657,20 @@ private fun InputBar(
             )
         }
         Spacer(Modifier.width(8.dp))
+        val busy = running || justSent
         Button(
-            onClick = if (running) onStop else onSend,
-            enabled = running || value.isNotBlank(),
+            onClick = if (busy) onStop else onSend,
+            enabled = busy || value.isNotBlank(),
             modifier = Modifier.size(56.dp),
             shape = RoundedCornerShape(14.dp),
             contentPadding = PaddingValues(0.dp),
             colors = ButtonDefaults.buttonColors(
-                containerColor = if (running) colors.error else colors.primary,
-                contentColor = if (running) colors.onError else colors.onPrimary,
+                containerColor = if (busy) colors.error else colors.primary,
+                contentColor = if (busy) colors.onError else colors.onPrimary,
             ),
         ) {
             Canvas(Modifier.size(20.dp)) {
-                if (running) {
+                if (busy) {
                     // 停止：实心圆角方块
                     drawRoundRect(
                         color = androidx.compose.ui.graphics.Color(
@@ -753,6 +870,7 @@ private fun SettingsDialog(
     var wakeWords by remember { mutableStateOf(vm.settings.wakeWords) }
     var wakeTone by remember { mutableStateOf(vm.settings.wakeTone) }
     var idleSleep by remember { mutableStateOf(vm.settings.idleSleepSeconds.toString()) }
+    var chatTurns by remember { mutableStateOf(vm.settings.chatContextTurns.toString()) }
     var interruptOn by remember { mutableStateOf(vm.settings.interruptEnabled) }
     var interruptWords by remember { mutableStateOf(vm.settings.interruptWords) }
     var requireVp by remember { mutableStateOf(vm.settings.requireVoiceprint) }
@@ -826,6 +944,18 @@ private fun SettingsDialog(
                             lineHeight = 16.sp,
                         )
                     }
+                }
+
+                // ---------------- 聊天 ----------------
+                SettingsSection(
+                    title = "聊天",
+                    hint = "上下文轮数决定模型能记住多少轮对话。0=每句独立（记不住前后文）。",
+                ) {
+                    SmallField(
+                        chatTurns, { chatTurns = it },
+                        "上下文轮数（0~20）",
+                        KeyboardType.Number,
+                    )
                 }
 
                 // ---------------- 播报 ----------------
@@ -950,6 +1080,7 @@ private fun SettingsDialog(
                         requireVoiceprint = requireVp,
                         voiceprintThreshold = vpThreshold.toFloatOrNull()?.coerceIn(0.1f, 0.9f) ?: 0.30f,
                         idleSleepSeconds = idleSleep.toIntOrNull()?.coerceIn(0, 600) ?: 60,
+                        chatContextTurns = chatTurns.toIntOrNull()?.coerceIn(0, 20) ?: 4,
                         interruptEnabled = interruptOn,
                         interruptWords = interruptWords.trim().ifEmpty { "停一下,停下来,不说了,别说了" },
                     )

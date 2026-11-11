@@ -19,6 +19,13 @@ data class AgentSettings(
     val musicPolicy: String = MUSIC_DUCK,
     /** 沙箱进程空闲回收阈值（分钟），0 = 不回收。回收释放 guest 内存（~130MB）。 */
     val sandboxIdleMinutes: Int = 5,
+    /**
+     * 聊天时注入多少轮历史对话。
+     *
+     * 之前是 0（每句都是独立请求），导致"我叫什么""刚才那个再说一遍"这类追问全接不上。
+     * 4 轮是甜点：够记住上下文，又不至于让请求体膨胀、响应变慢。
+     */
+    val chatContextTurns: Int = 4,
     val ttsVoiceId: String = "male-qn-qingse",
     val ttsModel: String = "speech-02-hd",
     // ---------- 语音唤醒与声纹 ----------
@@ -99,6 +106,7 @@ data class AgentSettings(
         private const val K_TTS_ENGINE = "tts_engine"
         private const val K_MUSIC_POLICY = "music_policy"
         private const val K_SANDBOX_IDLE = "sandbox_idle_minutes"
+        private const val K_CHAT_CONTEXT = "chat_context_turns"
         private const val K_TTS_VOICE = "tts_voice_id"
         private const val K_TTS_MODEL = "tts_model"
         private const val K_WAKE_ENABLED = "wake_enabled"
@@ -144,6 +152,7 @@ data class AgentSettings(
                 ttsEngine = p.getString(K_TTS_ENGINE, null) ?: TTS_MINIMAX,
                 musicPolicy = p.getString(K_MUSIC_POLICY, null) ?: MUSIC_DUCK,
                 sandboxIdleMinutes = p.getInt(K_SANDBOX_IDLE, 5),
+                chatContextTurns = p.getInt(K_CHAT_CONTEXT, 4),
                 ttsVoiceId = p.getString(K_TTS_VOICE, null) ?: "male-qn-qingse",
                 ttsModel = p.getString(K_TTS_MODEL, null) ?: "speech-02-hd",
                 wakeEnabled = p.getBoolean(K_WAKE_ENABLED, true),
@@ -174,6 +183,7 @@ data class AgentSettings(
                 .putString(K_TTS_ENGINE, s.ttsEngine)
                 .putString(K_MUSIC_POLICY, s.musicPolicy)
                 .putInt(K_SANDBOX_IDLE, s.sandboxIdleMinutes)
+                .putInt(K_CHAT_CONTEXT, s.chatContextTurns)
                 .putString(K_TTS_VOICE, s.ttsVoiceId)
                 .putString(K_TTS_MODEL, s.ttsModel)
                 .putBoolean(K_WAKE_ENABLED, s.wakeEnabled)

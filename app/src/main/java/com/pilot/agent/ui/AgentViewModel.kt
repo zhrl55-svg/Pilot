@@ -38,6 +38,15 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     val logs = mutableStateListOf<LogEntry>()
 
     /**
+     * 聊天历史（一问一答成对）。
+     *
+     * 之前聊天是"每句独立请求"，模型完全不知道上一句说了什么，
+     * "我叫什么""刚才那个再说一遍"这类追问全接不上。
+     * 这里把历史存下来，按设置的轮数注入到请求里。
+     */
+    private val chatHistory = ArrayDeque<Pair<String, String>>()
+
+    /**
      * 对话区只显示"人说的话"和"AI 说的话"。
      *
      * 过程类（思考 THINK / 执行 ACT / 观察 OBSERVE）一律不显示——
@@ -49,6 +58,15 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         }
 
     var running by mutableStateOf(false)
+        private set
+
+    /**
+     * 刚发送、任务正在跑（区别于"完全空闲"）。
+     *
+     * 发送后按钮要**先变成停止**，任务做完才回纸飞机——
+     * 现在 running 一变 false 立刻回纸飞机，用户按不到停止。
+     */
+    var justSent by mutableStateOf(false)
         private set
 
     var confirm by mutableStateOf<ConfirmUi?>(null)
@@ -529,6 +547,9 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 add(LogEntry.Kind.OBSERVE, "模型不可用，这句没法回答。")
             } else {
                 val clean = reply.trim().take(200)
+                // 存进历史，供下一轮当上下文
+                chatHistory.addLast(text to clean)
+                while (chatHistory.size > 40) chatHistory.removeFirst()
                 add(LogEntry.Kind.DONE, clean)
                 AgentRuntime.speaker.speak(clean)
             }
@@ -551,9 +572,24 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                             "content",
                             "你是手机助手 Pilot，运行在这台安卓手机上。现在是 $now。" +
                                 "用一到两句话回答，简短口语化，不要用列表。" +
-                                "你能开关应用、查天气和股票、播音乐、跑 shell 命令、做导航。",
+                                "你能开关应用、查天气和股票、播音乐、跑 shell 命令、做导航。" +
+                                "下面是最近的对话，接住其中的指代和上下文。",
                         )
                     })
+                    // 注入最近 N 轮上下文（问答交替）
+                    val turns = s.chatContextTurns.coerceIn(0, 20)
+                    if (turns > 0) {
+                        chatHistory.takeLast(turns).forEach { (q, a) ->
+                            put(org.json.JSONObject().apply {
+                                put("role", "user")
+                                put("content", q)
+                            })
+                            put(org.json.JSONObject().apply {
+                                put("role", "assistant")
+                                put("content", a)
+                            })
+                        }
+                    }
                     put(org.json.JSONObject().apply {
                         put("role", "user")
                         put("content", text)
@@ -610,6 +646,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         }
         add(LogEntry.Kind.USER, g)
         running = true
+        justSent = true
         progress = 0 to settings.maxTurns
         AgentRuntime.loop?.start(AgentRuntime.scope, g)
     }
@@ -617,6 +654,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     fun stop() {
         AgentRuntime.loop?.cancel()
         running = false
+        justSent = false
         confirm = null
         add(LogEntry.Kind.ERROR, "已手动中止")
     }
@@ -651,12 +689,14 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 val text = polish(ev.summary)
                 add(LogEntry.Kind.DONE, text)
                 running = false
+                justSent = false
                 AgentRuntime.speaker.speak(text)
                 refreshStatus()
             }
             is AgentEvent.Failed -> {
                 add(LogEntry.Kind.ERROR, ev.reason)
                 running = false
+                justSent = false
                 confirm = null
             }
             is AgentEvent.Progress -> progress = ev.step to ev.maxSteps
