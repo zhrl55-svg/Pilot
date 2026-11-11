@@ -41,6 +41,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -68,11 +69,11 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.ui.focus.FocusRequester
@@ -89,14 +90,16 @@ import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 
+import com.pilot.agent.Dbg
 import com.pilot.agent.agent.AgentSettings
 
 /** 按住多久算长按（开始录音）。低于系统长按阈值，手感更跟手。 */
@@ -160,8 +163,11 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
     val ctx = LocalContext.current
-    var input by remember { mutableStateOf("") }
+    // 用 TextFieldValue 而不是 String：才能把光标放到句末
+    var input by remember { mutableStateOf(TextFieldValue("")) }
     var showSettings by remember { mutableStateOf(false) }
+    // 当前哪条消息处于文字选择态；点对话区空白处就清空（放弃选择）
+    var selectingEntryId by remember { mutableStateOf<Long?>(null) }
     val rootFocusManager = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
     // ★ 声纹注册弹窗放在这一层：跟设置弹窗同级会互相遮挡，点「开始」看着没反应（实测）。
@@ -208,18 +214,32 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
         )
         Spacer(Modifier.height(12.dp))
 
+        // ★ 音乐播放条：在聊天区上部显示歌名 + 暂停/继续 + 停止
+        vm.nowPlaying?.let { title ->
+            MusicBar(
+                title = title,
+                paused = vm.musicPaused,
+                onToggle = { vm.toggleMusic() },
+                onStop = { vm.stopMusic() },
+            )
+            Spacer(Modifier.height(12.dp))
+        }
+
         Box(
             Modifier
                 .weight(1f)
                 // ★ 点对话区（含空白处）→ 输入框取消焦点、键盘收起。
                 //   用 clickable 而不是 focusable：不用依赖 isFocused 之类的 API，
                 //   行为也更直接（点一下就收键盘）。
-                .clickable(
-                    interactionSource = remember { MutableInteractionSource() },
-                    indication = null,
-                ) {
-                    rootFocusManager.clearFocus(force = true)
-                    keyboard?.hide()
+                .pointerInput(Unit) {
+                    // ★ 用 detectTapGestures 而不是 clickable：
+                    //   clickable 在长按松手时也会判成 click → 刚选中的文字立刻被清掉。
+                    //   detectTapGestures 的 onTap 只在真正短按时触发。
+                    detectTapGestures(onTap = {
+                        rootFocusManager.clearFocus(force = true)
+                        keyboard?.hide()
+                        selectingEntryId = null      // 单击其他地方 = 放弃选择
+                    })
                 },
         ) {
             if (vm.chatLogs.isEmpty()) {
@@ -233,6 +253,10 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
                     items(vm.chatLogs, key = { it.id }) { entry ->
                         LogRow(
                             entry = entry,
+                            selectionActive = selectingEntryId == entry.id,
+                            onSelectionChange = { active ->
+                                selectingEntryId = if (active) entry.id else null
+                            },
                             onCopy = { text ->
                                 val cm = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
                                     as android.content.ClipboardManager
@@ -240,8 +264,9 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
                                 android.widget.Toast.makeText(ctx, "已复制", android.widget.Toast.LENGTH_SHORT).show()
                             },
                             onAddToChat = { text ->
-                                // "添加到对话"：把这段文本放进输入框，用户可以直接改再发
-                                input = if (input.isBlank()) text else "$input $text"
+                                // ★ 添加到输入框后光标自动到句末（用户能接着改/接着说）
+                                val t = if (input.text.isBlank()) text else input.text + " " + text
+                                input = TextFieldValue(t, TextRange(t.length))
                             },
                         )
                     }
@@ -261,8 +286,8 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
                     st == com.pilot.agent.voice.VoiceInput.State.RECOGNIZING
             },
             onSend = {
-                vm.run(input)
-                input = ""
+                vm.run(input.text)
+                input = TextFieldValue("")
             },
             justSent = vm.justSent,
             speaking = vm.speaking,
@@ -362,6 +387,48 @@ private fun Header(vm: AgentViewModel, onSettings: () -> Unit, onNavOpen: () -> 
     }
 }
 
+/** 音乐播放条：歌名 + 暂停/继续 + 停止。 */
+@Composable
+private fun MusicBar(
+    title: String,
+    paused: Boolean,
+    onToggle: () -> Unit,
+    onStop: () -> Unit,
+) {
+    val colors = MaterialTheme.colorScheme
+    Surface(
+        color = colors.secondaryContainer.copy(alpha = 0.55f),
+        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(start = 12.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+        ) {
+            Text(
+                "♪",
+                fontSize = 15.sp,
+                color = colors.onSecondaryContainer,
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                title,
+                fontSize = 13.sp,
+                color = colors.onSecondaryContainer,
+                maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(onClick = onToggle) {
+                Text(if (paused) "继续" else "暂停", fontSize = 12.sp)
+            }
+            TextButton(onClick = onStop) {
+                Text("停止", fontSize = 12.sp, color = colors.error)
+            }
+        }
+    }
+}
+
 @Composable
 private fun StatusCard(vm: AgentViewModel, onEnable: () -> Unit) {
     val colors = MaterialTheme.colorScheme
@@ -402,176 +469,218 @@ private fun StatusCard(vm: AgentViewModel, onEnable: () -> Unit) {
 /**
  * 一条对话。
  *
- * 版式：用户靠右带气泡、AI 靠左无气泡；只显示 USER / DONE / ERROR。
- *
- * 长按 → 弹「文字选择 + 横向菜单」：
- * - 文本按分隔符切成若干块，默认整句选中（浅色选择条），
- *   点某块收窄到该块，再点另一块扩展成连续范围（跟系统长按选词的手感一致）
- * - 菜单横向排：选择（全选） / 复制 / 添加到对话，作用于当前选中范围
+ * 长按 → **在原文上**做选择（参考系统文字选择）：
+ * - 文字按分隔符切块，长按命中哪块就选中哪块（蓝色高亮画在原文上）
+ * - 选中范围两端画竖线 + 圆点手柄，**两根手柄都能反复拖动**扩缩范围
+ * - 半透明菜单**浮在文字上方**（用 Box 叠层 + 负 offset，不占布局高度）
+ * - 点对话区其他地方 → 放弃选择
  */
-@OptIn(ExperimentalFoundationApi::class, ExperimentalLayoutApi::class)
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun LogRow(
     entry: LogEntry,
+    selectionActive: Boolean,
+    onSelectionChange: (Boolean) -> Unit,
     onCopy: (String) -> Unit,
     onAddToChat: (String) -> Unit,
 ) {
     val colors = MaterialTheme.colorScheme
     val isUser = entry.kind == LogEntry.Kind.USER
     val textColor = if (entry.kind == LogEntry.Kind.ERROR) colors.error else colors.onBackground
-    var menuOpen by remember { mutableStateOf(false) }
 
-    // 按分隔符切块：每块保留末尾的标点，读起来还是原句
     val chunks = remember(entry.text) { splitBySeparator(entry.text) }
-    var selStart by remember { mutableStateOf(0) }
-    var selEnd by remember { mutableStateOf(chunks.lastIndex.coerceAtLeast(0)) }
+    val ranges = remember(chunks) {
+        var acc = 0
+        chunks.map { part ->
+            val r = acc until (acc + part.length)
+            acc += part.length
+            r
+        }
+    }
+    var selStart by remember { mutableStateOf<Int?>(null) }
+    var selEnd by remember { mutableStateOf<Int?>(null) }
+    var layout by remember { mutableStateOf<androidx.compose.ui.text.TextLayoutResult?>(null) }
 
-    fun openMenu() {
-        selStart = 0
-        selEnd = chunks.lastIndex.coerceAtLeast(0)   // 默认整句选中
-        menuOpen = true
+    LaunchedEffect(selectionActive) {
+        if (!selectionActive) { selStart = null; selEnd = null }
     }
 
-    fun selectedText() = chunks.slice(selStart..selEnd).joinToString("").trim()
+    val selRange: IntRange? = if (selStart != null && selEnd != null) {
+        val a = ranges.getOrNull(selStart!!)?.first ?: 0
+        val b = (ranges.getOrNull(selEnd!!)?.last ?: (entry.text.length - 1)) + 1
+        a until b.coerceAtMost(entry.text.length)
+    } else null
+    val selectedText = selRange?.let { entry.text.substring(it.first, it.last) }?.trim().orEmpty()
 
-    Box {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start,
-        ) {
-            if (isUser) {
-                Surface(
-                    color = colors.primary.copy(alpha = 0.20f),
-                    shape = RoundedCornerShape(16.dp, 16.dp, 4.dp, 16.dp),
-                ) {
-                    Text(
-                        text = entry.text,
-                        fontSize = 14.sp,
-                        color = textColor,
-                        lineHeight = 21.sp,
-                        modifier = Modifier
-                            .widthIn(max = 280.dp)
-                            .combinedClickable(onClick = {}, onLongClick = { openMenu() })
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
-                    )
-                }
-            } else {
-                Text(
-                    text = entry.text,
-                    fontSize = 14.sp,
-                    color = textColor,
-                    lineHeight = 21.sp,
-                    modifier = Modifier
-                        .widthIn(max = 300.dp)
-                        .combinedClickable(onClick = {}, onLongClick = { openMenu() }),
-                )
-            }
+    // ★ 手势协程用 rememberUpdatedState 读最新选择范围：
+    //   直接捕获 selRange 会在重组后一直读到旧快照 → 手柄"只能拖一次，下次不动"（实测）
+    val rangeNow = rememberUpdatedState(selRange)
+    val layoutNow = rememberUpdatedState(layout)
+
+    fun chunkAt(offset: androidx.compose.ui.geometry.Offset): Int? {
+        val l = layoutNow.value ?: return null
+        if (entry.text.isEmpty()) return null
+        val charOffset = l.getOffsetForPosition(offset).coerceIn(0, entry.text.length - 1)
+        return ranges.indexOfFirst { charOffset in it }.takeIf { it >= 0 }
+    }
+
+    val annotated = androidx.compose.ui.text.buildAnnotatedString {
+        append(entry.text)
+        if (selRange != null && selRange.first < entry.text.length) {
+            addStyle(
+                androidx.compose.ui.text.SpanStyle(
+                    background = androidx.compose.ui.graphics.Color(0xFF2B5FA8),
+                    color = androidx.compose.ui.graphics.Color(0xFFFFFFFF),
+                ),
+                selRange.first, selRange.last + 1,
+            )
         }
+    }
 
-        if (menuOpen) {
-            Dialog(
-                onDismissRequest = { menuOpen = false },
-                properties = DialogProperties(usePlatformDefaultWidth = false),
-            ) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    // 背景遮罩单独一层：点它关闭，点内容区不会被误关
-                    Box(
-                        Modifier
-                            .matchParentSize()
-                            .background(androidx.compose.ui.graphics.Color(0x66000000))
-                            .clickable { menuOpen = false },
-                    )
-                    Surface(
-                        color = colors.surface,
-                        shape = RoundedCornerShape(14.dp),
-                        modifier = Modifier
-                            .fillMaxWidth(0.9f)
-                            .widthIn(max = 400.dp),
-                    ) {
-                        Column(Modifier.padding(14.dp)) {
-                            Text("选择文字", fontSize = 12.sp, color = colors.onSurfaceVariant)
-                            Spacer(Modifier.height(8.dp))
-                            // ★ 选择条：按分隔符分块，选中范围高亮
-                            FlowRow(
-                                horizontalArrangement = Arrangement.spacedBy(2.dp),
-                                verticalArrangement = Arrangement.spacedBy(2.dp),
-                            ) {
-                                chunks.forEachIndexed { i, part ->
-                                    val inSel = i in selStart..selEnd
-                                    Text(
-                                        part,
-                                        fontSize = 14.sp,
-                                        lineHeight = 22.sp,
-                                        color = if (inSel) colors.onPrimary else colors.onSurface,
-                                        modifier = Modifier
-                                            .background(
-                                                if (inSel) colors.primary else Color.Transparent,
-                                                RoundedCornerShape(4.dp),
-                                            )
-                                            .clickable {
-                                                // 第一次点 → 只选这块；再点 → 扩成连续范围
-                                                when {
-                                                    selStart == selEnd -> {
-                                                        selStart = minOf(selStart, i)
-                                                        selEnd = maxOf(selEnd, i)
-                                                    }
-                                                    i < selStart -> selStart = i
-                                                    i > selEnd -> selEnd = i
-                                                    else -> {
-                                                        selStart = i
-                                                        selEnd = i
-                                                    }
-                                                }
-                                            }
-                                            .padding(horizontal = 3.dp, vertical = 2.dp),
-                                    )
+    Box(Modifier.fillMaxWidth()) {
+        val bubbleShape = RoundedCornerShape(16.dp, 16.dp, 4.dp, 16.dp)
+        val bodyModifier = Modifier
+            .widthIn(max = if (isUser) 280.dp else 300.dp)
+            .let { m ->
+                if (isUser) {
+                    m.background(colors.primary.copy(alpha = 0.20f), bubbleShape)
+                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                } else m
+            }
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    // 判断按下的是哪根手柄
+                    var handle: Int? = null
+                    val r = rangeNow.value
+                    val l = layoutNow.value
+                    if (r != null && l != null && entry.text.isNotEmpty()) {
+                        val a = l.getBoundingBox(r.first)
+                        val b = l.getBoundingBox(r.last.coerceAtMost(entry.text.length - 1))
+                        val radius = 30.dp.toPx()
+                        val dl = (down.position - Offset(a.left, a.bottom)).getDistance()
+                        val dr = (down.position - Offset(b.right, b.bottom)).getDistance()
+                        if (minOf(dl, dr) < radius) handle = if (dl <= dr) 0 else 1
+                    }
+                    if (handle != null) {
+                        // ★ 拖动手柄：每帧都读最新范围，拖多少次都有效
+                        while (true) {
+                            val ev = awaitPointerEvent()
+                            val pos = ev.changes.firstOrNull()?.position
+                            if (pos != null) {
+                                val c = chunkAt(pos)
+                                if (c != null) {
+                                    val s0 = selStart ?: c
+                                    val e0 = selEnd ?: c
+                                    if (handle == 0) {
+                                        selStart = minOf(c, e0); selEnd = e0
+                                    } else {
+                                        selEnd = maxOf(c, s0); selStart = s0
+                                    }
                                 }
                             }
-                            Spacer(Modifier.height(12.dp))
-                            androidx.compose.material3.HorizontalDivider(
-                                color = colors.outlineVariant.copy(alpha = 0.4f),
-                            )
-                            Spacer(Modifier.height(6.dp))
-                            // ★ 横向菜单
-                            Row(Modifier.fillMaxWidth()) {
-                                MenuChip("选择", Modifier.weight(1f)) {
-                                    selStart = 0
-                                    selEnd = chunks.lastIndex.coerceAtLeast(0)
-                                }
-                                MenuChip("复制", Modifier.weight(1f)) {
-                                    onCopy(selectedText())
-                                    menuOpen = false
-                                }
-                                MenuChip("添加到对话", Modifier.weight(1f)) {
-                                    onAddToChat(selectedText())
-                                    menuOpen = false
-                                }
+                            if (ev.changes.any { it.changedToUpIgnoreConsumed() }) break
+                        }
+                        onSelectionChange(true)
+                    } else {
+                        // 单击 / 长按（靠超时唤醒，按住不动不会有新事件）
+                        val tapped = withTimeoutOrNull(450L) {
+                            while (true) {
+                                val ev = awaitPointerEvent()
+                                if (ev.changes.any { it.changedToUpIgnoreConsumed() }) break
                             }
+                            true
+                        }
+                        if (tapped != null) {
+                            Dbg.i("PilotSel", "短按 selStart=$selStart")
+                            if (selStart != null) {
+                                chunkAt(down.position)?.let { c -> selStart = c; selEnd = c }
+                                onSelectionChange(true)
+                            }
+                        } else {
+                            // 落在文字边缘/空白处时兜底选第一块，别让长按"没反应"
+                            val c = chunkAt(down.position) ?: 0
+                            Dbg.i("PilotSel", "长按命中 chunk=$c text=${entry.text.take(12)}")
+                            selStart = c; selEnd = c
+                            onSelectionChange(true)
                         }
                     }
                 }
+            }
+
+        Box(Modifier.align(if (isUser) Alignment.TopEnd else Alignment.TopStart)) {
+            Text(
+                text = annotated,
+                fontSize = 14.sp,
+                color = textColor,
+                lineHeight = 21.sp,
+                onTextLayout = { layout = it },
+                modifier = bodyModifier,
+            )
+            if (selRange != null && layout != null) {
+                Canvas(Modifier.matchParentSize()) {
+                    val l = layoutNow.value ?: return@Canvas
+                    val a = l.getBoundingBox(selRange.first)
+                    val b = l.getBoundingBox(selRange.last.coerceAtMost(entry.text.length - 1))
+                    val hc = androidx.compose.ui.graphics.Color(0xFF4A90E2)
+                    val w = 2.dp.toPx()
+                    drawLine(hc, Offset(a.left, a.top), Offset(a.left, a.bottom), w)
+                    drawLine(hc, Offset(b.right, b.top), Offset(b.right, b.bottom), w)
+                    val r = 5.dp.toPx()
+                    drawCircle(hc, r, Offset(a.left, a.bottom + r))
+                    drawCircle(hc, r, Offset(b.right, b.bottom + r))
+                }
+            }
+        }
+
+        // ★ 半透明菜单浮在文字上方。
+        //   ★ 关键：外面套一个 size(0) 的 Box —— 否则菜单虽然用负 offset 画到文字上方，
+        //   它**仍然参与父 Box 的测量**，下面的文字会被顶下去（用户反馈"复制时下面下移"）。
+        if (selRange != null) {
+            Box(
+                Modifier
+                    .align(if (isUser) Alignment.TopEnd else Alignment.TopStart)
+                    .size(0.dp)
+                    .zIndex(2f),
+            ) {
+            Surface(
+                color = androidx.compose.ui.graphics.Color(0x802A2A2A),   // 50% 透明
+                shape = RoundedCornerShape(16.dp),
+                shadowElevation = 4.dp,
+                modifier = Modifier
+                    .offset(y = (-44).dp)
+                    .widthIn(max = 330.dp),
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                ) {
+                    MenuChip("复制") { onCopy(selectedText); selStart = null; selEnd = null; onSelectionChange(false) }
+                    MenuChip("添加到输入框") { onAddToChat(selectedText); selStart = null; selEnd = null; onSelectionChange(false) }
+                    MenuChip("全选") { selStart = 0; selEnd = ranges.lastIndex; onSelectionChange(true) }
+                }
+            }
             }
         }
     }
 }
 
-/** 按分隔符切块，保留末尾标点（中文标点 / 英文标点 / 空白 / 换行）。 */
+/** 按分隔符切块，保留末尾标点（中文标点 / 问叹分冒号 / 空白）。 */
 private fun splitBySeparator(text: String): List<String> =
     text.split(Regex("(?<=[，。！？；：、!?;:\\s])"))
         .filter { it.isNotEmpty() }
         .ifEmpty { listOf(text) }
 
 @Composable
-private fun MenuChip(label: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
-    val colors = MaterialTheme.colorScheme
+private fun MenuChip(label: String, onClick: () -> Unit) {
     Text(
         label,
-        fontSize = 13.sp,
-        color = colors.primary,
+        fontSize = 12.sp,
+        color = androidx.compose.ui.graphics.Color(0xFFEEEEEE),
         textAlign = TextAlign.Center,
-        modifier = modifier
+        modifier = Modifier
             .clickable(onClick = onClick)
-            .padding(vertical = 10.dp),
+            .padding(horizontal = 8.dp, vertical = 8.dp),
     )
 }
 
@@ -620,8 +729,8 @@ private fun EmptyHint() {
  */
 @Composable
 private fun InputBar(
-    value: String,
-    onValueChange: (String) -> Unit,
+    value: TextFieldValue,
+    onValueChange: (TextFieldValue) -> Unit,
     running: Boolean,
     justSent: Boolean,
     speaking: Boolean,
@@ -804,7 +913,7 @@ private fun InputBar(
                 running || justSent -> onStop    // 任务中：中止任务
                 else -> onSend
             },
-            enabled = showStop || value.isNotBlank(),
+            enabled = showStop || value.text.isNotBlank(),
             modifier = Modifier.size(56.dp),
             shape = RoundedCornerShape(14.dp),
             contentPadding = PaddingValues(0.dp),

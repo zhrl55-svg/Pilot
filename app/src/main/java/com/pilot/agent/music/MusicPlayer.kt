@@ -77,11 +77,46 @@ class MusicPlayer private constructor(private val context: Context) {
         }
     }
 
+    /**
+     * 暂停（语音输入时用）。
+     *
+     * 为什么要暂停而不是停止：语音输入完还要接着听歌，
+     * 暂停能保留播放位置；而且网易云试听链接本来就限时，
+     * 重新请求可能拿不到。
+     */
+    fun pause() {
+        val mp = player ?: return
+        if (!isPlaying) return
+        runCatching {
+            if (mp.isPlaying) mp.pause()
+            isPlaying = false
+            paused = true
+            Dbg.i(TAG, "音乐已暂停：$currentTitle")
+        }.onFailure { Dbg.w(TAG, "暂停失败 ${it.message}") }
+    }
+
+    /** 恢复播放（从暂停点继续） */
+    fun resume() {
+        val mp = player ?: return
+        if (isPlaying || !paused) return
+        runCatching {
+            mp.start()
+            isPlaying = true
+            paused = false
+            Dbg.i(TAG, "音乐已恢复：$currentTitle")
+        }.onFailure { Dbg.w(TAG, "恢复失败 ${it.message}") }
+    }
+
+    /** 暂停中（UI 显示"继续"） */
+    var paused: Boolean = false
+        private set
+
     fun stop() {
         runCatching { player?.stop() }
         runCatching { player?.release() }
         player = null
         isPlaying = false
+        paused = false
         currentTitle = null
         // 释放闸门：麦克风恢复可信，唤醒词能重新被识别
         runCatching { audioGate?.close() }
@@ -93,7 +128,8 @@ class MusicPlayer private constructor(private val context: Context) {
         com.pilot.agent.voice.AudioFocusManager.musicStop = null
     }
 
-    fun nowPlaying(): String? = if (isPlaying) currentTitle else null
+    /** 当前歌曲名（播放中或暂停中） */
+    fun nowPlaying(): String? = if (isPlaying || paused) currentTitle else null
 
     companion object {
         private const val TAG = "PilotMusic"

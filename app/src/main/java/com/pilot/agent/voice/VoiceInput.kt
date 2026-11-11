@@ -386,7 +386,19 @@ class VoiceInput(
         //   播报中要能听见「停一下」打断，聆听中要能听见唤醒词重新开始。
         val hit = wake.feed(frame, len)
         if (hit != null) handleHit(hit)
-        if (mode == Mode.LISTEN || mode == Mode.ACTIVE) vad?.feed(frame, len)
+
+        // ★★ 放音期间**连 VAD 都不喂**，并且把已积累的段丢掉。
+        //   原来只在 recognize() 入口拦 isMuted，但 VAD 一直在攒播报声，
+        //   播报结束后整段被切出来 → ASR 把播报内容误识别成新指令 →
+        //   又触发一轮播报，形成自激循环（日志里连着 6 轮"莫名被唤醒"）。
+        //   注意：KWS 上面照常跑，播报中的语音打断不受影响。
+        val echoGuard = AudioGate.lastReleaseAt > 0L &&
+            SystemClock.uptimeMillis() - AudioGate.lastReleaseAt < ECHO_GUARD_MS
+        if (AudioGate.isMuted || echoGuard) {
+            vad?.reset()
+        } else if (mode == Mode.LISTEN || mode == Mode.ACTIVE) {
+            vad?.feed(frame, len)
+        }
     }
 
     /**
@@ -403,17 +415,24 @@ class VoiceInput(
         }
         val st = AgentSettings.load()
         val isInterruptWord = st.interruptWordList().any { word.contains(it) || it.contains(word) }
+        val isWakeWord = st.wakeWordList().any { word.contains(it) || it.contains(word) }
         val speaking = AudioGate.isMuted
 
-        if (st.interruptEnabled && speaking && (isInterruptWord || word.isNotEmpty())) {
-            tryInterrupt(word, isInterruptWord)
+        // ★ 打断词（停一下 / 不说了 / 安静…）**只在播报中**才有意义。
+        //   非播报时命中一律静默忽略：既不能唤醒、也不能调 backToIdleOrWake()
+        //   ——那个调用会把 WAKE 切成 ACTIVE，活跃期免唤醒监听，
+        //   于是环境音被当成对话，看起来就是"莫名被唤醒"（实测踩到）。
+        if (isInterruptWord && !isWakeWord) {
+            if (speaking && st.interruptEnabled) {
+                tryInterrupt(word, isInterruptWord = true)
+            } else {
+                Dbg.i(TAG, "打断词「$word」在非播报状态，忽略（不唤醒）")
+            }
             return
         }
-        if (isInterruptWord && !speaking) {
-            // 没在播报时说「停一下」→ 结束这次对话，回待命
-            Dbg.i(TAG, "收到打断词「$word」（未播报），结束本次对话")
-            runCatching { onInterrupt(word) }
-            backToIdleOrWake()
+        // 唤醒词在播报中也能打断（老板定的：唤醒词 + 关键词都能打断）
+        if (speaking && st.interruptEnabled) {
+            tryInterrupt(word, isInterruptWord = false)
             return
         }
         if (mode == Mode.LISTEN || state == State.RECOGNIZING) {

@@ -78,6 +78,14 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     var speaking by mutableStateOf(false)
         private set
 
+    /** 当前播放的歌名（播放中或暂停中），空 = 没在放 */
+    var nowPlaying by mutableStateOf<String?>(null)
+        private set
+
+    /** 音乐是否处于暂停状态（决定按钮显示"继续"还是"暂停"） */
+    var musicPaused by mutableStateOf(false)
+        private set
+
     var confirm by mutableStateOf<ConfirmUi?>(null)
         private set
 
@@ -184,6 +192,11 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                     voiceState = st
                     Dbg.i(TAG, "语音状态 → $st")
                 }
+                // 音乐播放状态（给顶部播放条用）
+                val mp = com.pilot.agent.music.MusicPlayer.get(getApplication())
+                val title = mp.nowPlaying()
+                if (title != nowPlaying) nowPlaying = title
+                if (mp.paused != musicPaused) musicPaused = mp.paused
                 delay(100)
             }
         }
@@ -541,6 +554,10 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     fun startVoiceHold(): Boolean {
         ensureVoice()
         val v = voice ?: return false
+        // ★ 开始语音输入前暂停音乐：麦克风要录人声，
+        //   放着歌的话 ASR 会把歌当人声（还容易自激），人也听不清自己说话。
+        //   暂停而不是停止——听完还能接着放。
+        pauseMusicForVoice()
         if (v.state == VoiceInput.State.LISTENING || v.state == VoiceInput.State.RECOGNIZING) {
             add(LogEntry.Kind.OBSERVE, "上一句还在处理，等一下再按住说")
             return false
@@ -555,7 +572,27 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     /** 按住说话：松手结束录音并送识别（识别完由 onText 自动执行）。 */
     fun finishVoiceHold() {
         voice?.finishListening()
+        resumeMusicAfterVoice()
     }
+
+    /** 语音输入前暂停音乐。 */
+    private fun pauseMusicForVoice() {
+        val mp = com.pilot.agent.music.MusicPlayer.get(getApplication())
+        if (mp.isPlaying) {
+            mp.pause()
+            musicPausedByVoice = true
+        }
+    }
+
+    /** 语音输入结束后恢复音乐（只在"是语音暂停的"时才恢复）。 */
+    private fun resumeMusicAfterVoice() {
+        if (!musicPausedByVoice) return
+        musicPausedByVoice = false
+        com.pilot.agent.music.MusicPlayer.get(getApplication()).resume()
+    }
+
+    @Volatile
+    private var musicPausedByVoice = false
 
     fun toggleVoice() {
         ensureVoice()
@@ -734,6 +771,21 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
      * - 任务在跑 → 中止；
      * - 两个都在发生 → 两个都停。
      */
+    /** 音乐：暂停 / 继续 */
+    fun toggleMusic() {
+        val mp = com.pilot.agent.music.MusicPlayer.get(getApplication())
+        if (mp.isPlaying) mp.pause() else mp.resume()
+        nowPlaying = mp.nowPlaying()
+        musicPaused = mp.paused
+    }
+
+    /** 音乐：停止 */
+    fun stopMusic() {
+        com.pilot.agent.music.MusicPlayer.get(getApplication()).stop()
+        nowPlaying = null
+        musicPaused = false
+    }
+
     fun stopSpeaking() {
         var did = false
         if (AgentRuntime.speaker.isSpeaking) {
