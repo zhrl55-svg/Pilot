@@ -155,6 +155,14 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             AgentRuntime.events.collect { handle(it) }
         }
+        // ★ 常驻轮询播报状态：停止按钮要在播报**一开始**就出现。
+        //   只在 Finished 事件里起轮询有竞态——任务完成得快的话按钮来不及出现。
+        viewModelScope.launch {
+            while (true) {
+                syncSpeaking()
+                delay(100)
+            }
+        }
         viewModelScope.launch {
             AgentRuntime.foreground.collect { foreground = it }
         }
@@ -192,6 +200,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         val s = AgentRuntime.speaker.isSpeaking
         if (s != speaking) {
             speaking = s
+            Dbg.i(TAG, "播报状态 → $s")
         }
     }
 
@@ -736,14 +745,6 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 justSent = false
                 AgentRuntime.speaker.speak(text)
                 refreshStatus()
-                // 播报期间要显示"停止"按钮：起个轮询跟着播报状态
-                viewModelScope.launch {
-                    while (AgentRuntime.speaker.isSpeaking) {
-                        syncSpeaking()
-                        delay(120)
-                    }
-                    syncSpeaking()
-                }
             }
             is AgentEvent.Failed -> {
                 add(LogEntry.Kind.ERROR, ev.reason)
