@@ -576,7 +576,9 @@ class VoiceInput(
                 }
                 main.post {
                     when {
-                        !authorized -> onError("声纹不匹配，已忽略这句话")
+                        // ★ 声纹不匹配就**静默忽略**：这是"防误触发"的正常路径，
+                        //   不是错误。写进对话区会刷屏（旁人说话也刷一条）。
+                        !authorized -> Dbg.i(TAG, "声纹不匹配，忽略这句")
                         text == null -> onError(asr.lastError ?: "端侧识别不可用")
                         text.isBlank() -> Dbg.i(TAG, "识别结果为空")
                         isWakeEcho(text) -> Dbg.i(TAG, "丢弃唤醒词残留：$text")
