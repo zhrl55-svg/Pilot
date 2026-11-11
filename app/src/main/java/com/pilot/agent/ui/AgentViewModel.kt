@@ -37,6 +37,17 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
 
     val logs = mutableStateListOf<LogEntry>()
 
+    /**
+     * 对话区只显示"人说的话"和"AI 说的话"。
+     *
+     * 过程类（思考 THINK / 执行 ACT / 观察 OBSERVE）一律不显示——
+     * 那些是给人调试看的，堆在对话里用户只会觉得吵。
+     */
+    val chatLogs: List<LogEntry>
+        get() = logs.filter {
+            it.kind == LogEntry.Kind.USER || it.kind == LogEntry.Kind.DONE || it.kind == LogEntry.Kind.ERROR
+        }
+
     var running by mutableStateOf(false)
         private set
 
@@ -173,7 +184,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             // 单例复用：把回调换成当前 ViewModel 的
             v.onState = { voiceState = it }
             v.onText = { text ->
-                add(LogEntry.Kind.USER, "「$text」")
+                add(LogEntry.Kind.USER, text)
                 when (IntentGate.classify(text)) {
                     IntentGate.Kind.TASK -> run(text)
                     IntentGate.Kind.QUERY -> query(text)
@@ -199,7 +210,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             gate = AgentRuntime.voiceprint,
             onState = { voiceState = it },
             onText = { text ->
-                add(LogEntry.Kind.USER, "「$text」")
+                add(LogEntry.Kind.USER, text)
                 // 意图三分类：操作 / 查询 / 闲聊，走三条完全不同的链路
                 when (IntentGate.classify(text)) {
                     IntentGate.Kind.TASK -> run(text)
@@ -414,6 +425,22 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         refreshStatus()
     }
 
+    /** 按住说话：按下开始录音（不切换待命状态）。 */
+    fun startVoiceHold() {
+        ensureVoice()
+        val v = voice ?: return
+        if (v.state == VoiceInput.State.LISTENING || v.state == VoiceInput.State.RECOGNIZING) return
+        v.startListening(resumeWake = wakeOn)
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { AgentRuntime.localLlm.ensureReady() }
+        }
+    }
+
+    /** 按住说话：松手结束录音并送识别（识别完由 onText 自动执行）。 */
+    fun finishVoiceHold() {
+        voice?.finishListening()
+    }
+
     fun toggleVoice() {
         ensureVoice()
         val v = voice ?: return
@@ -597,9 +624,10 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 AgentRuntime.speaker.speak(ev.question)
             }
             is AgentEvent.Finished -> {
-                add(LogEntry.Kind.DONE, ev.summary)
+                val text = polish(ev.summary)
+                add(LogEntry.Kind.DONE, text)
                 running = false
-                AgentRuntime.speaker.speak(ev.summary)
+                AgentRuntime.speaker.speak(text)
                 refreshStatus()
             }
             is AgentEvent.Failed -> {
@@ -609,6 +637,28 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             }
             is AgentEvent.Progress -> progress = ev.step to ev.maxSteps
         }
+    }
+
+    /**
+     * 润色完成话术。
+     *
+     * 三个真问题：
+     * 1. `已打开 设置 设置`——planner 拼 appLabel + label，同一个词出现两次；
+     * 2. `已开启 蓝牙 已完成`——机械后缀，念出来很生硬；
+     * 3. 空泛的「已完成」，用户不知道完成了什么。
+     */
+    private fun polish(text: String): String {
+        var t = text.trim()
+        if (t.isEmpty()) return t
+        // 相邻重复词去掉（空格分隔的）
+        val parts = t.split(' ').filter { it.isNotBlank() }
+        val dedup = mutableListOf<String>()
+        for (p in parts) if (dedup.lastOrNull() != p) dedup += p
+        t = dedup.joinToString(" ")
+        // 去掉机械后缀
+        t = t.removeSuffix(" 已完成").removeSuffix("已完成").trim()
+        if (t == "完成" || t.isEmpty()) return "好了"
+        return t
     }
 
     private fun add(kind: LogEntry.Kind, text: String) {

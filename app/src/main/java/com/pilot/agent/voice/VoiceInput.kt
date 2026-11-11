@@ -226,6 +226,7 @@ class VoiceInput(
      * UI 侧（注册引导弹窗）负责提示用户念口令。
      */
     @Volatile private var enrolling = false
+    private var enrollResumeWake = false
     private val enrollSamples = ArrayList<ShortArray>()
 
     /** 注册完成回调（在音频线程触发，UI 侧自行切主线程）。 */
@@ -236,6 +237,9 @@ class VoiceInput(
         if (!ensureCapture()) return false
         enrolling = true
         enrollSamples.clear()
+        // 注册期间不走 VAD→ASR，但**注册结束要回到原来的待命状态**，
+        // 否则麦克风被关掉、待命丢失，用户还得手动再点一次（实测"注册完就没反应了"）。
+        enrollResumeWake = resumeToWake || mode == Mode.WAKE || mode == Mode.ACTIVE
         resumeToWake = false
         vad?.reset()
         mode = Mode.LISTEN
@@ -247,11 +251,13 @@ class VoiceInput(
     fun cancelEnroll() {
         enrolling = false
         enrollSamples.clear()
+        resumeToWake = enrollResumeWake
         backToIdleOrWake()
     }
 
     private fun finishEnroll(): Boolean {
         enrolling = false
+        resumeToWake = enrollResumeWake
         val ok = enrollSamples.size >= ENROLL_TARGET
         if (ok) {
             // 三段拼起来一起提 embedding：比单句稳（对不同音量/距离更宽容）
@@ -428,6 +434,14 @@ class VoiceInput(
             backToIdleOrWake()
             return
         }
+        // ★ 放音刚结束的尾音也要丢：VAD 缓冲里那段会被识别成播放内容本身
+        //   （「音量已经是最大百分之一百」），然后被当成新指令执行，形成自问自答。
+        val sinceSpeak = SystemClock.uptimeMillis() - AudioGate.lastReleaseAt
+        if (AudioGate.lastReleaseAt > 0L && sinceSpeak < ECHO_GUARD_MS) {
+            Dbg.i(TAG, "放音刚结束 ${sinceSpeak}ms，丢弃尾音（${pcm.size * 1000 / AudioCapture.SAMPLE_RATE}ms）")
+            backToIdleOrWake()
+            return
+        }
         if (!busy.compareAndSet(false, true)) return
         emitState(State.RECOGNIZING)
         worker.execute {
@@ -546,6 +560,9 @@ class VoiceInput(
 
     private companion object {
         const val TAG = "PilotVoice"
+
+        /** 放音结束后多久内录到的音频一律当回声丢掉 */
+        const val ECHO_GUARD_MS = 900L
 
         /** 声纹注册要采够的语句段数 */
         const val ENROLL_TARGET = 3

@@ -51,6 +51,14 @@ class AgentLoop(
     @Volatile
     private var hasUi = true
 
+    /**
+     * 系统直调最近一次的结果话术（「音量 80% 调到 93%（+13%）」这种）。
+     * 直调成功要播报的是**实际结果**，不是「音量」两个字——
+     * 之前用 action.summary 播，用户只听到"音量"，等于没告诉你调成多少。
+     */
+    @Volatile
+    private var lastSystemMessage: String? = null
+
     val isRunning: Boolean get() = job?.isActive == true
 
     /**
@@ -294,7 +302,7 @@ class AgentLoop(
             // 失败还重试没有意义（缺权限就是缺权限），只会把同一句话重复问 5 遍。
             if (action.action == "systemop") {
                 if (ok) {
-                    emit(AgentEvent.Finished(action.summary?.let { "$it 已完成" } ?: "已完成"))
+                    emit(AgentEvent.Finished(lastSystemMessage ?: action.summary ?: "完成了"))
                 } else {
                     emit(AgentEvent.Failed("${action.summary ?: "系统操作"}没能完成，看上面的原因"))
                 }
@@ -408,6 +416,7 @@ class AgentLoop(
      * 而不是只听到一句"完成了"。所以这里把 SystemOps 的返回文本用 Observe 事件发出去。
      */
     private suspend fun runSystemOp(a: AgentAction): Boolean {
+        lastSystemMessage = null
         val op = a.target ?: return false
         val arg = a.text.orEmpty()
         return when (op) {
@@ -732,6 +741,9 @@ class AgentLoop(
     }
 
     private suspend fun emit(e: AgentEvent) {
+        // 直调的结果话术是通过 Observe 发出去的（「音量 80% 调到 93%」）。
+        // 在这里顺手记一份，完成时就能播"实际结果"而不是干巴巴的"音量"。
+        if (e is AgentEvent.Observe) lastSystemMessage = e.text
         sink.emit(e)
     }
 }

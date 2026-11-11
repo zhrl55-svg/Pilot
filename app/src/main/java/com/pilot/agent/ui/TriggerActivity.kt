@@ -79,6 +79,10 @@ class TriggerActivity : Activity() {
                     "wake" -> vv.debugHit("小派")
                     "end" -> vv.debugEndTurn()
                     "status" -> Dbg.i(TAG, "自检状态：${vv.debugStatus()}")
+                    "enroll" -> {
+                        val ok = vv.startEnroll()
+                        Dbg.i(TAG, "自检：声纹注册 startEnroll=$ok")
+                    }
                     else -> vv.debugHit(voiceTest)
                 }
                 Dbg.i(TAG, "自检后：${vv.debugStatus()}")

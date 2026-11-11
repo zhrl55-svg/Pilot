@@ -49,7 +49,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.scale
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -57,6 +56,37 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.RoundRect
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.style.TextAlign
+import kotlinx.coroutines.withTimeoutOrNull
+
 import com.pilot.agent.agent.AgentSettings
 
 class MainActivity : ComponentActivity() {
@@ -65,14 +95,14 @@ class MainActivity : ComponentActivity() {
 
     private val micPermission =
         registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) vm.toggleVoice()
+            if (granted) vm.startVoiceHold()
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
             PilotTheme {
-                AgentScreen(vm, onMicClick = ::requestMic)
+                AgentScreen(vm, onRequestMic = { micPermission.launch(android.Manifest.permission.RECORD_AUDIO) })
             }
         }
         handleGoalIntent(intent)
@@ -115,15 +145,17 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun AgentScreen(vm: AgentViewModel, onMicClick: () -> Unit) {
+private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
     val ctx = LocalContext.current
     var input by remember { mutableStateOf("") }
     var showSettings by remember { mutableStateOf(false) }
+    // ★ 声纹注册弹窗放在这一层：跟设置弹窗同级会互相遮挡，点「开始」看着没反应（实测）。
+    var showEnroll by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val colors = MaterialTheme.colorScheme
 
-    LaunchedEffect(vm.logs.size) {
-        if (vm.logs.isNotEmpty()) listState.animateScrollToItem(vm.logs.lastIndex)
+    LaunchedEffect(vm.chatLogs.size) {
+        if (vm.chatLogs.isNotEmpty()) listState.animateScrollToItem(vm.chatLogs.lastIndex)
     }
 
     Column(
@@ -159,12 +191,11 @@ private fun AgentScreen(vm: AgentViewModel, onMicClick: () -> Unit) {
         StatusCard(
             vm,
             onEnable = { openAccessibilitySettings(ctx) },
-            onToggleWake = { vm.toggleWake() },
         )
         Spacer(Modifier.height(12.dp))
 
         Box(Modifier.weight(1f)) {
-            if (vm.logs.isEmpty()) {
+            if (vm.chatLogs.isEmpty()) {
                 EmptyHint()
             } else {
                 LazyColumn(
@@ -172,7 +203,7 @@ private fun AgentScreen(vm: AgentViewModel, onMicClick: () -> Unit) {
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.fillMaxSize(),
                 ) {
-                    items(vm.logs, key = { it.id }) { LogRow(it) }
+                    items(vm.chatLogs, key = { it.id }) { LogRow(it) }
                 }
             }
         }
@@ -189,7 +220,18 @@ private fun AgentScreen(vm: AgentViewModel, onMicClick: () -> Unit) {
                 input = ""
             },
             onStop = { vm.stop() },
-            onMicClick = onMicClick,
+            onStartVoice = {
+                // 长按说话要先有录音权限；没有就当场申请，授权后立刻开始
+                if (androidx.core.content.ContextCompat.checkSelfPermission(
+                        ctx, android.Manifest.permission.RECORD_AUDIO
+                    ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                ) {
+                    vm.startVoiceHold()
+                } else {
+                    onRequestMic()
+                }
+            },
+            onFinishVoice = { vm.finishVoiceHold() },
         )
     }
 
@@ -208,7 +250,18 @@ private fun AgentScreen(vm: AgentViewModel, onMicClick: () -> Unit) {
     }
 
     if (showSettings) {
-        SettingsDialog(vm, onDismiss = { showSettings = false })
+        SettingsDialog(
+            vm,
+            onDismiss = { showSettings = false },
+            onEnrollRequest = {
+                showSettings = false
+                showEnroll = true
+            },
+        )
+    }
+
+    if (showEnroll) {
+        VoiceprintEnrollDialog(vm, onDismiss = { showEnroll = false })
     }
 
     // 二维码单独一层：不嵌在设置弹窗里，扫码时设置可以先关掉
@@ -272,114 +325,83 @@ private fun Header(vm: AgentViewModel, onSettings: () -> Unit, onNavOpen: () -> 
 }
 
 @Composable
-private fun StatusCard(vm: AgentViewModel, onEnable: () -> Unit, onToggleWake: () -> Unit) {
+private fun StatusCard(vm: AgentViewModel, onEnable: () -> Unit) {
     val colors = MaterialTheme.colorScheme
     Surface(
         color = colors.surface,
         shape = RoundedCornerShape(14.dp),
         modifier = Modifier.fillMaxWidth(),
     ) {
-        Column(Modifier.padding(14.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    if (vm.accessibilityOn) "操作权限 已就绪" else "操作权限 未开启",
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = if (vm.accessibilityOn) colors.primary else colors.error,
-                )
-                Spacer(Modifier.weight(1f))
-                if (!vm.accessibilityOn) {
-                    Button(
-                        onClick = onEnable,
-                        shape = RoundedCornerShape(10.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = colors.primary),
-                    ) { Text("去开启", fontSize = 12.sp) }
-                }
-            }
-            Spacer(Modifier.height(8.dp))
-            Row {
-                Metric("规划器", if (vm.settings.cloudReady) "端云双速" else "端侧规则")
-                Spacer(Modifier.width(20.dp))
-                Metric("云端模型", if (vm.settings.cloudReady) vm.settings.model else "未配置")
-                Spacer(Modifier.width(20.dp))
-                Metric("技能", "${vm.skillCount} 条")
-            }
-            Spacer(Modifier.height(6.dp))
-            Row {
-                Metric("端侧ASR", if (vm.asrReady) "就绪" else vm.asrNote)
-                Spacer(Modifier.width(20.dp))
-                Metric("端侧LLM", if (vm.llmReady) "就绪" else vm.llmNote)
-                Spacer(Modifier.width(20.dp))
-                Metric(
-                    "声纹",
-                    vm.voiceprintInfo.ifEmpty { if (vm.voiceprintEnrolled) "已注册" else "未注册" },
-                )
-            }
-            Spacer(Modifier.height(4.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    when (vm.voiceState) {
-                        com.pilot.agent.voice.VoiceInput.State.WAKE_WAIT -> "待命中，说唤醒词就能用"
-                        com.pilot.agent.voice.VoiceInput.State.ASLEEP -> "已休眠，说唤醒词或点一下麦克风"
-                        com.pilot.agent.voice.VoiceInput.State.ACTIVE -> "在等你接着说（不用再喊唤醒词）"
-                        com.pilot.agent.voice.VoiceInput.State.LISTENING -> "在听，说完停顿一下"
-                        com.pilot.agent.voice.VoiceInput.State.RECOGNIZING -> "识别中…"
-                        else -> "未开启语音"
-                    },
-                    fontSize = 11.sp,
-                    color = colors.onSurfaceVariant,
-                    modifier = Modifier.weight(1f),
-                )
-                TextButton(onClick = onToggleWake) {
-                    Text(
-                        if (vm.wakeOn) "停止待命" else "开始待命",
-                        fontSize = 12.sp,
-                        color = if (vm.wakeOn) colors.error else colors.primary,
-                    )
-                }
-            }
-            if (vm.progress.second > 0) {
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    "步骤 ${vm.progress.first} / ${vm.progress.second}",
-                    fontSize = 11.sp,
-                    color = colors.onSurfaceVariant,
-                )
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+        ) {
+            Box(
+                Modifier
+                    .size(8.dp)
+                    .background(if (vm.accessibilityOn) colors.primary else colors.error, CircleShape),
+            )
+            Spacer(Modifier.width(10.dp))
+            Text(
+                if (vm.accessibilityOn) "操作权限 已就绪" else "操作权限 未开启",
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium,
+                color = if (vm.accessibilityOn) colors.primary else colors.error,
+            )
+            Spacer(Modifier.weight(1f))
+            if (!vm.accessibilityOn) {
+                Button(
+                    onClick = onEnable,
+                    shape = RoundedCornerShape(10.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = colors.primary),
+                ) { Text("去开启", fontSize = 12.sp) }
             }
         }
     }
 }
 
-@Composable
-private fun Metric(label: String, value: String) {
-    val colors = MaterialTheme.colorScheme
-    Column {
-        Text(label, fontSize = 11.sp, color = colors.onSurfaceVariant)
-        Text(value, fontSize = 13.sp, color = colors.onBackground, fontWeight = FontWeight.Medium)
-    }
-}
-
+/**
+ * 一条对话。
+ *
+ * 版式（老板定的）：**用户靠右带气泡、AI 靠左无气泡**。
+ * 只渲染三种：用户说的话、AI 的回答、出错提示；
+ * 过程类（思考/执行/观察）不显示——那是给人调试看的，不是给用户看的。
+ */
 @Composable
 private fun LogRow(entry: LogEntry) {
     val colors = MaterialTheme.colorScheme
-    val (tint, prefix) = when (entry.kind) {
-        LogEntry.Kind.USER -> colors.onBackground to "你"
-        LogEntry.Kind.THINK -> colors.onSurfaceVariant to "想"
-        LogEntry.Kind.ACT -> colors.primary to "做"
-        LogEntry.Kind.OBSERVE -> colors.secondary to "看"
-        LogEntry.Kind.DONE -> colors.primary to "完成"
-        LogEntry.Kind.ERROR -> colors.error to "注意"
-    }
-    Row(verticalAlignment = Alignment.Top) {
-        Text(
-            prefix,
-            fontSize = 11.sp,
-            color = tint,
-            modifier = Modifier
-                .width(34.dp)
-                .padding(top = 2.dp),
-        )
-        Text(entry.text, fontSize = 13.sp, color = tint, lineHeight = 19.sp)
+    val isUser = entry.kind == LogEntry.Kind.USER
+    val textColor = if (entry.kind == LogEntry.Kind.ERROR) colors.error else colors.onBackground
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start,
+    ) {
+        if (isUser) {
+            Surface(
+                color = colors.primary.copy(alpha = 0.20f),
+                shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomEnd = 4.dp, bottomStart = 16.dp),
+            ) {
+                Text(
+                    text = entry.text,
+                    fontSize = 14.sp,
+                    color = textColor,
+                    lineHeight = 21.sp,
+                    modifier = Modifier
+                        .widthIn(max = 280.dp)
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                )
+            }
+        } else {
+            Text(
+                text = entry.text,
+                fontSize = 14.sp,
+                color = textColor,
+                lineHeight = 21.sp,
+                modifier = Modifier.widthIn(max = 300.dp),
+            )
+        }
     }
 }
 
@@ -402,6 +424,15 @@ private fun EmptyHint() {
     }
 }
 
+/**
+ * 输入栏。
+ *
+ * 交互按老板定的来：
+ * - **点一下**输入框 → 弹键盘打字；
+ * - **长按**输入框 → 开始录音，松手立即发送（识别结果直接执行）；
+ * - 录音时输入框有一圈**旋转的彩色描边**，一眼看出在录；
+ * - 不再有"说"按钮，发送按钮是个箭头。
+ */
 @Composable
 private fun InputBar(
     value: String,
@@ -410,49 +441,152 @@ private fun InputBar(
     listening: Boolean,
     onSend: () -> Unit,
     onStop: () -> Unit,
-    onMicClick: () -> Unit,
+    onStartVoice: () -> Unit,
+    onFinishVoice: () -> Unit,
 ) {
     val colors = MaterialTheme.colorScheme
+    val focusReq = remember { FocusRequester() }
+    val focusManager = LocalFocusManager.current
+    val keyboard = LocalSoftwareKeyboardController.current
+    var recording by remember { mutableStateOf(false) }
+
+    // 录音结束（识别完/被打断）时把描边收掉
+    LaunchedEffect(listening) {
+        if (!listening) recording = false
+    }
+
+    // ★ 不要旋转着画矩形：rotate 会把圆角矩形转出界，看起来是"扭"的。
+    //   改成颜色在两个主色之间呼吸，形状稳定、也明显是"在录"。
+    val spin = rememberInfiniteTransition(label = "rec")
+    val phase by spin.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            tween(1600, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "phase",
+    )
+    val live = recording || listening
+
     Row(verticalAlignment = Alignment.Bottom) {
-        OutlinedTextField(
-            value = value,
-            onValueChange = onValueChange,
-            modifier = Modifier.weight(1f),
-            placeholder = { Text("让 Pilot 做什么？", fontSize = 13.sp) },
-            maxLines = 3,
-            shape = RoundedCornerShape(14.dp),
-        )
-        Spacer(Modifier.width(8.dp))
-        // 按住说话：点一下开始，再点一下结束。端侧识别，断句静默 800ms 自动出结果。
         Box(
             modifier = Modifier
-                .size(56.dp)
-                .background(
-                    if (listening) colors.error else colors.surfaceVariant,
-                    RoundedCornerShape(14.dp),
-                )
-                .clickable(onClick = onMicClick),
-            contentAlignment = Alignment.Center,
+                .weight(1f)
+                .pointerInput(Unit) {
+                    awaitEachGesture {
+                        awaitFirstDown(requireUnconsumed = false)
+                        // 超时还没松手 = 长按 → 录音
+                        val upInTime = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
+                            waitForUpOrCancellation()
+                        }
+                        if (upInTime == null) {
+                            recording = true
+                            // 收起键盘：录音时它会挡住输入框
+                            runCatching { focusManager.clearFocus() }
+                            keyboard?.hide()
+                            onStartVoice()
+                            waitForUpOrCancellation()
+                            onFinishVoice()
+                            // 实际状态由 listening 驱动，这里只兜底
+                        } else {
+                            focusReq.requestFocus()
+                        }
+                    }
+                },
         ) {
-            Text(
-                if (listening) "停" else "说",
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Medium,
-                color = if (listening) colors.onError else colors.onSurfaceVariant,
+            if (live) {
+                // 一段亮线沿圆角边框滚动（流光），形状稳定、不随角度变形。
+                val border = androidx.compose.ui.graphics.lerp(colors.primary, colors.tertiary, phase)
+                Canvas(Modifier.matchParentSize().padding(1.dp)) {
+                    val r = CornerRadius(16.dp.toPx())
+                    val path = Path().apply {
+                        addRoundRect(
+                            RoundRect(
+                                left = 0f, top = 0f,
+                                right = size.width, bottom = size.height,
+                                cornerRadius = r,
+                            ),
+                        )
+                    }
+                    val stroke = 2.5.dp.toPx()
+                    // 底：一圈很淡的边，保证任何时刻都看得出"框在这儿"
+                    drawPath(path, color = border.copy(alpha = 0.25f), style = Stroke(stroke))
+                    // 上：一段占周长约 1/4 的高亮沿框流动
+                    val perimeter = 2f * (size.width + size.height)
+                    val dash = perimeter * 0.25f
+                    drawPath(
+                        path = path,
+                        color = border,
+                        style = Stroke(
+                            width = stroke,
+                            pathEffect = PathEffect.dashPathEffect(
+                                floatArrayOf(dash, perimeter - dash),
+                                -perimeter * phase,
+                            ),
+                        ),
+                    )
+                }
+            }
+            OutlinedTextField(
+                value = if (live) "" else value,
+                onValueChange = onValueChange,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .focusRequester(focusReq),
+                placeholder = {
+                    Text(
+                        if (live) "正在听…" else "点一下输入，长按说话",
+                        fontSize = 13.sp,
+                    )
+                },
+                maxLines = 3,
+                shape = RoundedCornerShape(14.dp),
+                colors = if (live) {
+                    OutlinedTextFieldDefaults.colors(
+                        unfocusedBorderColor = Color.Transparent,
+                        focusedBorderColor = Color.Transparent,
+                    )
+                } else {
+                    OutlinedTextFieldDefaults.colors()
+                },
             )
         }
         Spacer(Modifier.width(8.dp))
         Button(
             onClick = if (running) onStop else onSend,
             enabled = running || value.isNotBlank(),
-            modifier = Modifier.height(56.dp),
+            modifier = Modifier.size(56.dp),
             shape = RoundedCornerShape(14.dp),
+            contentPadding = PaddingValues(0.dp),
             colors = ButtonDefaults.buttonColors(
                 containerColor = if (running) colors.error else colors.primary,
                 contentColor = if (running) colors.onError else colors.onPrimary,
             ),
         ) {
-            Text(if (running) "停止" else "执行", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+            Canvas(Modifier.size(20.dp)) {
+                if (running) {
+                    // 停止：实心圆角方块
+                    drawRoundRect(
+                        color = androidx.compose.ui.graphics.Color(
+                            colors.onError.value,
+                        ),
+                        topLeft = Offset(size.width * 0.18f, size.height * 0.18f),
+                        size = androidx.compose.ui.geometry.Size(size.width * 0.64f, size.height * 0.64f),
+                        cornerRadius = CornerRadius(size.width * 0.12f),
+                    )
+                } else {
+                    // 发送：纸飞机（比"↑"更像发送，也更像"发出去"这个动作）
+                    val p = Path().apply {
+                        moveTo(size.width * 0.06f, size.height * 0.46f)
+                        lineTo(size.width * 0.94f, size.height * 0.06f)
+                        lineTo(size.width * 0.58f, size.height * 0.94f)
+                        lineTo(size.width * 0.44f, size.height * 0.58f)
+                        close()
+                    }
+                    drawPath(p, color = androidx.compose.ui.graphics.Color(colors.onPrimary.value))
+                }
+            }
         }
     }
 }
@@ -616,7 +750,11 @@ private fun Hint(text: String) {
 }
 
 @Composable
-private fun SettingsDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
+private fun SettingsDialog(
+    vm: AgentViewModel,
+    onDismiss: () -> Unit,
+    onEnrollRequest: () -> Unit,
+) {
     var baseUrl by remember { mutableStateOf(vm.settings.baseUrl) }
     var apiKey by remember { mutableStateOf(vm.settings.apiKey) }
     var model by remember { mutableStateOf(vm.settings.model) }
@@ -630,7 +768,6 @@ private fun SettingsDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
     var idleSleep by remember { mutableStateOf(vm.settings.idleSleepSeconds.toString()) }
     var interruptOn by remember { mutableStateOf(vm.settings.interruptEnabled) }
     var interruptWords by remember { mutableStateOf(vm.settings.interruptWords) }
-    var showEnroll by remember { mutableStateOf(false) }
     var requireVp by remember { mutableStateOf(vm.settings.requireVoiceprint) }
     var vpThreshold by remember {
         mutableStateOf(String.format(java.util.Locale.US, "%.2f", vm.settings.voiceprintThreshold))
@@ -676,7 +813,7 @@ private fun SettingsDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
                         SmallField(interruptWords, { interruptWords = it }, "打断词（逗号分隔）")
                     }
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        TextButton(onClick = { showEnroll = true }) {
+                        TextButton(onClick = onEnrollRequest) {
                             Text(
                                 if (vm.voiceprintEnrolled) "重新注册" else "注册声纹",
                                 fontSize = 12.sp,
@@ -827,10 +964,6 @@ private fun SettingsDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )
 
-    // 声纹注册引导：独立窗口（dialog 可以叠在设置弹窗上）
-    if (showEnroll) {
-        VoiceprintEnrollDialog(vm, onDismiss = { showEnroll = false })
-    }
 }
 
 /**

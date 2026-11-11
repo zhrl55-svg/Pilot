@@ -36,6 +36,17 @@ object AudioGate {
     var isMuted: Boolean = false
         private set
 
+    /**
+     * 最后一次放音结束的时刻（uptimeMillis）。
+     *
+     * 为什么要它：播报**结束的瞬间**，VAD 缓冲里还有一段尾音，
+     * 出来后会被切成一句话送 ASR，识别成「音量已经是最大百分之一百」这种
+     * ——正好是刚才播的内容。实测直接导致 agent 自己跟自己对话三轮。
+     */
+    @Volatile
+    var lastReleaseAt: Long = 0L
+        private set
+
     /** 占用来源名（调试用）。 */
     fun activeHolders(): Set<String> = holders.toSet()
 
@@ -46,6 +57,7 @@ object AudioGate {
         Dbg.i(TAG, "音频占用 +$name（持有者=${holders.size}）")
         return AutoCloseable {
             holders.remove(name)
+            lastReleaseAt = android.os.SystemClock.uptimeMillis()
             sync()
             Dbg.i(TAG, "音频占用 -$name（持有者=${holders.size}）")
         }
