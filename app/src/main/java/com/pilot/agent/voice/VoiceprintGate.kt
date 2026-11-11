@@ -42,7 +42,22 @@ class VoiceprintGate(private val context: Context) {
     var lastScore: Float = -1f
         private set
 
-    fun modelFile(): File = File(context.filesDir, "models/voiceprint/cnceleb_resnet34_LM.onnx")
+    /**
+     * 声纹模型文件（按优先级找）。
+     *
+     * ★ 优先 `campplus_sv_zh_16k.onnx`：这是 sherpa 官方打包的 3D-Speaker 模型，
+     *   metadata 里带 `framework=3d-speaker`，extractor 能正确初始化。
+     *   而原始的 WeSpeaker `cnceleb_resnet34_LM.onnx` **没有 sherpa 需要的 metadata**，
+     *   native 构造会静默失败返回空指针，随后 `createStream` 直接 SIGSEGV（实测崩了 5 次才定位）。
+     */
+    fun modelFile(): File {
+        val dir = File(context.filesDir, "models/voiceprint")
+        for (name in MODEL_CANDIDATES) {
+            val f = File(dir, name)
+            if (f.isFile && f.length() > 1_000_000) return f
+        }
+        return File(dir, MODEL_CANDIDATES.first())
+    }
 
     private fun templateFile(): File = File(context.filesDir, "voiceprint_template.bin")
 
@@ -53,11 +68,10 @@ class VoiceprintGate(private val context: Context) {
     /**
      * 声纹提取引擎是否可用。
      *
-     * ★ 当前置 false：P40 实测 `SpeakerEmbeddingExtractor.createStream()` 直接 native abort
-     *   （进程消失、Kotlin 接不住），所以先关掉入口，避免用户点一下就闪退。
-     *   修好 sherpa 版本（或换实现）后改回 true 即可恢复注册。
+     * 曾经因为模型缺 metadata 导致 native 空指针崩溃，临时关成 false；
+     * 换成 sherpa 官方 3D-Speaker 模型（带 `framework=3d-speaker`）后已恢复。
      */
-    val engineAvailable: Boolean = false
+    val engineAvailable: Boolean = true
 
     fun ensureReady(): Boolean {
         if (ready) return true
@@ -80,7 +94,7 @@ class VoiceprintGate(private val context: Context) {
             val t0 = System.currentTimeMillis()
             val cfg = SpeakerEmbeddingExtractorConfig(
                 model = model.absolutePath,
-                numThreads = 1,
+                numThreads = 2,
                 debug = false,
                 provider = "cpu",
             )
@@ -119,13 +133,15 @@ class VoiceprintGate(private val context: Context) {
             Dbg.i(TAG, "声纹：createStream begin samples=${samples.size}")
             stream = ex.createStream()
             Dbg.i(TAG, "声纹：acceptWaveform begin")
+            // ★ 不要调 inputFinished()：那是给流式 ASR 收尾用的，
+            //   speaker extractor 不需要（nav-agent 的实现也没有），多调反而会走错分支。
             stream.acceptWaveform(samples, sampleRate)
-            Dbg.i(TAG, "声纹：inputFinished")
-            stream.inputFinished()
             Dbg.i(TAG, "声纹：compute begin")
-            val emb = ex.compute(stream)
-            Dbg.i(TAG, "声纹：compute done dim=${emb?.size}")
-            emb
+            val raw = ex.compute(stream)
+            Dbg.i(TAG, "声纹：compute done dim=${raw?.size}")
+            // L2 归一化：后面只比余弦，归不归一都行，归一后阈值更稳
+            val norm = sqrt(raw.sumOf { (it * it).toDouble() }).toFloat()
+            if (norm <= 0f) null else FloatArray(raw.size) { raw[it] / norm }
         } catch (t: Throwable) {
             lastError = "${t.javaClass.simpleName}: ${t.message}"
             Dbg.e(TAG, "声纹提取失败 $lastError")
@@ -200,6 +216,16 @@ class VoiceprintGate(private val context: Context) {
 
     companion object {
         private const val TAG = "PilotVoice"
+
+        /**
+         * 模型候选（按优先级）。
+         *
+         * `campplus_sv_zh_16k.onnx` 是 sherpa 官方打包的 3D-Speaker 模型，
+         * metadata 里带 `framework=3d-speaker`，extractor 能正常初始化；
+         * 原始 WeSpeaker 的 resnet34 没有 sherpa 认的 metadata，native 构造静默失败
+         * → 空指针 → createStream SIGSEGV（实测崩了 5 次才定位到）。
+         */
+        val MODEL_CANDIDATES = listOf("campplus_sv_zh_16k.onnx", "cnceleb_resnet34_LM.onnx")
 
         /**
          * 唤醒门禁阈值。

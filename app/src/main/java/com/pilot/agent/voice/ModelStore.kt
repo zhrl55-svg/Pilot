@@ -46,6 +46,9 @@ object ModelStore {
             "llm_config.json" to 500L,
         ),
         "voiceprint" to mapOf(
+            // 首选：sherpa 官方 3D-Speaker 模型（带 framework=3d-speaker metadata）
+            "campplus_sv_zh_16k.onnx" to 20L * 1024 * 1024,
+            // 备用：原始 WeSpeaker resnet34（缺 metadata，sherpa 下会崩，仅留档）
             "cnceleb_resnet34_LM.onnx" to 20L * 1024 * 1024,
         ),
         // Pocket-0.3B：权重 164MB，比 0.6B 少一半，解码约快 50%

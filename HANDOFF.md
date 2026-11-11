@@ -364,7 +364,8 @@ Speaker.speakNav（不可打断）
 asr-sensevoice/     model.int8.onnx 239MB + tokens.txt      端侧识别
 mnn-llm-0.3b/       llm.mnn.weight 164MB + 其余 4 个          端侧对话（首选）
 mnn-llm/            llm.mnn.weight 335MB                     Qwen3-0.6B（备选）
-voiceprint/         cnceleb_resnet34_LM.onnx 25MB            声纹
+voiceprint/         campplus_sv_zh_16k.onnx 27MB             声纹（优先，带 metadata）
+                    cnceleb_resnet34_LM.onnx 26MB            备用（缺 metadata，sherpa 下会崩）
 ```
 
 **模型不进 APK**，走 `ModelStore`：外部私有目录 → App 启动时自己搬进私有目录。
@@ -378,6 +379,27 @@ adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent.debug --ez imp
 本地有备份：`D:\phone agent\models\mnn-llm-0.3b\`（0.3B）、`models\voiceprint\`（声纹）。
 
 ---
+
+### ★ 声纹模型必须带 metadata（踩了 5 次崩溃）
+
+`cnceleb_resnet34_LM.onnx` 是原始 WeSpeaker 模型，**没有 sherpa 需要的 metadata**。
+`sherpa-onnx` 构造 `SpeakerEmbeddingExtractor` 时会**静默失败返回空指针**，
+下一次 `createStream()` 直接 `SIGSEGV`（进程消失，Kotlin 完全接不住）。
+
+sherpa 的报错（`logcat` 能抓到，EMUI 只丢第三方 `Log.i`，native stderr 还在）：
+
+```
+sherpa-onnx: No model_type in the metadata!
+sherpa-onnx: Unsupported model_type: pytorch      ← 它读的其实是 framework 字段
+```
+
+**解法**：换成 sherpa 官方打包的 3D-Speaker 模型
+`3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx`（27MB，192 维，
+metadata 里带 `framework=3d-speaker`）。放到 `files/models/voiceprint/campplus_sv_zh_16k.onnx`，
+代码按 `MODEL_CANDIDATES` 优先找它。
+
+自测（不用真说话）：`--es voice_test enroll` + 三次 `--es speak_text '...'`，
+日志出现 `声纹模板已保存 dim=192` 即成功。
 
 ## 语音交互（11-11 重做）
 
