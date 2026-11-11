@@ -1126,57 +1126,43 @@ private fun DropdownSelector(
                             androidx.compose.material3.HorizontalDivider(
                                 color = colors.outlineVariant.copy(alpha = 0.4f),
                             )
-                            options.forEach { (key, text) ->
-                                val active = key == selected
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .background(
-                                            if (active) colors.primary.copy(alpha = 0.12f) else Color.Transparent,
-                                        )
-                                        .clickable {
-                                            onSelect(key)
-                                            expanded = false
-                                        }
-                                        .padding(start = 14.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
-                                ) {
-                                    Text(
-                                        text,
-                                        fontSize = 13.sp,
-                                        color = if (active) colors.primary else colors.onSurface,
-                                        fontWeight = if (active) FontWeight.Medium else FontWeight.Normal,
-                                        modifier = Modifier.weight(1f),
-                                    )
-                                    // ★ 预听按钮：点喇叭只播样音，不改当前选择
-                                    if (onPreview != null) {
-                                        // ★ 试听按钮不能和外层的"选中"点击冲突：
-                                        //   TextButton 在 Row 里，点击会同时触发外层 Row 的 clickable
-                                        //   → 变成"选中音色"，浮层收起、试听没跑（实测）。
-                                        //   办法：试听做成纯 Text + 自己的 pointerInput，
-                                        //   在手势层就消费掉事件，不让它冒泡到外层。
+                                options.forEach { (key, text) ->
+                                    val active = key == selected
+                                    // ★ 整行**不挂 clickable**：点"试听"会同时触发选中，
+                                    //   浮层收起、试听没跑。
+                                    //   现在左半边（文字）负责选中，右半边（试听）独立，
+                                    //   两者互不干扰。
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .background(
+                                                if (active) colors.primary.copy(alpha = 0.12f) else Color.Transparent,
+                                            )
+                                            .padding(start = 14.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
+                                    ) {
                                         Text(
-                                            "试听",
-                                            fontSize = 11.sp,
-                                            color = colors.primary,
+                                            text,
+                                            fontSize = 13.sp,
+                                            color = if (active) colors.primary else colors.onSurface,
+                                            fontWeight = if (active) FontWeight.Medium else FontWeight.Normal,
                                             modifier = Modifier
-                                                .pointerInput(key) {
-                                                    awaitEachGesture {
-                                                        awaitFirstDown(requireUnconsumed = false)
-                                                        awaitFirstDown(requireUnconsumed = true)
-                                                        // 消费掉这次点击
-                                                        while (true) {
-                                                            val ev = awaitPointerEvent()
-                                                            if (ev.changes.any { it.changedToUpIgnoreConsumed() }) break
-                                                        }
-                                                        onPreview(key)
-                                                    }
+                                                .weight(1f)
+                                                .clickable {
+                                                    onSelect(key)
+                                                    expanded = false
                                                 }
-                                                .padding(horizontal = 10.dp, vertical = 9.dp),
+                                                .padding(vertical = 9.dp),
                                         )
+                                        // 试听：只播样音，不改当前选择
+                                        if (onPreview != null) {
+                                            TextButton(onClick = { onPreview(key) }) {
+                                                Text("试听", fontSize = 11.sp, color = colors.primary)
+                                            }
+                                        }
                                     }
                                 }
-                            }
+
                             if (options.isEmpty()) {
                                 Text(
                                     "（没有可用音色）",
