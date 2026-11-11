@@ -70,6 +70,8 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -90,6 +92,8 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -398,13 +402,14 @@ private fun StatusCard(vm: AgentViewModel, onEnable: () -> Unit) {
 /**
  * 一条对话。
  *
- * 版式（老板定的）：**用户靠右带气泡、AI 靠左无气泡**。
- * 只渲染三种：用户说的话、AI 的回答、出错提示；
- * 过程类（思考/执行/观察）不显示——那是给人调试看的，不是给用户看的。
+ * 版式：用户靠右带气泡、AI 靠左无气泡；只显示 USER / DONE / ERROR。
  *
- * 长按弹菜单：选择 / 复制 / 添加到对话。
+ * 长按 → 弹「文字选择 + 横向菜单」：
+ * - 文本按分隔符切成若干块，默认整句选中（浅色选择条），
+ *   点某块收窄到该块，再点另一块扩展成连续范围（跟系统长按选词的手感一致）
+ * - 菜单横向排：选择（全选） / 复制 / 添加到对话，作用于当前选中范围
  */
-@OptIn(ExperimentalFoundationApi::class)
+@OptIn(ExperimentalFoundationApi::class, ExperimentalLayoutApi::class)
 @Composable
 private fun LogRow(
     entry: LogEntry,
@@ -415,7 +420,19 @@ private fun LogRow(
     val isUser = entry.kind == LogEntry.Kind.USER
     val textColor = if (entry.kind == LogEntry.Kind.ERROR) colors.error else colors.onBackground
     var menuOpen by remember { mutableStateOf(false) }
-    var selected by remember { mutableStateOf(false) }
+
+    // 按分隔符切块：每块保留末尾的标点，读起来还是原句
+    val chunks = remember(entry.text) { splitBySeparator(entry.text) }
+    var selStart by remember { mutableStateOf(0) }
+    var selEnd by remember { mutableStateOf(chunks.lastIndex.coerceAtLeast(0)) }
+
+    fun openMenu() {
+        selStart = 0
+        selEnd = chunks.lastIndex.coerceAtLeast(0)   // 默认整句选中
+        menuOpen = true
+    }
+
+    fun selectedText() = chunks.slice(selStart..selEnd).joinToString("").trim()
 
     Box {
         Row(
@@ -425,7 +442,7 @@ private fun LogRow(
             if (isUser) {
                 Surface(
                     color = colors.primary.copy(alpha = 0.20f),
-                    shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomEnd = 4.dp, bottomStart = 16.dp),
+                    shape = RoundedCornerShape(16.dp, 16.dp, 4.dp, 16.dp),
                 ) {
                     Text(
                         text = entry.text,
@@ -434,10 +451,7 @@ private fun LogRow(
                         lineHeight = 21.sp,
                         modifier = Modifier
                             .widthIn(max = 280.dp)
-                            .combinedClickable(
-                                onClick = {},
-                                onLongClick = { menuOpen = true },
-                            )
+                            .combinedClickable(onClick = {}, onLongClick = { openMenu() })
                             .padding(horizontal = 12.dp, vertical = 8.dp),
                     )
                 }
@@ -449,86 +463,115 @@ private fun LogRow(
                     lineHeight = 21.sp,
                     modifier = Modifier
                         .widthIn(max = 300.dp)
-                        .combinedClickable(
-                            onClick = {},
-                            onLongClick = { menuOpen = true },
-                        ),
+                        .combinedClickable(onClick = {}, onLongClick = { openMenu() }),
                 )
             }
         }
 
-        // 长按菜单：选择 / 复制 / 添加到对话
         if (menuOpen) {
-            androidx.compose.ui.window.Dialog(
+            Dialog(
                 onDismissRequest = { menuOpen = false },
-                properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false),
+                properties = DialogProperties(usePlatformDefaultWidth = false),
             ) {
-                Box(
-                    Modifier
-                        .fillMaxSize()
-                        .background(androidx.compose.ui.graphics.Color(0x66000000))
-                        .pointerInput(Unit) {
-                            awaitEachGesture {
-                                awaitFirstDown(requireUnconsumed = false)
-                                waitForUpOrCancellation()
-                                menuOpen = false
-                            }
-                        },
-                    contentAlignment = Alignment.Center,
-                ) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    // 背景遮罩单独一层：点它关闭，点内容区不会被误关
+                    Box(
+                        Modifier
+                            .matchParentSize()
+                            .background(androidx.compose.ui.graphics.Color(0x66000000))
+                            .clickable { menuOpen = false },
+                    )
                     Surface(
                         color = colors.surface,
                         shape = RoundedCornerShape(14.dp),
-                        modifier = Modifier.widthIn(max = 280.dp),
+                        modifier = Modifier
+                            .fillMaxWidth(0.9f)
+                            .widthIn(max = 400.dp),
                     ) {
-                        Column(Modifier.padding(vertical = 4.dp)) {
-                            Text(
-                                entry.text,
-                                fontSize = 13.sp,
-                                color = colors.onBackground,
-                                lineHeight = 19.sp,
-                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
-                            )
+                        Column(Modifier.padding(14.dp)) {
+                            Text("选择文字", fontSize = 12.sp, color = colors.onSurfaceVariant)
+                            Spacer(Modifier.height(8.dp))
+                            // ★ 选择条：按分隔符分块，选中范围高亮
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(2.dp),
+                                verticalArrangement = Arrangement.spacedBy(2.dp),
+                            ) {
+                                chunks.forEachIndexed { i, part ->
+                                    val inSel = i in selStart..selEnd
+                                    Text(
+                                        part,
+                                        fontSize = 14.sp,
+                                        lineHeight = 22.sp,
+                                        color = if (inSel) colors.onPrimary else colors.onSurface,
+                                        modifier = Modifier
+                                            .background(
+                                                if (inSel) colors.primary else Color.Transparent,
+                                                RoundedCornerShape(4.dp),
+                                            )
+                                            .clickable {
+                                                // 第一次点 → 只选这块；再点 → 扩成连续范围
+                                                when {
+                                                    selStart == selEnd -> {
+                                                        selStart = minOf(selStart, i)
+                                                        selEnd = maxOf(selEnd, i)
+                                                    }
+                                                    i < selStart -> selStart = i
+                                                    i > selEnd -> selEnd = i
+                                                    else -> {
+                                                        selStart = i
+                                                        selEnd = i
+                                                    }
+                                                }
+                                            }
+                                            .padding(horizontal = 3.dp, vertical = 2.dp),
+                                    )
+                                }
+                            }
+                            Spacer(Modifier.height(12.dp))
                             androidx.compose.material3.HorizontalDivider(
                                 color = colors.outlineVariant.copy(alpha = 0.4f),
                             )
-                            MenuRow("选择") {
-                                selected = true
-                                menuOpen = false
-                            }
-                            MenuRow("复制") {
-                                onCopy(entry.text)
-                                menuOpen = false
-                            }
-                            MenuRow("添加到对话") {
-                                onAddToChat(entry.text)
-                                menuOpen = false
+                            Spacer(Modifier.height(6.dp))
+                            // ★ 横向菜单
+                            Row(Modifier.fillMaxWidth()) {
+                                MenuChip("选择", Modifier.weight(1f)) {
+                                    selStart = 0
+                                    selEnd = chunks.lastIndex.coerceAtLeast(0)
+                                }
+                                MenuChip("复制", Modifier.weight(1f)) {
+                                    onCopy(selectedText())
+                                    menuOpen = false
+                                }
+                                MenuChip("添加到对话", Modifier.weight(1f)) {
+                                    onAddToChat(selectedText())
+                                    menuOpen = false
+                                }
                             }
                         }
                     }
                 }
             }
         }
-
-        // "选择"后把文本填进输入框
-        if (selected) {
-            selected = false
-            onAddToChat(entry.text)
-        }
     }
 }
 
+/** 按分隔符切块，保留末尾标点（中文标点 / 英文标点 / 空白 / 换行）。 */
+private fun splitBySeparator(text: String): List<String> =
+    text.split(Regex("(?<=[，。！？；：、!?;:\\s])"))
+        .filter { it.isNotEmpty() }
+        .ifEmpty { listOf(text) }
+
 @Composable
-private fun MenuRow(label: String, onClick: () -> Unit) {
+private fun MenuChip(label: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
     val colors = MaterialTheme.colorScheme
     Text(
         label,
-        fontSize = 14.sp,
-        color = colors.onBackground,
-        modifier = Modifier
-            .fillMaxWidth()
+        fontSize = 13.sp,
+        color = colors.primary,
+        textAlign = TextAlign.Center,
+        modifier = modifier
             .clickable(onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 11.dp),
+            .padding(vertical = 10.dp),
     )
 }
 
