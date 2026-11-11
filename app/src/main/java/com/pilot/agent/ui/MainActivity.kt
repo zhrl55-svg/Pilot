@@ -228,6 +228,9 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
             value = input,
             onValueChange = { input = it },
             running = vm.running,
+            // ★ 只在"正在接收这一句"时才算在听。
+            //   麦克风是常驻的（唤醒词一直在跑），状态多半是 WAKE_WAIT/ACTIVE，
+            //   之前把 listening 也算进去 → 输入框一直显示"正在听…"（老板反馈的 bug）。
             listening = vm.voiceState == com.pilot.agent.voice.VoiceInput.State.LISTENING ||
                 vm.voiceState == com.pilot.agent.voice.VoiceInput.State.RECOGNIZING,
             onSend = {
@@ -235,6 +238,8 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
                 input = ""
             },
             justSent = vm.justSent,
+            speaking = vm.speaking,
+            onStopSpeaking = { vm.stopSpeaking() },
             onStop = { vm.stop() },
             onStartVoice = {
                 // 长按说话要先有录音权限；没有就当场申请，授权后立刻开始
@@ -538,8 +543,10 @@ private fun InputBar(
     running: Boolean,
     listening: Boolean,
     justSent: Boolean,
+    speaking: Boolean,
     onSend: () -> Unit,
     onStop: () -> Unit,
+    onStopSpeaking: () -> Unit,
     onStartVoice: () -> Unit,
     onFinishVoice: () -> Unit,
 ) {
@@ -549,10 +556,7 @@ private fun InputBar(
     val keyboard = LocalSoftwareKeyboardController.current
     var recording by remember { mutableStateOf(false) }
 
-    // 录音结束（识别完/被打断）时把描边收掉
-    LaunchedEffect(listening) {
-        if (!listening) recording = false
-    }
+
 
     // ★ 不要旋转着画矩形：rotate 会把圆角矩形转出界，看起来是"扭"的。
     //   改成颜色在两个主色之间呼吸，形状稳定、也明显是"在录"。
@@ -567,7 +571,9 @@ private fun InputBar(
         ),
         label = "phase",
     )
-    val live = recording || listening
+    // 边框流光只在**长按录音中**时亮。语音层常驻监听状态一直是 LISTENING，
+    // 用它判断会让边框一直亮着（等于没有"在录音"的提示作用）。
+    val live = recording
 
     Row(verticalAlignment = Alignment.Bottom) {
         Box(
@@ -575,9 +581,11 @@ private fun InputBar(
                 .weight(1f)
                 .pointerInput(Unit) {
                     awaitEachGesture {
-                        awaitFirstDown(requireUnconsumed = false)
-                        // 超时还没松手 = 长按 → 录音
-                        val upInTime = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        // 超时还没松手 = 长按 → 录音。
+                        // 用 600ms（比系统长按阈值略长）：按住不动才算长按，
+                        // 快速点一下（哪怕系统判定为长按）也走单击。
+                        val upInTime = withTimeoutOrNull(600L) {
                             waitForUpOrCancellation()
                         }
                         if (upInTime == null) {
@@ -588,6 +596,9 @@ private fun InputBar(
                             onStartVoice()
                             waitForUpOrCancellation()
                             onFinishVoice()
+                            // 松手即退出"录音中"：边框收掉、文案变回提示。
+                            // 识别还在后台跑（onText 触发），但那不是"正在听"。
+                            recording = false
                         } else {
                             // 短按 = 文本输入：只聚焦，让键盘弹出来
                             focusReq.requestFocus()
@@ -637,8 +648,9 @@ private fun InputBar(
                 placeholder = {
                     Text(
                         when {
+                            // ★ 只认"长按中"：语音层常驻监听时状态一直是 LISTENING，
+                            //   用它判断会导致单击输入框后也显示"正在听…"（老板反馈的 bug）。
                             recording -> "正在听…（松手发送）"
-                            listening -> "正在听…"
                             else -> "点一下输入，长按说话"
                         },
                         fontSize = 13.sp,
@@ -657,20 +669,26 @@ private fun InputBar(
             )
         }
         Spacer(Modifier.width(8.dp))
-        val busy = running || justSent
+        // ★ 停止按钮的语义：**播报中按它 = 闭嘴**（老板原话"停止的目的是终止播报"）；
+        //   任务跑着但没在说话时按它 = 中止任务。
+        val showStop = speaking || running || justSent
         Button(
-            onClick = if (busy) onStop else onSend,
-            enabled = busy || value.isNotBlank(),
+            onClick = when {
+                speaking -> onStopSpeaking
+                running || justSent -> onStop
+                else -> onSend
+            },
+            enabled = showStop || value.isNotBlank(),
             modifier = Modifier.size(56.dp),
             shape = RoundedCornerShape(14.dp),
             contentPadding = PaddingValues(0.dp),
             colors = ButtonDefaults.buttonColors(
-                containerColor = if (busy) colors.error else colors.primary,
-                contentColor = if (busy) colors.onError else colors.onPrimary,
+                containerColor = if (showStop) colors.error else colors.primary,
+                contentColor = if (showStop) colors.onError else colors.onPrimary,
             ),
         ) {
             Canvas(Modifier.size(20.dp)) {
-                if (busy) {
+                if (showStop) {
                     // 停止：实心圆角方块
                     drawRoundRect(
                         color = androidx.compose.ui.graphics.Color(

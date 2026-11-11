@@ -69,6 +69,15 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     var justSent by mutableStateOf(false)
         private set
 
+    /**
+     * 正在播报（用于显示"停止"按钮）。
+     *
+     * 老板说的停止是**终止播报**——播报太长时用户想立刻闭嘴，不是中止任务。
+     * 播报状态由 Speaker 维护，这里轮询同步到 Compose 状态。
+     */
+    var speaking by mutableStateOf(false)
+        private set
+
     var confirm by mutableStateOf<ConfirmUi?>(null)
         private set
 
@@ -175,6 +184,14 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             wakeOn = ok
             if (ok) add(LogEntry.Kind.OBSERVE, "麦克风已常驻，喊「${AgentSettings.load().wakeWordList().first()}」唤醒")
             refreshStatus()
+        }
+    }
+
+    /** 同步播报状态（Speaker 是普通对象，状态变化不会自动触发 Compose 重组）。 */
+    private fun syncSpeaking() {
+        val s = AgentRuntime.speaker.isSpeaking
+        if (s != speaking) {
+            speaking = s
         }
     }
 
@@ -651,6 +668,32 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         AgentRuntime.loop?.start(AgentRuntime.scope, g)
     }
 
+    /**
+     * 停止按钮：**同时**停播报和停任务。
+     *
+     * 老板原话：「停止按钮在任务过程中同时也要停任务」。
+     * 所以这个按钮是一站式刹车：
+     * - 正在念话 → 闭嘴；
+     * - 任务在跑 → 中止；
+     * - 两个都在发生 → 两个都停。
+     */
+    fun stopSpeaking() {
+        var did = false
+        if (AgentRuntime.speaker.isSpeaking) {
+            AgentRuntime.speaker.stop()
+            did = true
+        }
+        if (running || justSent) {
+            AgentRuntime.loop?.cancel()
+            running = false
+            justSent = false
+            did = true
+        }
+        speaking = false
+        add(LogEntry.Kind.OBSERVE, if (did) "已停止播报与任务" else "已停止")
+        refreshStatus()
+    }
+
     fun stop() {
         AgentRuntime.loop?.cancel()
         running = false
@@ -677,6 +720,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun handle(ev: AgentEvent) {
+        syncSpeaking()
         when (ev) {
             is AgentEvent.Thinking -> add(LogEntry.Kind.THINK, ev.text)
             is AgentEvent.Acting -> add(LogEntry.Kind.ACT, ev.text)
@@ -692,6 +736,14 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 justSent = false
                 AgentRuntime.speaker.speak(text)
                 refreshStatus()
+                // 播报期间要显示"停止"按钮：起个轮询跟着播报状态
+                viewModelScope.launch {
+                    while (AgentRuntime.speaker.isSpeaking) {
+                        syncSpeaking()
+                        delay(120)
+                    }
+                    syncSpeaking()
+                }
             }
             is AgentEvent.Failed -> {
                 add(LogEntry.Kind.ERROR, ev.reason)

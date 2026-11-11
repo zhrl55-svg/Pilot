@@ -59,6 +59,17 @@ class Speaker(context: Context) {
     private val navLock = Any()
     /** 当前是否在播导航提示。 */
     @Volatile private var navSpeaking = false
+
+    /**
+     * 是否正在播报。
+     *
+     * UI 要用它决定"停止"按钮是否出现——
+     * 老板要的停止是**终止播报**（不是终止任务）：
+     * 播报太长时用户想立刻闭嘴。
+     */
+    @Volatile
+    var isSpeaking: Boolean = false
+        private set
     /** 排队等播的导航提示。 */
     private val navQueue = ArrayDeque<String>()
 
@@ -119,6 +130,7 @@ class Speaker(context: Context) {
 
         // ★ 通知导航界面「正在播报」（显示喇叭动画）
         runCatching { VoiceState.write(appContext, VoiceState.SPEAKING) }
+        isSpeaking = true
 
         // ★ 播报前抢一下音频焦点（TRANSIENT_MAY_DUCK）：系统会把音乐压低，
         //   而不是直接停掉——「播放一会自动就停了」的另一半原因。
@@ -129,6 +141,7 @@ class Speaker(context: Context) {
         engine.speak(
             spoken,
             onDone = {
+                isSpeaking = false
                 runCatching { gate.close() }
                 runCatching { speechFocus.close() }
                 runCatching { VoiceState.write(appContext, VoiceState.IDLE) }
@@ -183,6 +196,7 @@ class Speaker(context: Context) {
     fun stop() {
         system?.stop()
         minimax?.stop()
+        isSpeaking = false
         runCatching { VoiceState.write(appContext, VoiceState.IDLE) }
     }
 
