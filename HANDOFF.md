@@ -415,14 +415,31 @@ adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent.debug --ez imp
 17. **AppLaunchIndex 不能收录带 android:permission 的组件**：普通 App 起不来，
     直达抛 SecurityException 后规划器连烧 5 步瞎点。收录前查 `ActivityInfo.permission`，
     起不来再降级开主入口。
-18. **HarmonyOS 后台起 Activity 是静默失败**：`startActivity` 不抛异常（logcat 里才有
-    `activity start fail: Background activity start`），`runCatching{}.isSuccess` 靠不住。
-    无头广播路径拨号/闹钟这类要拉界面的操作会假成功，App 前台时正常。
-19. **沙箱 W^X 两件套**：`manifest extractNativeLibs="true"` 必须配
+18. **★ 更正（11-11）：「后台起 Activity 被拦」多半是误判。**
+    11-10 的结论是「HarmonyOS 静默拦截后台 startActivity，唯一出路是桌面点图标」。
+    11-11 用 `pidof` 直接测：`force-stop` 目标 App 后调用 `startActivity`，
+    **目标进程 0.6 秒就起来了**，只是**窗口焦点要约 5 秒**才切过去。
+    当时判断用的是 `rootInActiveWindow` + 1.2 秒超时，而窗口切换期它返回 **null**，
+    null 被当成「前台没动」→ 把「冷启动慢」判成「被系统拦截」→ 白走一遍翻屏（10 秒还可能失败）。
+    正确做法：判据用**无障碍事件流**（`AgentRuntime.foreground`，TYPE_WINDOW_STATE_CHANGED 驱动，
+    已过滤输入法和自己的包）+ 6 秒预算，别用 rootInActiveWindow。
+    教训：**遇到问题先怀疑测量方法，别急着归因于环境限制。**
+19. **输入法窗口会抢走 `rootInActiveWindow`**：点开带输入框的页面后它返回
+    `com.huawei.ohos.inputmethod`，于是「页面上没有输入框」这种假结论就出来了。
+    找节点要遍历 `service.windows`，把 inputmethod 包压到最后。
+20. **设置项的搜索框不是 EditText**：华为设置首屏那条是 `AutoCompleteTextView`
+    （`android:id/search_src_text`），按类名找 `EditText` 永远匹配不到，要按 `isEditable` 判。
+21. **搜索结果第一条就是答案**：别自己算字符串相似度去挑（会挑到搜索框自己的文字、
+    或列表深处不相干的条目）。取「含关键词 + y 最小」那一条，点不动就按坐标点中心。
+22. **桌面搜索的 Intent 被华为签名权限挡死**：`android.intent.action.SEARCH` 打
+    `com.huawei.launcher.globalsearch.SearchLocalAppsActivity` 要
+    `com.huawei.search.permission.ACCESS_REMOTE_CALL`，连 shell 都起不来。
+    走 UI（下滑 → 输入）才行；自研 ROM 里把这条权限加进白名单可直接用 Intent。
+23. **沙箱 W^X 两件套**：`manifest extractNativeLibs="true"` 必须配
     `jniLibs.useLegacyPackaging = true`，否则 AGP 无视 manifest，so 不解包，
     nativeLibraryDir 里没有可执行的 libproot.so。Android 10+ 唯一可 exec 的位置
     就是 nativeLibraryDir（proot 伪装成 .so 放 jniLibs 的原因）。
-20. **AGP mergeDebugAssets 自动把 `.tar.gz` 解成 `.tar`**：源码里放 .gz，APK 里只有 .tar
+24. **AGP mergeDebugAssets 自动把 `.tar.gz` 解成 `.tar`**：源码里放 .gz，APK 里只有 .tar
     （RootfsManager 双名兜底所以没事，但别在 APK 里找 .gz 找不到就慌）。
     rootfs/proot 类资源记得加 `androidResources.noCompress`，`assets.openFd` 依赖不解压。
 
@@ -430,7 +447,16 @@ adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent.debug --ez imp
 
 ## 下次的开工清单
 
-**第 0 条：10 条回归（必跑）**
+**第 0 条：回归（必跑）**
+```bash
+bash scripts/regress.sh            # 10 条，逐条打结论（设备默认 192.168.2.32:5555）
+bash scripts/regress.sh 蓝牙 护眼   # 只跑匹配的
+```
+已固化成脚本：每条从桌面起、清日志、触发、抽结论，`✓ 结论=完成` 才算过。
+手工补测：`打开护眼模式` / `关闭蓝牙`（这两条要验**开关真的变了**，
+可用 `adb shell settings get global bluetooth_on` 反查）。
+
+**第 0 条（旧）：手工 10 条**
 ```bash
 bash scripts/deploy-device.sh 192.168.2.32:5555   # 编译+装+推模型
 adb shell "am start -n com.pilot.agent/com.pilot.agent.ui.TriggerActivity \

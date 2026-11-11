@@ -35,6 +35,25 @@ class HeuristicPlanner(
         // ★ 系统能力直调：音量、亮度、打电话——不发 Intent、不开界面，直接改状态
         ruleSystemOp(goal)?.let { return AgentDecision("系统能力直调", it) }
 
+        // ★ 开关类设置项优先：「打开护眼模式」「关闭蓝牙」要的是开关真的到位，
+        //   不是打开设置页。这类指令先于直达/索引处理——
+        //   已经在目标页时直接拨当前页开关，没在的话先搜再拨。
+        settingsKeyword(goal)?.let { kw ->
+            val off = Regex("关闭|关掉|停用|禁用|取消|关一下").containsMatchIn(goal)
+            val on = Regex("打开|开启|启用|开一下|亮起|启动").containsMatchIn(goal) && !off
+            if (on || off) {
+                return AgentDecision(
+                    thought = "设置开关：$kw → ${if (on) "开" else "关"}",
+                    action = AgentAction(
+                        action = "systemop",
+                        target = if (on) "settings_switch_on" else "settings_switch_off",
+                        text = kw,
+                        summary = "${if (on) "开启" else "关闭"} $kw",
+                    ),
+                )
+            }
+        }
+
         // ★ 能用一个 Intent 启动的，绝不去点屏幕。
         //   顺序：系统动作/设置页（静态表） → App 内入口（运行时索引） → 应用启动 → 点击兜底。
         // 直达每个任务只试一次：成败都不再试。
@@ -68,6 +87,23 @@ class HeuristicPlanner(
             }
         }
 
+        // ★ 设置项搜索兜底：静态表和 App 索引都没命中，但目标明确是"设置里的某一项"，
+        //   就用设置自带的搜索框去搜。华为把大量设置项埋进二三级菜单（电池优化、应用启动管理…），
+        //   逐级点既脆又慢，搜索是官方正路。
+        //   白名单卡死范围，避免把"打开某个没索引的小 App"也塞进设置搜索。
+        // 纯导航类（"点击电池"这种没有开关动词的）→ 只是进到这一项的页面
+        settingsKeyword(goal)?.let { kw ->
+            return AgentDecision(
+                thought = "设置项搜索：$kw",
+                action = AgentAction(
+                    action = "systemop",
+                    target = "settings_search",
+                    text = kw,
+                    summary = "搜索设置项 $kw",
+                ),
+            )
+        }
+
         // 已经开过 App 还没找到目标，先别乱点
         ruleOpen(goal, req.history)?.let { return AgentDecision("识别为打开应用指令", it) }
         ruleKey(goal, req.history)?.let { return AgentDecision("识别为系统按键指令", it) }
@@ -80,6 +116,17 @@ class HeuristicPlanner(
             thought = "本地规则无法解析这个请求",
             action = AgentAction(action = "unable", summary = "端侧规则未覆盖：$goal"),
         )
+    }
+
+    /**
+     * 这句话是不是在找「设置里的某一项」，是的话返回关键词。
+     *
+     * 只在白名单里认，宁可漏（漏了就交给下游模型）也不要把普通指令卷进来：
+     * 「打开某某小 App」如果被当成设置项，用户会看到"设置里没搜到"这种莫名其妙的结果。
+     */
+    private fun settingsKeyword(goal: String): String? {
+        val g = goal.lowercase()
+        return SETTINGS_WORDS.filter { g.contains(it) }.maxByOrNull { it.length }
     }
 
     /**
@@ -318,6 +365,23 @@ class HeuristicPlanner(
     }
 
     companion object {
+        /**
+         * 设置项白名单：只有命中这些词，才允许走「设置内搜索」兜底。
+         *
+         * 覆盖面刻意保守——它只解决"索引里没有、又确实在设置里"的那批项。
+         * 加词的成本很低，但每个词都要能被设置搜索真的搜到。
+         */
+        private val SETTINGS_WORDS = listOf(
+            "电池优化", "电池", "省电", "耗电", "超级省电",
+            "蓝牙", "wlan", "wifi", "无线", "移动网络", "流量", "飞行模式", "热点",
+            "显示", "亮度", "护眼", "字体", "声音", "振动", "铃声", "音效",
+            "存储", "内存", "应用管理", "应用启动", "自启动", "权限", "隐私",
+            "定位", "语言", "输入法", "日期", "时间", "备份", "恢复出厂",
+            "无障碍", "开发者", "关于手机", "系统更新", "通知", "锁屏", "壁纸",
+            "指纹", "面部", "安全", "账号", "账户", "辅助功能",
+        )
+
+
         /**
          * Alpine 沙箱里的常见命令行工具白名单。
          * IntentGate 也引用它：整句首 token 命中且无中文 → 直接判 TASK

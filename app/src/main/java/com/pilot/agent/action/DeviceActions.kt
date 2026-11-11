@@ -124,47 +124,125 @@ class DeviceActions(
 
         // 先回桌面
         service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
-        delay(500)
+        delay(600)
 
-        // 最多翻 MAX_SCREENS 屏（P40 实测 6 屏）
-        for (screen in 0 until MAX_DESKTOP_SCREENS) {
-            // 1) 当前屏找图标
-            val node = service.rootInActiveWindow?.let { root ->
-                findByTextDeep(root) { t -> needles.any { n -> t.contains(n, ignoreCase = true) } }
-            }
+        // 桌面自己会报「第 4 屏，共 6 屏」，用它把翻屏上限收到真实页数——
+        // 写死 8 屏会在 6 屏的桌面上白翻 2 次，每次 900ms，全是浪费。
+        var limit = MAX_DESKTOP_SCREENS
+
+        for (screen in 0 until limit) {
+            val root = service.rootInActiveWindow
+            val page = desktopPage(root)
+            if (page != null && page.second in 2..12) limit = minOf(limit, page.second)
+            val node = findIconDeep(root, needles)
             if (node != null) {
                 val ok = runCatching {
-                    node.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK)
+                    if (node.isClickable) {
+                        node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    } else {
+                        // 图标文字节点本身不可点，往上找可点的容器
+                        var p = node.parent
+                        var clicked = false
+                        while (p != null) {
+                            if (p.isClickable) { clicked = p.performAction(AccessibilityNodeInfo.ACTION_CLICK); break }
+                            p = p.parent
+                        }
+                        clicked
+                    }
                 }.getOrDefault(false)
-                Dbg.i(TAG, "桌面第 $screen 屏点击「$label」-> $ok")
-                if (ok && awaitForeground(pkg, 2000L)) return true
+                Dbg.i(TAG, "桌面第 ${page?.first ?: screen} 屏点击「$label」-> $ok (页数上限 $limit)")
+                if (ok && awaitForeground(pkg, 2500L)) return true
             }
-            // 2) 往下一屏滑（从右往左）
-            val swiped = gesture({ p ->
-                p.moveTo((w * 0.85f).toFloat(), (h * 0.5f).toFloat())
-                p.lineTo((w * 0.12f).toFloat(), (h * 0.5f).toFloat())
-            }, 300)
-            if (!swiped) break
-            delay(600)
+
+            // 往下一屏滑。★ 必须验证「真的翻页了」：
+            //   华为桌面上有整块的服务卡片/小组件，横向拖在卡片上会被卡片自己吃掉，
+            //   手指滑了但屏没动——照原来的写法会以为翻过了，实际在同一屏原地滑 8 次，
+            //   最后报「翻完 8 屏没找到」（实测「设置」就这么丢的）。
+            val before = page?.first
+            var moved = false
+            for (fy in SWIPE_YS) {
+                gesture({ p ->
+                    p.moveTo((w * 0.85f).toFloat(), (h * fy).toFloat())
+                    p.lineTo((w * 0.12f).toFloat(), (h * fy).toFloat())
+                }, 300)
+                delay(500)
+                val now = desktopPage(service.rootInActiveWindow)?.first
+                if (before != null && now != null) {
+                    if (now != before) { moved = true; break }
+                } else {
+                    // 读不到页码（桌面版本差异）→ 当作翻动了，按老逻辑走
+                    moved = true; break
+                }
+            }
+            if (!moved) {
+                Dbg.w(TAG, "桌面滑不动了（卡片吃手势或已到最后一屏），停止翻屏")
+                break
+            }
         }
-        Dbg.w(TAG, "翻完 ${MAX_DESKTOP_SCREENS} 屏都没找到「${needles.joinToString("/")}」")
+        Dbg.w(TAG, "翻完 $limit 屏都没找到「${needles.joinToString("/")}」")
         return false
     }
 
-    /** 深度优先找文本匹配的节点（桌面图标在多层 RecyclerView 容器里）。 */
-    private fun findByTextDeep(
-        root: android.view.accessibility.AccessibilityNodeInfo?,
-        match: (String) -> Boolean,
-    ): android.view.accessibility.AccessibilityNodeInfo? {
+    /** 桌面报的「第 N 屏，共 M 屏」→ (N, M)。读不到返回 null。 */
+    private fun desktopPage(root: AccessibilityNodeInfo?): Pair<Int, Int>? {
         if (root == null) return null
-        val t = root.text?.toString().orEmpty()
-        val d = root.contentDescription?.toString().orEmpty()
-        if (t.isNotEmpty() && match(t)) return root
-        if (d.isNotEmpty() && match(d)) return root
-        for (i in 0 until root.childCount) {
-            findByTextDeep(root.getChild(i), match)?.let { return it }
+        var found: String? = null
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        var guard = 0
+        while (stack.isNotEmpty() && guard++ < 400) {
+            val n = stack.removeLast()
+            val d = n.contentDescription?.toString().orEmpty()
+            if (d.contains("屏") && d.contains("共")) { found = d; break }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { stack.add(it) }
         }
-        return null
+        val m = found?.let { Regex("第\\s*(\\d+)\\s*屏[，,]?\\s*共\\s*(\\d+)\\s*屏").find(it) }
+            ?: return null
+        val idx = m.groupValues[1].toIntOrNull() ?: return null
+        val total = m.groupValues[2].toIntOrNull() ?: return null
+        return idx to total
+    }
+
+    /**
+     * 桌面图标匹配：**精确匹配优先，且只认可点节点**。
+     *
+     * 上一版是全树 `contains` 匹配、不判可点性，实测在华为「智慧助手」那一屏
+     * 点到了一个含「设置」字样的卡片，performAction 返回 true、界面纹丝不动，
+     * 然后接着翻屏——白花 10 秒。桌面图标 99% 是 content-desc 精确等于 App 名，
+     * 先按精确找，找不到才退到前缀匹配，再不行才 contains。
+     */
+    private fun findIconDeep(
+        root: AccessibilityNodeInfo?,
+        needles: List<String>,
+    ): AccessibilityNodeInfo? {
+        if (root == null) return null
+        var best: AccessibilityNodeInfo? = null
+        var bestScore = 0
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        var guard = 0
+        while (stack.isNotEmpty() && guard++ < 800) {
+            val n = stack.removeLast()
+            val names = listOfNotNull(
+                n.contentDescription?.toString()?.takeIf { it.isNotBlank() },
+                n.text?.toString()?.takeIf { it.isNotBlank() },
+            )
+            for (name in names) {
+                val s = needles.maxOf { needle ->
+                    when {
+                        name.equals(needle, ignoreCase = true) -> 3
+                        name.startsWith(needle, ignoreCase = true) -> 2
+                        name.contains(needle, ignoreCase = true) -> 1
+                        else -> 0
+                    }
+                }
+                if (s > bestScore) { bestScore = s; best = n }
+            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { stack.add(it) }
+        }
+        // 只有 contains 级匹配（分值 1）时要求节点/父节点可点，否则宁可返回 null 换策略。
+        val hit = best ?: return null
+        return if (bestScore >= 2 || hit.isClickable || hit.parent?.isClickable == true) hit else null
     }
 
     /** 支持传包名、应用中文名、或常见别名（系统语言是英文时靠别名兜底）。 */
@@ -245,35 +323,432 @@ class DeviceActions(
         if (!started) return false
         // 目标本来就在前台（同包内换页），回查不出差别，放行
         if (before == target) return true
-        if (awaitForeground(target, 1200L)) return true
 
-        // ★ 后台启动被拦（HarmonyOS `Abort background activity starts`）：
-        //   实测四条路（11-10 P40 Pro 逐一验证）：
-        //   ① 无障碍服务直接起 → 拦（BOUND_FOREGROUND_SERVICE）
-        //   ② 透明代理 Activity → 代理自己也起不来（自己就是后台）
-        //   ③ 前台服务提升 → 进程状态对了，但 HarmonyOS 还要
-        //      allowBackgroundActivityStart（privileged 权限，自研 ROM 里给）
-        //   ④ AlarmManager 系统代发 → 排到 +5s 且代理 Activity 仍被 Abort
-        //   ⑤ **桌面图标无障碍点击** → ✅ 唯一在用户机上真能用的路
-        //   所以真机（debug 包）走 ⑤；自研 ROM 有 privileged 权限时走 ③ 最快。
-        Dbg.w(TAG, "后台 Activity 被拦，改走桌面图标点击：$target")
-        // 桌面图标上显示的是**应用 label**（设置 / 蓝牙 / 手机管家），
-        // 不是包名（com.android.settings）——按 label 找才点得到。
+        // ★ 判「启动成没成」的判据：前台到底动没动，而不是「多久之内到前台」。
+        //   2026-11-11 实测（P40 / HarmonyOS 4.0）：force-stop 目标 App 后调 startActivity，
+        //   目标进程 **0.6 秒**就起来了（pidof 有值），但窗口焦点要约 **5 秒**才切过去；
+        //   而早先的判据是 rootInActiveWindow + 1.2 秒超时，窗口切换期 root 返回 null，
+        //   null 被当成「前台没动」→ 把「冷启动慢」误判成「被系统拦截」→
+        //   白走一遍桌面翻屏（10 秒，还可能翻不到）。别再按老结论下判断。
+        when (awaitTransition(target, 6000L)) {
+            Transition.REACHED -> return true
+            // 前台换了但还没落在目标包（冷启动过渡页、系统权限弹窗挡在前面）——
+            // 这是"起来了"，交给下一轮重感知去处理真实界面。
+            Transition.MOVED -> {
+                if (awaitForeground(target, 1500L)) return true
+                Dbg.i(TAG, "前台已切换（未落在 $target），按启动成功处理")
+                return true
+            }
+            Transition.STUCK -> Unit
+        }
+
+        // 走到这里说明 6 秒内前台确实没换过，才轮到兜底。
+        // （历史上这里写的是「后台启动被拦 → 桌面翻屏」，那个结论是误判，见上面注释。）
+        Dbg.w(TAG, "目标 $target 未在预算内到达前台，尝试系统搜索拉起")
+        // 桌面图标上显示的是**应用 label**（设置 / 蓝牙 / 手机管家），不是包名。
         val displayLabel = runCatching {
             val info = service.packageManager.getPackageInfo(target, 0)
             service.packageManager.getApplicationLabel(info.applicationInfo ?: return@runCatching "").toString()
         }.getOrDefault(target)
-        val launched = launchViaLauncherGesture(target, displayLabel)
-        if (!launched) {
-            Dbg.w(TAG, "桌面图标也没找到")
-            return false
-        }
-        return awaitForeground(target, 2500L)
+        // 首选「系统搜索」：桌面下滑 → 输入应用名 → 回车，一次直达，不受图标在第几屏、
+        // 是否被塞进文件夹影响（华为把一堆系统应用收进了大文件夹）。
+        if (globalSearch(displayLabel, target)) return true
+        // 最后手段才是翻屏点图标。
+        if (launchViaLauncherGesture(target, displayLabel)) return awaitForeground(target, 2500L)
+        Dbg.w(TAG, "搜索和桌面图标都没能把 $target 拉到前台")
+        return false
     }
 
-    /** 当前前台窗口的包名（无障碍 API，零权限）。 */
-    fun foregroundPackage(): String? =
-        runCatching { service.rootInActiveWindow?.packageName?.toString() }.getOrNull()
+    /**
+     * 全局搜索：桌面下滑 → 输入 → 点结果。
+     *
+     * 这一条同时覆盖「启动 App」和「找设置项」两种场景——**桌面下滑的系统搜索本来就能搜到设置项**
+     * （实测输入「Settings」直接列 WLAN / 声音和振动 / 蓝牙 / 超级终端）。
+     * 所以不需要先打开设置、再进设置内的搜索：一个入口解决，少两次页面跳转。
+     *
+     * 比翻桌面屏可靠得多：不依赖图标在第几屏、是否被塞进大文件夹，一次输入直达。
+     * 不写死搜索页包名（华为 com.huawei.search，小米/OPPO 各不相同），
+     * 只认「下滑之后出现的可编辑框」。
+     *
+     * @param query     输入的关键词
+     * @param expectPkg 期望落到的包；null 表示只要求「点了某条结果」
+     */
+    private suspend fun globalSearch(query: String, expectPkg: String?): Boolean {
+        val w = service.resources.displayMetrics.widthPixels
+        val h = service.resources.displayMetrics.heightPixels
+
+        service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
+        delay(700)
+
+        // 桌面下滑呼出搜索。★ 不是每一屏都能下滑出搜索：
+        //   华为首页是「智慧助手」式布局，在那屏下滑没反应（实测）。所以要换屏重试。
+        var edit: AccessibilityNodeInfo? = null
+        for (round in 0 until 3) {
+            for ((fx, from, to) in listOf(
+                Triple(0.5f, 0.22f, 0.62f),
+                Triple(0.5f, 0.55f, 0.90f),
+            )) {
+                gesture({ p ->
+                    p.moveTo((w * fx).toFloat(), (h * from).toFloat())
+                    p.lineTo((w * fx).toFloat(), (h * to).toFloat())
+                }, 400)
+                delay(900)
+                edit = findNodeDeepAnyWindow { it.isEditable }
+                if (edit != null) break
+            }
+            if (edit != null) break
+            // 换到下一屏再试（从右往左滑）
+            Dbg.w(TAG, "全局搜索：这一屏下滑没反应，换屏重试（第 ${round + 1} 次）")
+            gesture({ p ->
+                p.moveTo((w * 0.85f).toFloat(), (h * 0.8f).toFloat())
+                p.lineTo((w * 0.15f).toFloat(), (h * 0.8f).toFloat())
+            }, 300)
+            delay(700)
+        }
+        if (edit == null) {
+            Dbg.w(TAG, "桌面下滑没呼出搜索框，放弃全局搜索")
+            return false
+        }
+
+        val args = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, query)
+        }
+        runCatching {
+            edit.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+            edit.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        }
+        Dbg.i(TAG, "全局搜索：已输入「$query」")
+        delay(900)
+
+        // 有的 ROM 输入即出结果，有的要回车。先回车提交一次（对 App 名常常直接拉起），
+        // 提交后如果目标包已经到前台，就到此为止。
+        val entered = runCatching {
+            edit.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+        }.getOrDefault(false)
+        Dbg.i(TAG, "全局搜索：提交=$entered")
+        if (expectPkg != null && awaitForeground(expectPkg, 3000L)) return true
+
+        // 点最匹配的那一条结果。
+        val hit = findBestResult(query)
+        if (hit == null) {
+            Dbg.w(TAG, "全局搜索：没有匹配「$query」的结果")
+            return false
+        }
+        val pageBefore = foregroundPackage()
+        val clicked = runCatching { clickNodeOrParent(hit) }.getOrDefault(false)
+        Dbg.i(TAG, "全局搜索：点击结果「${hit.text ?: hit.contentDescription}」-> $clicked")
+        if (!clicked) return false
+        return if (expectPkg != null) {
+            awaitForeground(expectPkg, 4000L)
+        } else {
+            // 没指定目标包时，判据是"离开搜索页"——点了没反应也算失败，
+            // 否则会把"还停在搜索结果里"当成成功播报出去。
+            val left = awaitLeave(pageBefore, 3000L)
+            if (!left) Dbg.w(TAG, "全局搜索：点了结果但没离开搜索页（${foregroundPackage()}）")
+            left
+        }
+    }
+
+    /** 等前台离开某个包（点结果后判断有没有真跳走）。 */
+    private suspend fun awaitLeave(pkg: String?, timeoutMs: Long): Boolean {
+        if (pkg == null) { delay(600); return true }
+        var waited = 0L
+        while (waited < timeoutMs) {
+            delay(150)
+            waited += 150
+            val now = foregroundPackage()
+            if (now != null && now != pkg) return true
+        }
+        return false
+    }
+
+    /**
+     * 取搜索结果里最合适的一条：**先看匹配强度，同强度取最靠上**。
+     *
+     * 只说"第一条"会踩坑：搜「蓝牙」时最上面那条是「蓝牙已连接。」这种状态句子，
+     * 点进去不是设置页。搜索页本身按相关度排，所以规则是：
+     *   完全同名(3) > 以关键词开头(2) > 包含关键词(1)，同级之间取 y 最小的一条。
+     * 同时排除输入框自己的文字（它必然包含关键词）。
+     */
+    private suspend fun findBestResult(keyword: String): AccessibilityNodeInfo? {
+        val deadline = System.currentTimeMillis() + 3000
+        while (System.currentTimeMillis() < deadline) {
+            val roots = runCatching { service.windows.mapNotNull { it.root } }.getOrDefault(emptyList())
+            val stack = ArrayDeque<AccessibilityNodeInfo>()
+            roots.filter { it.packageName?.toString()?.contains("inputmethod", true) != true }
+                .forEach { stack.add(it) }
+            val rect = android.graphics.Rect()
+            var best: AccessibilityNodeInfo? = null
+            var bestScore = 0
+            var bestY = Int.MAX_VALUE
+            var guard = 0
+            while (stack.isNotEmpty() && guard++ < 1200) {
+                val n = stack.removeLast()
+                // 搜索框自己的文字必然含关键词，绝不能当结果
+                if (!n.isEditable) {
+                    val label = n.text?.toString().orEmpty() + n.contentDescription?.toString().orEmpty()
+                    val score = when {
+                        label.isBlank() -> 0
+                        label.equals(keyword, ignoreCase = true) -> 3
+                        label.startsWith(keyword, ignoreCase = true) -> 2
+                        label.contains(keyword, ignoreCase = true) && label.length <= keyword.length + 24 -> 1
+                        else -> 0
+                    }
+                    if (score > 0 && runCatching { n.getBoundsInScreen(rect) }.isSuccess && rect.height() > 0) {
+                        if (score > bestScore || (score == bestScore && rect.top < bestY)) {
+                            bestScore = score
+                            bestY = rect.top
+                            best = n
+                        }
+                    }
+                }
+                for (i in 0 until n.childCount) n.getChild(i)?.let { stack.add(it) }
+            }
+            if (best != null && bestScore >= 2) return best
+            if (best != null) return best
+            delay(250)
+        }
+        return null
+    }
+
+    /**
+     * 点一条搜索结果。
+     *
+     * 先试 performAction；不行就**按坐标点节点中心**——搜索结果的文字节点
+     * （`com.huawei.search:id/author` 这种）自己不可点，可点的容器又常在 4 层以外，
+     * 靠「往上找可点父节点」会整条漏掉（实测：报"没有匹配的结果"，其实结果就在屏幕上）。
+     */
+    private suspend fun clickNodeOrParent(node: AccessibilityNodeInfo): Boolean {
+        if (node.isClickable && node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+        var p = node.parent
+        var depth = 0
+        while (p != null && depth++ < 6) {
+            if (p.isClickable && p.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+            p = p.parent
+        }
+        val rect = android.graphics.Rect()
+        if (!runCatching { node.getBoundsInScreen(rect) }.isSuccess) return false
+        if (rect.width() <= 0 || rect.height() <= 0) return false
+        return tap(rect.centerX(), rect.centerY())
+    }
+
+    /**
+     * 把某个设置项拨到指定状态（开/关），并**回读校验**。
+     *
+     * ★ 「打开护眼模式」不等于「打开护眼模式的设置页」。
+     *   用户要的是开关变成开——停在设置页等于没做。所以这里四步：
+     *   搜索进入 → 找开关 → 拨到目标状态 → 重新读一遍确认。
+     *   这条对所有设置项通用：能搜到的项、页面上有 Switch/CheckBox 的都能拨。
+     *
+     * @return 成功时的用户话术；失败返回 null（调用方据此播报失败，不许假成功）
+     */
+    suspend fun setSettingsItem(keyword: String, on: Boolean): String? {
+        // 已经在目标设置页上（页面文字里就有这个词）→ 直接拨当前页的开关，
+        // 不用再退回桌面搜一遍。「打开蓝牙」走直达进了蓝牙页之后就是这条路。
+        if (onSettingsPage(keyword)) {
+            toggleTopSwitch(on)?.let { return it }
+        }
+        if (!globalSearch(keyword, null)) {
+            Dbg.w(TAG, "设置开关：没搜到「$keyword」")
+            return null
+        }
+        delay(700)
+        return toggleTopSwitch(on)
+    }
+
+    /** 当前前台是不是「包含这个词的设置页」。 */
+    private fun onSettingsPage(keyword: String): Boolean {
+        val pkg = foregroundPackage() ?: return false
+        if (!pkg.contains("settings", ignoreCase = true)) return false
+        var found = false
+        val roots = runCatching { service.windows.mapNotNull { it.root } }.getOrDefault(emptyList())
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        roots.forEach { stack.add(it) }
+        var guard = 0
+        while (stack.isNotEmpty() && guard++ < 1200) {
+            val n = stack.removeLast()
+            val label = n.text?.toString().orEmpty() + n.contentDescription?.toString().orEmpty()
+            if (label.contains(keyword, ignoreCase = true)) { found = true; break }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { stack.add(it) }
+        }
+        return found
+    }
+
+    /** 把当前页最靠上的开关拨到目标状态，回读确认。返回话术，失败返回 null。 */
+    private suspend fun toggleTopSwitch(on: Boolean): String? {
+        val verb = if (on) "开启" else "关闭"
+        repeat(3) {
+            val sw = findTopSwitch() ?: return null
+            // ★ 认人不能靠"第一个开关"，也不能只靠 viewId：
+            //   护眼模式页里主开关和「定时开启」共用 `android:id/switch_widget`。
+            val id = sw.viewIdResourceName
+            val box = android.graphics.Rect().also { runCatching { sw.getBoundsInScreen(it) } }
+            if (sw.isChecked == on) {
+                return "已经是${if (on) "开启" else "关闭"}状态"
+            }
+
+            // 三种点法逐级降级：控件本身 → 可点父行 → 按坐标点。
+            var reached = false
+            if (runCatching { sw.performAction(AccessibilityNodeInfo.ACTION_CLICK) }.getOrDefault(false)) {
+                delay(900)
+                reached = readSwitch(id, box)?.isChecked == on
+            }
+            if (!reached) {
+                val parent = sw.parent
+                if (parent != null &&
+                    runCatching { parent.performAction(AccessibilityNodeInfo.ACTION_CLICK) }.getOrDefault(false)
+                ) {
+                    delay(900)
+                    reached = readSwitch(id, box)?.isChecked == on
+                }
+                Dbg.i(TAG, "设置开关：点控件未达成，改点父行 reached=$reached")
+            }
+            if (!reached && box.width() > 0) {
+                tap(box.centerX(), box.centerY())
+                delay(900)
+                reached = readSwitch(id, box)?.isChecked == on
+                Dbg.i(TAG, "设置开关：按坐标点 reached=$reached")
+            }
+            if (reached) {
+                Dbg.i(TAG, "设置开关：已$verb（回读确认）")
+                return "已$verb"
+            }
+        }
+        return null
+    }
+
+    private fun isSwitchNode(n: AccessibilityNodeInfo): Boolean =
+        n.className?.toString()?.contains("Switch", ignoreCase = true) == true
+
+    /**
+     * 页面里最靠上的那个开关 = 这一项的主开关。
+     *
+     * ★ 优先取**可点**的那个：蓝牙页有两个 Switch——整行的 `switch_bar`
+     *   （`clickable=false`）和右侧真正可拨的 `switch_widget`（`clickable=true`），
+     *   两者 y 相同，取到前者就怎么点都不动。
+     */
+    private fun findTopSwitch(): AccessibilityNodeInfo? {
+        var bestClickable: AccessibilityNodeInfo? = null
+        var bestClickableY = Int.MAX_VALUE
+        var bestAny: AccessibilityNodeInfo? = null
+        var bestAnyY = Int.MAX_VALUE
+        val rect = android.graphics.Rect()
+        val roots = runCatching { service.windows.mapNotNull { it.root } }.getOrDefault(emptyList())
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        roots.filter { it.packageName?.toString()?.contains("inputmethod", true) != true }.forEach { stack.add(it) }
+        var guard = 0
+        while (stack.isNotEmpty() && guard++ < 1200) {
+            val n = stack.removeLast()
+            if (isSwitchNode(n) && runCatching { n.getBoundsInScreen(rect) }.isSuccess && rect.height() > 0) {
+                if (rect.top < bestAnyY) { bestAnyY = rect.top; bestAny = n }
+                if (n.isClickable && rect.top < bestClickableY) { bestClickableY = rect.top; bestClickable = n }
+            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { stack.add(it) }
+        }
+        return bestClickable ?: bestAny
+    }
+
+    /** 按 viewId + 位置回读同一个开关。 */
+    private fun readSwitch(id: String?, box: android.graphics.Rect): AccessibilityNodeInfo? {
+        var found: AccessibilityNodeInfo? = null
+        val roots = runCatching { service.windows.mapNotNull { it.root } }.getOrDefault(emptyList())
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        roots.filter { it.packageName?.toString()?.contains("inputmethod", true) != true }.forEach { stack.add(it) }
+        var guard = 0
+        while (stack.isNotEmpty() && guard++ < 1200) {
+            val n = stack.removeLast()
+            if (isSwitchNode(n) && n.viewIdResourceName == id && sameBounds(n, box)) { found = n; break }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { stack.add(it) }
+        }
+        return found
+    }
+
+    private fun sameBounds(n: AccessibilityNodeInfo, box: android.graphics.Rect): Boolean {
+        val r = android.graphics.Rect()
+        if (!runCatching { n.getBoundsInScreen(r) }.isSuccess) return false
+        return kotlin.math.abs(r.centerX() - box.centerX()) < 8 && kotlin.math.abs(r.centerY() - box.centerY()) < 8
+    }
+
+    /**
+     * 设置项搜索：直接走全局搜索。
+     *
+     * 华为把大量设置项埋在二三级菜单里（电池优化、应用启动管理、护眼…），
+     * 直达常常只落到入口页。桌面下滑的全局搜索能直接列出设置项，点一下就进去，
+     * 也不用先开设置——少一次跳转，也少一个会变的菜单层级。
+     */
+    suspend fun searchSettings(keyword: String): Boolean {
+        if (keyword.isBlank()) return false
+        return globalSearch(keyword, null)
+    }
+
+    /**
+     * 轮询找节点。用于「刚点完一跳，新页面还没铺好」的场景：
+     * `rootInActiveWindow` 在窗口切换期是 null，查一次就下结论必然误判。
+     */
+    private suspend fun findNodeDeepRetry(
+        timeoutMs: Long,
+        match: (AccessibilityNodeInfo) -> Boolean,
+    ): AccessibilityNodeInfo? {
+        var waited = 0L
+        while (waited < timeoutMs) {
+            findNodeDeepAnyWindow(match)?.let { return it }
+            delay(200)
+            waited += 200
+        }
+        return null
+    }
+
+    /**
+     * 在所有窗口里找节点，输入法窗口排最后。
+     *
+     * ★ `rootInActiveWindow` 只给"当前活动窗口"，而**输入法弹出来时它给的是键盘**——
+     *   实测点开设置搜索框后它返回 `com.huawei.ohos.inputmethod`，
+     *   于是"搜索页没有输入框"这种假结论就出来了（页面明明开着）。
+     *   所以要遍历 `service.windows`，把 inputmethod 的窗口压到最后。
+     */
+    private fun findNodeDeepAnyWindow(
+        match: (AccessibilityNodeInfo) -> Boolean,
+    ): AccessibilityNodeInfo? {
+        val roots = runCatching { service.windows.mapNotNull { it.root } }.getOrDefault(emptyList())
+        if (roots.isEmpty()) return findNodeDeep(service.rootInActiveWindow, match)
+        val ordered = roots.sortedBy {
+            val p = it.packageName?.toString().orEmpty()
+            if (p.contains("inputmethod", true)) 1 else 0
+        }
+        for (r in ordered) findNodeDeep(r, match)?.let { return it }
+        return null
+    }
+
+    /** 广度优先找第一个满足条件的节点（搜索页/桌面都在多层容器里）。 */
+    private fun findNodeDeep(
+        root: AccessibilityNodeInfo?,
+        match: (AccessibilityNodeInfo) -> Boolean,
+    ): AccessibilityNodeInfo? {
+        if (root == null) return null
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var guard = 0
+        while (queue.isNotEmpty() && guard++ < 800) {
+            val n = queue.removeFirst()
+            if (runCatching { match(n) }.getOrDefault(false)) return n
+            for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
+        }
+        return null
+    }
+
+    /**
+     * 当前前台窗口的包名。
+     *
+     * ★ 优先用无障碍事件流（`AgentRuntime.foreground`，由 TYPE_WINDOW_STATE_CHANGED 驱动）：
+     *   `rootInActiveWindow` 在窗口切换期间会返回 **null**，拿它判断"启动成不成功"
+     *   会把"冷启动慢"误判成"被系统拦截"（2026-11-11 实测：Settings 冷启动约 5 秒，
+     *   期间 root 一直是 null，而进程其实 0.6 秒就起来了）。
+     */
+    fun foregroundPackage(): String? {
+        val ev = com.pilot.agent.runtime.AgentRuntime.foreground.value
+        if (ev.isNotEmpty()) return ev
+        return runCatching { service.rootInActiveWindow?.packageName?.toString() }.getOrNull()
+    }
 
     /** 轮询等目标包成为前台。 */
     private suspend fun awaitForeground(pkg: String, timeoutMs: Long): Boolean {
@@ -284,6 +759,41 @@ class DeviceActions(
             if (foregroundPackage() == pkg) return true
         }
         return false
+    }
+
+    private enum class Transition { REACHED, MOVED, STUCK }
+
+    /**
+     * 等「前台窗口发生变化」。
+     *
+     * 三态的意义在于区分系统拦截和启动慢：
+     * - REACHED：落在目标包，成功。
+     * - MOVED：前台确实换了（哪怕还没到目标），说明 startActivity 被系统放行了，只是还在过渡。
+     * - STUCK：前台一动没动，这才是真的被拦（HarmonyOS `Abort background activity starts`）。
+     */
+    private suspend fun awaitTransition(pkg: String, timeoutMs: Long): Transition {
+        val before = foregroundPackage()
+        var waited = 0L
+        // 诊断用：把等待期间看到的前台包序列记下来。
+        // 「被判成拦截」到底是系统真拦了，还是我们读不到窗口（rootInActiveWindow 切换期间为 null），
+        // 只有这串序列能回答。别靠猜。
+        val seen = LinkedHashSet<String>()
+        while (waited < timeoutMs) {
+            delay(150)
+            waited += 150
+            val now = foregroundPackage()
+            seen.add(now ?: "null")
+            if (now == pkg) {
+                Dbg.i(TAG, "前台切到 $pkg 用时 ${waited}ms")
+                return Transition.REACHED
+            }
+            if (now != null && now != before) {
+                Dbg.i(TAG, "前台已变（$before → $now）用时 ${waited}ms，等它落到 $pkg")
+                return Transition.MOVED
+            }
+        }
+        Dbg.w(TAG, "等待 ${timeoutMs}ms 前台未变，观察到的包序列=$seen")
+        return Transition.STUCK
     }
 
     private suspend fun gesture(
@@ -316,6 +826,13 @@ class DeviceActions(
 
         /** 桌面最多翻几屏找图标（P40 实测 6 屏） */
         private const val MAX_DESKTOP_SCREENS = 8
+        /**
+         * 横滑时尝试的纵向位置（按屏幕高度比例）。
+         *
+         * 华为桌面首页是「智慧助手」式布局，中间整块是服务卡片/小组件，
+         * 在卡片上横滑会被卡片吞掉。所以换几个高度各试一次，翻不动再判死。
+         */
+        private val SWIPE_YS = listOf(0.82f, 0.30f, 0.55f)
         /**
          * 中文别名 → 候选包名。
          *

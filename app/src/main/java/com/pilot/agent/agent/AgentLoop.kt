@@ -19,6 +19,9 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 private const val TAG = "Pilot"
 
+/** 会自己跳的文本：时钟、倒计时、电量百分比。判界面变化时要忽略它们。 */
+private val clockLike = Regex("""^(\d{1,2}[:：]\d{2}([:：]\d{2})?|\d{1,3}%|\d{1,2}/\d{1,2})$""")
+
 /**
  * Agent 主循环：观察 → 决策 → 护栏 → 执行 → 记录 → 再观察。
  *
@@ -41,6 +44,10 @@ class AgentLoop(
     private val confirmSeq = AtomicLong(0)
     private var job: Job? = null
 
+    /** 本次任务最后一个「把用户带到别的 App」的动作落在了哪个包，用于决定收尾要不要归位。 */
+    @Volatile
+    private var landedPkg: String? = null
+
     @Volatile
     private var hasUi = true
 
@@ -54,7 +61,7 @@ class AgentLoop(
         if (goal.isBlank()) return
         // 新任务顶掉旧任务：旧任务可能正卡在等用户确认，不顶掉的话后面所有请求都会被 isRunning 挡回去
         if (isRunning) {
-            Dbg.i(TAG, "supersede running task, new goal=$goal")
+            Dbg.i(TAG, "supersede running task")
             cancel()
         }
         hasUi = ui
@@ -86,7 +93,7 @@ class AgentLoop(
 
     private suspend fun run(goal: String) {
         val settings = settingsProvider()
-        Dbg.i(TAG, "run start goal=$goal maxTurns=${settings.maxTurns} cloudReady=${settings.cloudReady}")
+        Dbg.i(TAG, "run start goalChars=${goal.length} maxTurns=${settings.maxTurns} cloudReady=${settings.cloudReady}")
 
         // 记下任务开始前用户在看什么，结束时要切回去。
         // 这是「任务栈隔离」的轻量版：纯 App 层建不了可交互虚拟屏（需要 CAPTURE_VIDEO_OUTPUT），
@@ -94,6 +101,7 @@ class AgentLoop(
         val self = com.pilot.agent.PilotApp.instance.packageName
         val originPkg = (reader.capture()?.pkg ?: reader.last()?.pkg)
             ?.takeIf { it.isNotEmpty() && it != self }
+        landedPkg = null
         try {
             runInner(goal, settings)
         } finally {
@@ -101,11 +109,21 @@ class AgentLoop(
         }
     }
 
-    /** 把前台切回任务开始前的 App */
+    /**
+     * 把前台切回任务开始前的 App。
+     *
+     * ★ 只给「借道别的 App 办完事」的任务用。如果任务本身就是「打开X」，
+     *   收尾时把用户拽回原 App 等于把刚打开的结果又关掉——所以只要当前前台
+     *   正是本任务最后一步主动跳过去的 App，就不归位。
+     */
     private suspend fun restoreOrigin(originPkg: String?) {
         if (originPkg.isNullOrEmpty()) return
         val now = com.pilot.agent.runtime.AgentRuntime.foreground.value
         if (now == originPkg) return
+        if (landedPkg != null && now == landedPkg) {
+            Dbg.i(TAG, "收尾不归位：$now 就是本任务的目标 App")
+            return
+        }
         Dbg.i(TAG, "任务结束，切回 $originPkg")
         runCatching { actions.openApp(originPkg) }
     }
@@ -126,7 +144,7 @@ class AgentLoop(
             }
 
             IntentGate.Kind.CHAT -> {
-                Dbg.i(TAG, "intent gate: 闲聊，跳过 goal=$goal")
+                Dbg.i(TAG, "intent gate: 闲聊，跳过本次输入")
                 emit(AgentEvent.Observe("「$goal」不是操作指令，没有动屏幕。"))
                 emit(AgentEvent.Finished("这条听起来是交流，没有执行设备操作"))
                 return
@@ -136,6 +154,8 @@ class AgentLoop(
         }
 
         val trace = mutableListOf<SkillStep>()
+        // 输入步骤目前没有安全的参数槽位/密钥托管机制，任何含输入的任务都不沉淀为可回放技能。
+        var skillEligible = true
         val history = mutableListOf<String>()
 
         // 1. 先看技能库，能回放就不惊动模型
@@ -148,12 +168,17 @@ class AgentLoop(
 
         var lastFingerprint = ""
         var repeats = 0
+        // 连续「执行成功但界面没动」的次数。这是「每步都成功、任务原地踏步」的唯一可观测信号。
+        var invalidStreak = 0
+        // 上一步动作后settle完的屏幕。既做无效动作判定，也直接给下一轮决策用。
+        var nextSnap: ScreenSnapshot? = null
 
         for (step in 1..settings.maxTurns) {
             Dbg.i(TAG, "loop step=$step enter")
             emit(AgentEvent.Progress(step, settings.maxTurns))
 
-            var snap = reader.capture()
+            var snap = nextSnap ?: reader.capture()
+            nextSnap = null
             if (snap == null) {
                 // 上一步点击触发了页面跳转，切换瞬间 rootInActiveWindow 会是 null。
                 // 这里必须重试，否则「点了之后读不到屏幕」会把好好的任务判死。
@@ -203,7 +228,7 @@ class AgentLoop(
 
             when (action.action) {
                 "done" -> {
-                    if (trace.isNotEmpty()) skills.recordSuccess(goal, snap.pkg, trace)
+                    if (skillEligible && trace.isNotEmpty()) skills.recordSuccess(goal, snap.pkg, trace)
                     Dbg.i(TAG, "done: ${action.summary} steps=$step skills=${trace.size}")
                     emit(AgentEvent.Finished(action.summary ?: "已完成"))
                     return
@@ -214,7 +239,7 @@ class AgentLoop(
                 "shortcut", "component" -> {
                     if (history.any { it.startsWith("直达") && it.contains("ok") }) {
                         Dbg.i(TAG, "直达已执行过，判定完成：${action.summary}")
-                        if (trace.isNotEmpty()) skills.recordSuccess(goal, snap.pkg, trace)
+                        if (skillEligible && trace.isNotEmpty()) skills.recordSuccess(goal, snap.pkg, trace)
                         emit(AgentEvent.Finished("已打开 ${action.summary ?: ""}"))
                         return
                     }
@@ -237,7 +262,8 @@ class AgentLoop(
 
             // 2. 护栏在动作落地之前
             val risk = guard.riskOf(action, snap)
-            if (risk != Risk.NONE && settings.confirmMoneyActions) {
+            // 高风险确认是策略约束，不受普通设置开关影响。
+            if (risk != Risk.NONE) {
                 val go = askUser("${action.describe()} —— 可能涉及${guard.riskLabel(risk)}，确认执行？", risk)
                 guard.audit(goal, action, risk, go)
                 if (!go) {
@@ -260,19 +286,10 @@ class AgentLoop(
                 }
                 return
             }
+            if (action.action == "input") skillEligible = false
             toSkillStep(action, snap)?.let { if (ok) trace += it }
 
-            // 死循环判定要带上屏幕状态：同一动作但界面变了，那是正常推进，不是卡住
-            val fingerprint = "${action.action}:$ok:${snap.pkg}:${snap.nodes.size}"
-            if (fingerprint == lastFingerprint) repeats++ else {
-                repeats = 0
-                lastFingerprint = fingerprint
-            }
-            history += "${action.describe()} -> ${if (ok) "ok" else "fail"}"
-
-            if (repeats >= 3) throw IllegalStateException("同一动作连续失败 3 次，已中止，避免把界面点乱。")
-
-            // 3. 等界面稳定再抓下一帧
+            // 3. 等界面稳定再抓下一帧。这一帧有两个用途：给下一轮决策，以及判断这一步到底有没有生效。
             val settle = when (action.action) {
                 "wait" -> action.ms ?: 500
                 "open" -> 1200
@@ -280,6 +297,55 @@ class AgentLoop(
                 else -> 350
             }
             delay(settle.toLong())
+
+            // ★ 动作后校验：无障碍返回 true 只代表「事件发出去了」，不代表界面动了。
+            //   点了不可点区域、输入没落进输入框、Intent 被系统后台拦下——三种都会一路「成功」、
+            //   一路重规划，直到 maxTurns 才报超时，用户看到的是「它一直在瞎点」。
+            //   所以这里必须回抓一帧比对：界面没变 = 无效动作，写进历史让规划器换策略。
+            val after = reader.capture()
+            if (after != null) nextSnap = after
+            val changed = after != null && screenKey(after) != screenKey(snap)
+            val countsAsProgress = !uiAffecting(action) || changed
+
+            if (countsAsProgress) {
+                if (invalidStreak > 0) Dbg.i(TAG, "step=$step 界面有变化，无效动作计数清零")
+                invalidStreak = 0
+                history += "${action.describe()} -> ${if (ok) "ok" else "fail"}"
+            } else {
+                invalidStreak++
+                history += "${action.describe()} -> 执行成功但界面没有变化（无效动作），换一种方式"
+                Dbg.w(
+                    TAG,
+                    "step=$step 无效动作 streak=$invalidStreak action=${action.action} pkg=${snap.pkg} nodes=${snap.nodes.size}",
+                )
+                emit(AgentEvent.Observe("这一步没有引起界面变化，换个方式再试"))
+                // 返回键在顶层界面按下去本来就不会有变化——这不是"无效动作"，
+                // 是"已经没得退了"。再重试两遍只会让用户听三遍同样的提示。
+                if (action.action == "key" && action.target == "back") {
+                    emit(AgentEvent.Finished("已经是最外层界面，没有可返回的地方"))
+                    return
+                }
+                if (invalidStreak >= 3) {
+                    throw IllegalStateException(
+                        "连续 3 步动作没有引起界面变化，已中止，避免空转。请确认当前界面是否还能操作（可能被弹窗、锁屏或权限提示挡住）。",
+                    )
+                }
+            }
+
+            // 跳转类动作记下落点，收尾时据此决定要不要把用户切回原 App
+            if (action.action == "open" || action.action == "shortcut" || action.action == "component") {
+                val p = after?.pkg.orEmpty()
+                if (p.isNotEmpty() && p != snap.pkg) landedPkg = p
+            }
+
+            // 死循环判定要带上界面状态：同一动作、同样的结果、界面也没变，才算卡住
+            val fingerprint = "${action.action}:$ok:$changed:${after?.pkg}:${after?.nodes?.size}"
+            if (fingerprint == lastFingerprint) repeats++ else {
+                repeats = 0
+                lastFingerprint = fingerprint
+            }
+
+            if (repeats >= 3) throw IllegalStateException("同一动作连续 3 次没有进展，已中止，避免把界面点乱。")
         }
 
         emit(AgentEvent.Failed("超过 ${settings.maxTurns} 步仍未完成，已停在当前界面。"))
@@ -480,6 +546,34 @@ class AgentLoop(
                 true
             }
 
+            "settings_switch_on", "settings_switch_off" -> {
+                // 拨开关：不是打开设置页就完事，要开关真的到位（内部回读校验过）。
+                val msg = actions.setSettingsItem(arg, op == "settings_switch_on")
+                if (msg != null) {
+                    val text = if (msg.startsWith("已经")) "「$arg」$msg" else "$msg「$arg」"
+                    emit(AgentEvent.Observe(text))
+                    true
+                } else {
+                    // 有些项本来就没有独立开关（是一堆列表/子菜单），退化成"打开这一项"，
+                    // 但要如实说明，不能播成"已开启"。
+                    val opened = actions.searchSettings(arg)
+                    emit(
+                        AgentEvent.Observe(
+                            if (opened) "「$arg」没有独立开关，已打开它的设置页" else "没能打开「$arg」",
+                        ),
+                    )
+                    opened
+                }
+            }
+
+            "settings_search" -> {
+                // 设置项搜索：静态表和 App 索引都没命中时才走这里。
+                // 比逐级点菜单稳——设置改版、菜单挪位置都不影响。
+                val ok = actions.searchSettings(arg)
+                emit(AgentEvent.Observe(if (ok) "已在设置里搜索并打开「$arg」" else "设置里没搜到「$arg」"))
+                ok
+            }
+
             else -> false
         }
     }
@@ -503,7 +597,7 @@ class AgentLoop(
         val pkg = reader.last()?.pkg.orEmpty()
         val skill = skills.match(goal, pkg)
         if (skill == null) {
-            Dbg.i(TAG, "no skill matched goal=$goal pkg=$pkg")
+            Dbg.i(TAG, "no skill matched pkg=$pkg")
             return null
         }
         Dbg.i(TAG, "skill hit goal=${skill.goal} steps=${skill.steps.size} successes=${skill.successes}")
@@ -554,6 +648,32 @@ class AgentLoop(
         }
 
         else -> false
+    }
+
+    /** 这一步动作是否「本来就应该让界面变化」。不改变界面的动作（wait 等）不参与无效动作判定。 */
+    private fun uiAffecting(a: AgentAction): Boolean = when (a.action) {
+        "tap", "tap_node", "long_press", "input", "swipe", "scroll", "key", "open", "shortcut", "component" -> true
+        else -> false
+    }
+
+    /**
+     * 界面指纹：只回答「这两帧是不是同一个界面」。
+     *
+     * ★ 必须剔掉时间类文本（状态栏 11:59、倒计时 00:12、电量 87%）。时钟每秒跳一下，
+     *   每一帧都会被判成「有变化」，无效动作就永远检测不出来——这是这个功能最容易写废的地方。
+     *   宁可漏判（少报一次无效动作），不可误判（把正常推进当成无效，逼规划器换策略）。
+     */
+    private fun screenKey(s: ScreenSnapshot): String {
+        val sb = StringBuilder(s.pkg).append('|').append(s.nodes.size)
+        for (n in s.nodes) {
+            val t = n.text.take(24)
+            if (t.isNotEmpty() && !clockLike.matches(t)) {
+                sb.append('|').append(n.cls).append(':').append(t)
+            }
+            if (n.checked) sb.append('v')
+            if (!n.enabled) sb.append('d')
+        }
+        return sb.toString()
     }
 
     private fun toSkillStep(action: AgentAction, snap: ScreenSnapshot): SkillStep? = when (action.action) {

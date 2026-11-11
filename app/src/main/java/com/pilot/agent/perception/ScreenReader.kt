@@ -64,7 +64,8 @@ class ScreenReader(private val service: AccessibilityService) {
                             cls = node.className?.toString()?.substringAfterLast('.') ?: "",
                             // 关键：可点击的往往是外层容器（Preference、LinearLayout），
                             // 文本躺在被过滤掉的子 TextView 里。不聚合就等于瞎了。
-                            text = labelOf(node),
+                            // 密码控件不把任何可见文本放进快照，避免随屏幕上下文发送给规划器。
+                            text = if (node.isPassword) "[密码输入框]" else labelOf(node),
                             viewId = node.viewIdResourceName ?: "",
                             x1 = rect.left,
                             y1 = rect.top,
@@ -75,6 +76,7 @@ class ScreenReader(private val service: AccessibilityService) {
                             scrollable = node.isScrollable,
                             checked = node.isChecked,
                             enabled = node.isEnabled,
+                            password = node.isPassword,
                         )
                     )
                 } else if (includePlainText) {
@@ -173,9 +175,11 @@ class ScreenReader(private val service: AccessibilityService) {
         return Bitmap.createScaledBitmap(src, maxWidth, (src.height * ratio).toInt(), true)
     }
 
-    private fun ownLabel(node: AccessibilityNodeInfo): String =
-        node.text?.toString()?.trim().orEmpty()
+    private fun ownLabel(node: AccessibilityNodeInfo): String {
+        if (node.isPassword) return "[密码输入框]"
+        return node.text?.toString()?.trim().orEmpty()
             .ifEmpty { node.contentDescription?.toString()?.trim().orEmpty() }
+    }
 
     /**
      * 把一个节点子树里的文本拼成标签。

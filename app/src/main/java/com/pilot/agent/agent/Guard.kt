@@ -28,11 +28,20 @@ class Guard(private val ctx: Context) {
         "发送", "发布", "分享", "群发", "评论", "拨号", "呼叫", "邀请", "转发",
         "send", "post", "share",
     )
+    private val sensitiveFieldWords = listOf("密码", "验证码", "动态码", "口令", "支付密码", "security code", "password", "otp")
+    private val destructiveCommand = Regex(
+        "(?i)(?:^|[;&|]\\s*)(?:rm\\s+-(?:[^ ]*r[^ ]*f|[^ ]*f[^ ]*r)|dd\\s+.*\\bof=/dev/|mkfs(?:\\.[a-z0-9]+)?|wipefs|format\\s+|shred\\s+|passwd\\s|chmod\\s+-R\\s+777)"
+    )
 
     fun riskOf(action: AgentAction, snap: ScreenSnapshot): Risk {
         if (action.action == "done" || action.action == "wait" || action.action == "ask") return Risk.NONE
         if (action.action == "key" || action.action == "scroll") return Risk.NONE
         if (action.action == "open") return Risk.NONE
+
+        if (action.action == "systemop" && action.target == "call") return Risk.EXTERNAL
+        if (action.action == "systemop" && action.target == "terminal" && destructiveCommand.containsMatchIn(action.text.orEmpty())) {
+            return Risk.IRREVERSIBLE
+        }
 
         val targetText = buildString {
             action.summary?.let { append(it).append(' ') }
@@ -45,11 +54,20 @@ class Guard(private val ctx: Context) {
 
         // 只在"坐标点击"这种看不清目标的情况下才扫全屏文本。
         // 否则微信首页有个"支付"入口，每次点任何东西都会误报，用户会被确认弹窗逼疯。
-        // ★ 注意条件必须是 action=="click"，不能只判 id==null：
+        // ★ 条件必须是 action=="tap"（坐标点击），不能只判 id==null：
         //   systemop/shortcut（系统直调、直达）同样没有 id，但它们的意图完全明确
         //   （summary 里就写着"音量""蓝牙"），扫全屏会让桌面一个「支付宝」图标
         //   把「声音大一点」误判成资金变动（2026-11-10 回归实测踩到）。
-        val screenText = if (action.action == "click" && action.id == null)
+        //   动作名是 tap 不是 click——写错过一次，防护整段静默失效。
+        val targetNode = action.id?.let { id -> snap.nodes.firstOrNull { it.id == id } }
+        if (action.action == "input" && targetNode != null &&
+            (targetNode.password || sensitiveFieldWords.any { word ->
+                (targetNode.text + " " + targetNode.viewId).contains(word, ignoreCase = true)
+            })) {
+            return Risk.SENSITIVE
+        }
+
+        val screenText = if (action.action == "tap" && action.id == null)
             snap.nodes.joinToString(" ") { it.text } else ""
         val haystack = (targetText + " " + screenText).lowercase()
 
@@ -65,6 +83,7 @@ class Guard(private val ctx: Context) {
         Risk.MONEY -> "资金变动"
         Risk.IRREVERSIBLE -> "不可恢复的删除/退出"
         Risk.EXTERNAL -> "对外发送内容"
+        Risk.SENSITIVE -> "敏感凭据或验证码"
         Risk.NONE -> "无"
     }
 
@@ -72,7 +91,9 @@ class Guard(private val ctx: Context) {
     fun audit(goal: String, action: AgentAction, risk: Risk, approved: Boolean) {
         runCatching {
             val ts = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
-            val line = "$ts\trisk=${risk.name}\tapproved=$approved\tgoal=$goal\taction=${action.describe()}\n"
+            // 高风险任务可能包含消息正文、收件人或凭据；审计只留动作摘要，不落原始请求。
+            val safeGoal = "[用户任务内容已隐藏]"
+            val line = "$ts\trisk=${risk.name}\tapproved=$approved\tgoal=$safeGoal\taction=${action.describe()}\n"
             File(ctx.filesDir, "audit.log").appendText(line)
         }
     }

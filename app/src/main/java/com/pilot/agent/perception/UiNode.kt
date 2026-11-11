@@ -26,6 +26,8 @@ data class UiNode(
     val scrollable: Boolean = false,
     val checked: Boolean = false,
     val enabled: Boolean = true,
+    /** Android 标记的密码输入框；用于在输入前强制确认，且不把内容写入技能。 */
+    val password: Boolean = false,
 ) {
     val cx: Int get() = (x1 + x2) / 2
     val cy: Int get() = (y1 + y2) / 2
@@ -45,6 +47,7 @@ data class UiNode(
             if (scrollable) append('s')
             if (checked) append('v')
             if (!enabled) append('d')
+            if (password) append('p')
         }
         if (f.isNotEmpty()) append(" [").append(f).append(']')
     }

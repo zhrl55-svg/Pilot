@@ -1,5 +1,7 @@
 package com.pilot.agent.agent
 
+import com.pilot.agent.Dbg
+
 import java.io.File
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
@@ -43,15 +45,55 @@ class SkillStore(private val dir: File) {
 
     private val file: File get() = File(dir, "skills.json")
 
+    init {
+        migrate()
+        // 应用加载技能库时即迁移清理旧版含输入值的记录。
+        all()
+    }
+
+    /**
+     * 技能库版本迁移。
+     *
+     * v1 → v2（2026-11-11）：语义变了。「打开X」以前记的是"打开这一项的设置页"，
+     * 现在要求"开关真的拨到位"；而这些旧轨迹会**短路新逻辑**——
+     * 回放一步"打开蓝牙设置页"就宣告完成，用户看到的还是没打开。
+     * 旧轨迹一律作废（技能重学一次很便宜，回放错一次很贵）。
+     */
+    private fun migrate() {
+        runCatching {
+            val marker = File(dir, "skills.v2")
+            if (marker.exists()) return
+            dir.mkdirs()
+            val old = file
+            if (old.exists()) {
+                Dbg.i("Pilot", "技能库迁移 v1→v2：作废 ${old.length()} 字节旧轨迹")
+                old.delete()
+            }
+            marker.writeText("2")
+        }
+    }
+
     fun all(): List<Skill> = runCatching {
-        if (!file.exists()) emptyList()
-        else json.decodeFromString<List<Skill>>(file.readText())
+        if (!file.exists()) {
+            emptyList()
+        } else {
+            val decoded = json.decodeFromString<List<Skill>>(file.readText())
+            // 清理旧版本可能保存的密码、验证码或消息正文，禁止继续回放或留在磁盘。
+            val safe = decoded.filterNot { skill -> skill.steps.any { it.action == "input" } }
+            if (safe.size != decoded.size) persist(safe)
+            safe
+        }
     }.getOrDefault(emptyList())
 
     private fun persist(list: List<Skill>) {
         runCatching {
             dir.mkdirs()
-            file.writeText(json.encodeToString(list))
+            val tmp = File(dir, "skills.json.tmp")
+            tmp.writeText(json.encodeToString(list))
+            if (!tmp.renameTo(file)) {
+                tmp.copyTo(file, overwrite = true)
+                tmp.delete()
+            }
         }
     }
 

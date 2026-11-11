@@ -10,6 +10,7 @@ data class AgentSettings(
     val maxTurns: Int = 25,
     val preferOnDevice: Boolean = true,
     val enableLocalModel: Boolean = true,
+    @Deprecated("高风险确认现在始终强制开启")
     val confirmMoneyActions: Boolean = true,
     val allowSkillReplay: Boolean = true,
     /** 播报引擎：minimax（云端，默认）/ system（系统 TTS）/ off */

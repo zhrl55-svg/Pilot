@@ -26,7 +26,8 @@ data class AgentAction(
         "tap_node" -> "点击节点 [$id]"
         "long_press" -> "长按节点 [$id]"
         "swipe" -> "滑动 ($x,$y) → ($x2,$y2)"
-        "input" -> "在 [$id] 输入「${text.orEmpty().take(20)}」"
+        // 输入值可能包含密码、验证码、收件人或私人消息；描述会进入日志、历史与模型上下文，不能回显原文。
+        "input" -> "在 [$id] 输入内容（已隐藏）"
         "open" -> "打开应用 ${target.orEmpty()}"
         "systemop" -> "系统直调 ${summary ?: target.orEmpty()}"
         "shortcut" -> "直达 ${summary ?: target.orEmpty()}"
@@ -60,4 +61,4 @@ data class AgentAction(
     }
 }
 
-enum class Risk { NONE, MONEY, IRREVERSIBLE, EXTERNAL }
+enum class Risk { NONE, MONEY, IRREVERSIBLE, EXTERNAL, SENSITIVE }

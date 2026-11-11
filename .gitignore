@@ -34,3 +34,6 @@ keystore/
 .workbuddy-ai/x*.png
 .workbuddy-ai/y*.png
 .workbuddy-ai/m1.png
+
+# 方案评估受控工作区：只在评审范围内流转，不随代码仓库分发
+review/
