@@ -35,7 +35,7 @@ data class AgentAction(
         "key" -> "按键 ${target.orEmpty()}"
         "scroll" -> "滚动 [$id] ${target ?: "forward"}"
         "wait" -> "等待 ${ms ?: 500}ms"
-        "app_func" -> "调用 ${target.orEmpty()} 的工具 ${text.orEmpty()}"
+        "app_func" -> "调用应用工具 ${target.orEmpty()}（参数已隐藏）"
         "done" -> "完成：${summary.orEmpty()}"
         "ask" -> "需要确认：${summary.orEmpty()}"
         else -> action
@@ -53,6 +53,7 @@ data class AgentAction(
           {"name":"scroll","description":"对可滚动容器做一次滚动，比 swipe 更稳定","parameters":{"type":"object","properties":{"id":{"type":"integer"},"target":{"type":"string","enum":["forward","backward"]}},"required":["id"]}},
           {"name":"open","description":"按包名或应用名打开一个 App","parameters":{"type":"object","properties":{"target":{"type":"string"}},"required":["target"]}},
           {"name":"key","description":"系统按键","parameters":{"type":"object","properties":{"target":{"type":"string","enum":["back","home","recents","notifications"]}},"required":["target"]}},
+          {"name":"app_func","description":"在 Android 16+ 且系统已授权时调用目标应用公开的 AppFunction；target 格式为 package/functionId，text 为 JSON 参数。调用前必须向用户确认。不可用时改走界面操作。","parameters":{"type":"object","properties":{"target":{"type":"string"},"text":{"type":"string"}},"required":["target"]}},
           {"name":"wait","description":"等待界面加载","parameters":{"type":"object","properties":{"ms":{"type":"integer"}},"required":["ms"]}},
           {"name":"done","description":"任务完成，给出结果说明","parameters":{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}},
           {"name":"ask","description":"信息不足或动作有风险，向用户提问/请求确认","parameters":{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}}

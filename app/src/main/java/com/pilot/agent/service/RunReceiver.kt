@@ -188,7 +188,9 @@ class RunReceiver : BroadcastReceiver() {
                         runBlocking { com.pilot.agent.query.QueryEngine.handle(goal) }
                     }.getOrNull()
                     if (!answer.isNullOrBlank()) {
-                        AgentRuntime.speaker.speak(answer)
+                        val spokenSummary = com.pilot.agent.query.QueryEngine.speechSummary(answer)
+                        if (spokenSummary != null) AgentRuntime.speaker.speakExpanded(spokenSummary)
+                        else AgentRuntime.speaker.speak(answer)
                     } else {
                         AgentRuntime.speaker.speak(
                             runCatching { runBlocking { answerByModel(goal) } }

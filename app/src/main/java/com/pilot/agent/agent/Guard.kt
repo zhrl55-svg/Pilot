@@ -39,6 +39,8 @@ class Guard(private val ctx: Context) {
         if (action.action == "open") return Risk.NONE
 
         if (action.action == "systemop" && action.target == "call") return Risk.EXTERNAL
+        // AppFunction 的副作用由目标应用定义；缺少结构化风险元数据时按对外副作用处理。
+        if (action.action == "app_func") return Risk.EXTERNAL
         if (action.action == "systemop" && action.target == "terminal" && destructiveCommand.containsMatchIn(action.text.orEmpty())) {
             return Risk.IRREVERSIBLE
         }

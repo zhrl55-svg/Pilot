@@ -133,6 +133,31 @@ class TriggerActivity : Activity() {
             return
         }
 
+        // 设备端导航模拟测试入口。标记文件位于 App 私有目录，主/导航进程共享。
+        val simulateNav = i.getStringExtra("simulate_nav")?.trim().orEmpty()
+        if (simulateNav.isNotBlank()) {
+            Dbg.i(TAG, "启动模拟导航测试：目的地=$simulateNav")
+            val loop = AgentRuntime.loop
+            if (loop != null) {
+                val marker = java.io.File(filesDir, "nav_simulate_next")
+                if (!runCatching { marker.writeText("1"); true }.getOrDefault(false)) {
+                    Dbg.e(TAG, "写入模拟导航标记失败")
+                    return
+                }
+                loop.start(AgentRuntime.scope, "导航去$simulateNav", ui = false)
+                Dbg.i(TAG, "模拟导航请求已交给 AgentLoop")
+                return
+            }
+            val appContext = applicationContext
+            Thread {
+                val jobId = kotlinx.coroutines.runBlocking {
+                    com.pilot.agent.navigation.NavigationClient.startSimulatedNavi(appContext, simulateNav)
+                }
+                Dbg.i(TAG, "模拟导航服务已返回 jobId=$jobId")
+            }.apply { name = "simulate-navigation-test"; isDaemon = true }.start()
+            return
+        }
+
         // 正式指令
         val goal = i.getStringExtra("goal")?.trim().orEmpty()
         if (goal.isEmpty()) {

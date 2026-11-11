@@ -138,6 +138,27 @@ class AgentLoop(
 
     private suspend fun runInner(goal: String, settings: AgentSettings) {
 
+        if (com.pilot.agent.action.CalendarTool.handles(goal)) {
+            emit(AgentEvent.Finished(com.pilot.agent.action.CalendarTool.create(
+                com.pilot.agent.PilotApp.instance, goal,
+            )))
+            return
+        }
+
+        if (com.pilot.agent.action.PersonalTodoStore.handles(goal)) {
+            emit(AgentEvent.Finished(com.pilot.agent.action.PersonalTodoStore.handle(goal)))
+            return
+        }
+
+        // 私人提醒为本地系统工具，不进入模型规划或上云。
+        if (com.pilot.agent.action.ReminderManager.handles(goal)) {
+            val result = com.pilot.agent.action.ReminderManager.handle(
+                com.pilot.agent.PilotApp.instance, goal,
+            )
+            emit(AgentEvent.Finished(result))
+            return
+        }
+
         // 意图分流：操作 → 进循环；查询 → 直接出答案；闲聊 → 不碰屏幕
         when (IntentGate.classify(goal)) {
             IntentGate.Kind.QUERY -> {
@@ -401,7 +422,17 @@ class AgentLoop(
                 }
                 "key" -> target != null && actions.key(target)
                 "systemop" -> runSystemOp(a)
-                "app_func" -> false // 见 AppFunctionBridge，待 ROM 权限到位后接通
+                "app_func" -> {
+                    val dest = target ?: return false
+                    val pkg = dest.substringBefore('/')
+                    val functionId = dest.substringAfter('/', "")
+                    if (pkg.isBlank() || functionId.isBlank()) return false
+                    val result = com.pilot.agent.appfunction.AppFunctionBridge.invoke(
+                        com.pilot.agent.PilotApp.instance, pkg, functionId, text.orEmpty(),
+                    ) ?: return false
+                    emit(AgentEvent.Observe(result))
+                    true
+                }
                 else -> false
             }
         } catch (t: Throwable) {

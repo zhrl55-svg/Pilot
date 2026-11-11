@@ -65,6 +65,8 @@ class RouteGuide(
 
     private var lastLat = 0.0
     private var lastLon = 0.0
+    private val simulationHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var simulationRunnable: Runnable? = null
 
     // ------------------------------------------------------------ 对外
 
@@ -137,8 +139,43 @@ class RouteGuide(
         }
     }
 
+    /** 仅用于显式测试模式：沿 Web 路线 polyline 回放定位，验证逐步引导和 TTS。 */
+    fun simulatePlayback() {
+        simulationRunnable?.let(simulationHandler::removeCallbacks)
+        val snapshot = points
+        if (snapshot.isEmpty()) {
+            NLog.w(TAG, "模拟回放没有路线坐标点")
+            return
+        }
+        val stride = kotlin.math.ceil(snapshot.size / 70.0).toInt().coerceAtLeast(1)
+        val indices = (snapshot.indices step stride).toMutableList().apply {
+            if (lastOrNull() != snapshot.lastIndex) add(snapshot.lastIndex)
+        }
+        NLog.i(TAG, "Web 路线模拟回放开始 points=${snapshot.size} samples=${indices.size}")
+        var cursor = 0
+        val task = object : Runnable {
+            override fun run() {
+                if (route == null) return
+                val p = snapshot[indices[cursor]]
+                onLocation(p[1], p[0])
+                cursor++
+                if (cursor < indices.size) {
+                    simulationHandler.postDelayed(this, 500L)
+                } else {
+                    NLog.i(TAG, "Web 路线模拟回放到达终点")
+                    onAnnounce("模拟导航已到达目的地附近", PRIORITY_URGENT)
+                    simulationRunnable = null
+                }
+            }
+        }
+        simulationRunnable = task
+        simulationHandler.post(task)
+    }
+
     /** 停止引导。 */
     fun stop() {
+        simulationRunnable?.let(simulationHandler::removeCallbacks)
+        simulationRunnable = null
         route = null
         points = emptyList()
         pointStep = IntArray(0)

@@ -1,5 +1,6 @@
 package com.pilot.navigation
 
+import android.content.Context
 import android.util.Log
 
 /**
@@ -19,13 +20,21 @@ object NavKeys {
     /** Web API Key（地点搜索用）。 */
     fun webKey(): String = BuildConfig.AMAP_WEB_KEY
 
-    /** 检查 Key 是否就绪（缺 Key 时导航不可用，要能提前发现）。 */
-    fun check(): String {
+    /** 检查 Web Key 和 Manifest 注入的 Android SDK Key；绝不记录密钥本身。 */
+    fun check(context: Context): String {
         val web = webKey()
-        if (web.isBlank()) {
-            NLog.w(TAG, "AMAP_WEB_KEY 未配置，地点搜索不可用")
-            return "缺少高德 Web Key（local.properties 里加 AMAP_WEB_KEY=xxx）"
+        val sdk = runCatching {
+            context.packageManager.getApplicationInfo(
+                context.packageName,
+                android.content.pm.PackageManager.GET_META_DATA,
+            ).metaData?.getString("com.amap.api.v2.apikey").orEmpty()
+        }.getOrDefault("")
+        val status = "sdkKey=${if (sdk.isBlank()) "missing" else "injected"}, webKey=${if (web.isBlank()) "missing" else "injected"}"
+        if (sdk.isBlank() || web.isBlank()) {
+            NLog.w(TAG, "高德配置未就绪：$status（不输出 Key 内容）")
+            return status
         }
-        return "ok"
+        NLog.i(TAG, "高德配置已注入：$status；服务端有效性以算路错误码为准")
+        return status
     }
 }

@@ -1,7 +1,15 @@
 package com.pilot.agent.appfunction
 
 import android.content.Context
+import android.os.Build
+import android.os.CancellationSignal
+import android.os.OutcomeReceiver
 import android.util.Log
+import java.lang.reflect.Proxy
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import org.json.JSONObject
 
 /**
  * AppFunctions 调用方桥接。
@@ -24,6 +32,7 @@ object AppFunctionBridge {
 
     /** 平台类是否存在 + 系统服务是否可获取。 */
     fun isAvailable(ctx: Context): Boolean = runCatching {
+        if (Build.VERSION.SDK_INT < 36) return false
         Class.forName("android.app.appfunctions.AppFunctionManager")
         serviceName()?.let { ctx.getSystemService(it) } != null
     }.getOrDefault(false)
@@ -34,23 +43,91 @@ object AppFunctionBridge {
         field.get(null) as? String
     }.getOrNull()
 
-    /**
-     * 真实调用入口。返回 null 表示当前设备/权限不满足，上层应回落到 UI 自动化。
-     *
-     * 实现示例（签名确认后取消注释）：
-     * ```
-     * val mgr = ctx.getSystemService(Context.APP_FUNCTION_SERVICE) as AppFunctionManager
-     * val response = mgr.executeAppFunction(pkg, functionId, params, cancellationSignal)
-     * ```
-     */
+    /** API 36+ reflective call keeps API-35 builds compatible. Null means fall back to UI automation. */
     fun invoke(ctx: Context, pkg: String, functionId: String, argsJson: String): String? {
         if (!isAvailable(ctx)) {
             Log.i(TAG, "AppFunctions 不可用，回落到 UI 自动化（pkg=$pkg, fn=$functionId）")
             return null
         }
-        // 见上方说明：签名确认前不做反射调用，避免静默失效。
-        Log.i(TAG, "AppFunctions 可用，但调用签名待 ROM 侧确认：pkg=$pkg fn=$functionId args=$argsJson")
-        return null
+        return try {
+            val parameters = genericDocument(JSONObject(argsJson.ifBlank { "{}" }))
+            val requestClass = Class.forName("android.app.appfunctions.ExecuteAppFunctionRequest")
+            val builderClass = Class.forName("android.app.appfunctions.ExecuteAppFunctionRequest\$Builder")
+            val builder = builderClass.getConstructor(String::class.java, String::class.java)
+                .newInstance(pkg, functionId)
+            val setParameters = builderClass.methods.firstOrNull { it.name == "setParameters" && it.parameterCount == 1 }
+            if (setParameters != null) setParameters.invoke(builder, parameters)
+            val request = builderClass.getMethod("build").invoke(builder)
+            val manager = ctx.getSystemService(serviceName()!!) ?: return null
+            val method = manager.javaClass.methods.firstOrNull {
+                it.name == "executeAppFunction" && it.parameterCount == 4 && it.parameterTypes[0].isInstance(request)
+            } ?: return null
+
+            val callbackType = method.parameterTypes[3]
+            val latch = CountDownLatch(1)
+            var response: Any? = null
+            var failure: Throwable? = null
+            val callback = Proxy.newProxyInstance(callbackType.classLoader, arrayOf(callbackType)) { _, m, args ->
+                when (m.name) {
+                    "onResult" -> response = args?.firstOrNull()
+                    "onError" -> failure = args?.firstOrNull() as? Throwable
+                }
+                if (m.name == "onResult" || m.name == "onError") latch.countDown()
+                null
+            }
+            val executor = Executors.newSingleThreadExecutor()
+            try {
+                method.invoke(manager, request, executor, CancellationSignal(), callback)
+                if (!latch.await(30, TimeUnit.SECONDS)) return null
+            } finally {
+                executor.shutdownNow()
+            }
+            if (failure != null) {
+                Log.w(TAG, "AppFunction failed: ${failure?.javaClass?.simpleName}")
+                return null
+            }
+            val resultDoc = response?.javaClass?.methods?.firstOrNull { it.name == "getResultDocument" && it.parameterCount == 0 }
+                ?.invoke(response)
+            Log.i(TAG, "AppFunction executed: $pkg/$functionId")
+            "应用工具已执行：$functionId" + (resultDoc?.let { "\n结果：${it.toString().take(1200)}" } ?: "")
+        } catch (t: Throwable) {
+            Log.w(TAG, "AppFunction 调用失败：${t.cause?.javaClass?.simpleName ?: t.javaClass.simpleName}")
+            null
+        }
+    }
+
+    private fun genericDocument(values: JSONObject): Any {
+        val builderClass = Class.forName("android.app.appsearch.GenericDocument\$Builder")
+        val builder = builderClass.getConstructor(String::class.java, String::class.java)
+            .newInstance("pilot-agent", "${System.currentTimeMillis()}")
+        for (key in values.keys()) {
+            val value = values.opt(key) ?: continue
+            val methodName = when (value) {
+                is String -> "setPropertyString"
+                is Boolean -> "setPropertyBoolean"
+                is Int, is Long -> "setPropertyLong"
+                is Number -> "setPropertyDouble"
+                else -> continue
+            }
+            val elementType = when (methodName) {
+                "setPropertyString" -> String::class.java
+                "setPropertyBoolean" -> Boolean::class.javaPrimitiveType!!
+                "setPropertyLong" -> Long::class.javaPrimitiveType!!
+                else -> Double::class.javaPrimitiveType!!
+            }
+            val setter = builderClass.methods.firstOrNull {
+                it.name == methodName && it.parameterCount == 2 && it.parameterTypes[0] == String::class.java && it.parameterTypes[1].isArray
+            } ?: continue
+            val coerced = when (value) {
+                is Int -> value.toLong()
+                is Number -> if (methodName == "setPropertyDouble") value.toDouble() else value
+                else -> value
+            }
+            val array = java.lang.reflect.Array.newInstance(elementType, 1)
+            java.lang.reflect.Array.set(array, 0, coerced)
+            setter.invoke(builder, key, array)
+        }
+        return builderClass.getMethod("build").invoke(builder)
     }
 
     /** 诊断信息，显示在设置页里，方便确认 ROM 集成是否生效。 */

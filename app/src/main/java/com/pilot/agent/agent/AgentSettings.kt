@@ -2,10 +2,12 @@ package com.pilot.agent.agent
 
 import android.content.Context
 import com.pilot.agent.PilotApp
+import com.pilot.agent.query.SecretVault
 
 data class AgentSettings(
     val baseUrl: String = DEFAULT_BASE_URL,
     val apiKey: String = "",
+    val webSearchApiKey: String = "",
     val model: String = DEFAULT_MODEL,
     val maxTurns: Int = 25,
     val preferOnDevice: Boolean = true,
@@ -105,6 +107,7 @@ data class AgentSettings(
 
         private const val K_URL = "base_url"
         private const val K_KEY = "api_key"
+        private const val K_WEB_SEARCH_KEY = "brave_search_api_key"
         private const val K_MODEL = "model"
         private const val K_TURNS = "max_turns"
         private const val K_ONDEVICE = "prefer_ondevice"
@@ -152,6 +155,7 @@ data class AgentSettings(
             return AgentSettings(
                 baseUrl = p.getString(K_URL, null) ?: DEFAULT_BASE_URL,
                 apiKey = p.getString(K_KEY, null) ?: "",
+                webSearchApiKey = SecretVault.get(K_WEB_SEARCH_KEY),
                 model = p.getString(K_MODEL, null) ?: DEFAULT_MODEL,
                 maxTurns = p.getInt(K_TURNS, 25),
                 preferOnDevice = p.getBoolean(K_ONDEVICE, true),
@@ -209,6 +213,7 @@ data class AgentSettings(
                 .putString(K_MUSIC_URL, s.musicBaseUrl)
                 .putString(K_NETEASE_COOKIE, s.neteaseCookie)
                 .apply()
+            runCatching { SecretVault.put(K_WEB_SEARCH_KEY, s.webSearchApiKey) }
         }
 
         fun isAccessibilityEnabled(ctx: Context): Boolean {

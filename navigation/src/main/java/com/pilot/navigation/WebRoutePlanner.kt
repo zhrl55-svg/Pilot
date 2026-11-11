@@ -58,6 +58,8 @@ class WebRoutePlanner {
         fromLon: Double,
         toLat: Double,
         toLon: Double,
+        strategy: Int = 0,
+        avoidCongestion: Boolean = true,
         onResult: (Route) -> Unit,
         onError: (String) -> Unit,
     ) {
@@ -66,7 +68,14 @@ class WebRoutePlanner {
             // 高德的经纬度顺序是「经度,纬度」
             append("&origin=").append("$fromLon,$fromLat")
             append("&destination=").append("$toLon,$toLat")
-            append("&strategy=0")   // 0 = 推荐（速度最快+躲避拥堵）
+            // Web v3: 0=速度优先，3=距离优先，4=躲避拥堵。
+            val webStrategy = when (strategy) {
+                2 -> 3
+                1 -> 4
+                3 -> if (avoidCongestion) 20 else 19
+                else -> if (avoidCongestion) 4 else 0
+            }
+            append("&strategy=").append(webStrategy)
             append("&extensions=base")
         }
         val json = try {

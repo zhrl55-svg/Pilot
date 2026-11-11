@@ -29,11 +29,18 @@ class NavigationService : Service() {
 
     companion object {
         private const val TAG = "PilotNav"
+        private const val SDK_KEY_BACKOFF_MS = 30 * 60 * 1000L
+        private const val SDK_TRANSIENT_BACKOFF_MS = 60 * 1000L
+        private const val SDK_ROUTE_TIMEOUT_MS = 8_000L
         const val ACTION_BIND = "com.pilot.navigation.BIND"
 
         /** 全局引用（NavActivity 要拿它挂 moveCamera 回调）。 */
         @Volatile
         private var instance: NavigationService? = null
+
+        /** 本进程内熔断，避免 Key 无效或 SDK 服务异常时每次导航都阻塞用户。 */
+        @Volatile private var sdkBlockedUntil = 0L
+        @Volatile private var sdkBlockedReason = ""
 
         /**
          * 拿当前服务的定位器（**拿不到就创建并启动定位**）。
@@ -76,6 +83,7 @@ class NavigationService : Service() {
 
     private val callbacks = RemoteCallbackList<NavCallback>()
     private val jobs = java.util.concurrent.atomic.AtomicLong(1)
+    private val simulateNextRequest = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /** 高德引擎（懒初始化，避免服务起来就吃 100MB+ native）。 */
     private var engine: AmapNaviEngine? = null
@@ -98,6 +106,9 @@ class NavigationService : Service() {
 
         override fun startNavi(destination: String, strategy: Int): Long {
             val jobId = jobs.getAndIncrement()
+            val simulationMarker = java.io.File(filesDir, "nav_simulate_next")
+            val simulated = simulateNextRequest.getAndSet(false) || runCatching { simulationMarker.delete() }.getOrDefault(false)
+            if (simulated) NLog.i(TAG, "本次请求启用模拟导航")
             currentState = State.ROUTING
 
             // ★ 先查常去地点：「回家」「去公司」这种词直接命中收藏，
@@ -109,13 +120,16 @@ class NavigationService : Service() {
                 emit(jobId, "state", "导航去${fav.label}", priority = 0, stateName = currentState.toString())
                 // 收藏里已经有坐标，直接算路
                 java.util.concurrent.Executors.newSingleThreadExecutor().execute {
-                    val sdkOk = trySdkRouteFromFav(jobId, fav, strategy)
+                    val sdkOk = trySdkRouteFromFav(jobId, fav, strategy, simulated)
                     if (!sdkOk) {
                         webRoute().plan(
                             fromLat = locationProvider().lat, fromLon = locationProvider().lon,
                             toLat = fav.lat, toLon = fav.lon,
+                            strategy = strategy,
+                            avoidCongestion = NavigationSettings.load(this@NavigationService).avoidJam,
                             onResult = { r ->
                                 guide().start(r)
+                                if (simulated) guide().simulatePlayback()
                                 emit(jobId, "state", "开始导航", priority = 0, stateName = currentState.toString())
                             },
                             onError = { msg ->
@@ -156,7 +170,7 @@ class NavigationService : Service() {
             //   （local.properties 的键不会自动进 gradle project property，
             //   manifestPlaceholder 是空串——已修）。
             val onFound: (List<SdkPoiSearch.Candidate>) -> Unit = { candidates ->
-                onPoiResolved(jobId, candidates, loc, strategy)
+                onPoiResolved(jobId, candidates, loc, strategy, simulated)
             }
             val onFailed: (String) -> Unit = { msg ->
                 currentState = State.FAILED
@@ -181,6 +195,11 @@ class NavigationService : Service() {
                 },
             )
             return jobId
+        }
+
+        override fun startSimulatedNavi(destination: String): Long {
+            simulateNextRequest.set(true)
+            return startNavi(destination, AmapNaviEngine.STRATEGY_RECOMMEND)
         }
 
         override fun stopNavi(jobId: Long): Boolean {
@@ -260,6 +279,7 @@ class NavigationService : Service() {
         candidates: List<SdkPoiSearch.Candidate>,
         loc: LocationProvider,
         strategy: Int,
+        simulated: Boolean,
     ) {
         if (candidates.isEmpty()) {
             currentState = State.FAILED
@@ -279,7 +299,7 @@ class NavigationService : Service() {
         //   策略：SDK 发起算路，等 15 秒。成功就走 SDK（体验最好）；
         //   失败/超时自动降级 Web（保证一定能导航）。
         Thread {
-            val sdkOk = trySdkRoute(jobId, best, loc, strategy)
+            val sdkOk = trySdkRoute(jobId, best, loc, strategy, simulated)
             if (sdkOk) {
                 recordHistory(best.name, best.lat, best.lon, best.poiId)
             } else {
@@ -287,8 +307,11 @@ class NavigationService : Service() {
                 webRoute().plan(
                     fromLat = loc.lat, fromLon = loc.lon,
                     toLat = best.lat, toLon = best.lon,
+                    strategy = strategy,
+                    avoidCongestion = NavigationSettings.load(this).avoidJam,
                     onResult = { r ->
                         guide().start(r)
+                        if (simulated) guide().simulatePlayback()
                         emit(jobId, "state", "开始导航", priority = 0, stateName = currentState.toString())
                     },
                     onError = { msg ->
@@ -309,27 +332,59 @@ class NavigationService : Service() {
         best: SdkPoiSearch.Candidate,
         loc: LocationProvider,
         strategy: Int,
+        simulated: Boolean,
     ): Boolean {
         return try {
+            val now = System.currentTimeMillis()
+            if (now < sdkBlockedUntil) {
+                NLog.w(TAG, "SDK 算路熔断中，${(sdkBlockedUntil - now) / 1000}s 后重试：$sdkBlockedReason")
+                return false
+            }
+            val keyStatus = NavKeys.check(this)
+            if (keyStatus.contains("sdkKey=missing")) {
+                blockSdk("Android SDK Key 未注入", SDK_KEY_BACKOFF_MS)
+                return false
+            }
             val e = engine()
             e.init()
             if (!e.isReady()) {
                 NLog.w(TAG, "SDK 引擎没就绪，跳过")
+                blockSdk("SDK 引擎未就绪", SDK_TRANSIENT_BACKOFF_MS)
                 return false
             }
             e.startNaviToPoint(
                 best.name, best.lat, best.lon, strategy,
                 startLat = loc.lat, startLon = loc.lon,
                 poiId = best.poiId,
+                avoidCongestion = NavigationSettings.load(this).avoidJam,
+                simulated = simulated,
             )
             // 等算路回调（导航引擎线程池回调，用 CountDownLatch）
-            val ok = e.awaitRoute(15_000)
-            NLog.i(TAG, "SDK 算路结果=$ok")
+            val ok = e.awaitRoute(SDK_ROUTE_TIMEOUT_MS)
+            val error = e.lastRouteErrorCode
+            if (!ok) {
+                val keyError = error == 13 || error == 22
+                blockSdk(
+                    if (keyError) "高德 Key/安全码校验失败(error=$error)" else "SDK 算路未完成(error=${error ?: "timeout"})",
+                    if (keyError) SDK_KEY_BACKOFF_MS else SDK_TRANSIENT_BACKOFF_MS,
+                )
+            } else {
+                sdkBlockedUntil = 0L
+                sdkBlockedReason = ""
+            }
+            NLog.i(TAG, "SDK 算路结果=$ok error=${error ?: "none"}")
             ok
         } catch (t: Throwable) {
             NLog.w(TAG, "SDK 算路异常 ${t.message}")
+            blockSdk("SDK 算路异常", SDK_TRANSIENT_BACKOFF_MS)
             false
         }
+    }
+
+    private fun blockSdk(reason: String, durationMs: Long) {
+        sdkBlockedReason = reason
+        sdkBlockedUntil = System.currentTimeMillis() + durationMs
+        NLog.w(TAG, "SDK 算路进入熔断 ${durationMs / 1000}s：$reason；本次立即回退 Web 算路")
     }
 
     /**
@@ -355,23 +410,49 @@ class NavigationService : Service() {
         jobId: Long,
         fav: NavigationSettings.Favorite,
         strategy: Int,
+        simulated: Boolean,
     ): Boolean = try {
-        val e = engine()
-        e.init()
-        if (!e.isReady()) {
+        val now = System.currentTimeMillis()
+        if (now < sdkBlockedUntil) {
+            NLog.w(TAG, "SDK 算路熔断中，收藏点直接回退 Web")
+            false
+        } else if (NavKeys.check(this).contains("sdkKey=missing")) {
+            blockSdk("Android SDK Key 未注入", SDK_KEY_BACKOFF_MS)
             false
         } else {
-            val loc = locationProvider()
-            loc.start()
-            e.startNaviToPoint(
-                fav.label, fav.lat, fav.lon, strategy,
-                startLat = loc.lat, startLon = loc.lon,
-                poiId = fav.poiId,
-            )
-            e.awaitRoute(15_000)
+            val e = engine()
+            e.init()
+            if (!e.isReady()) {
+                blockSdk("SDK 引擎未就绪", SDK_TRANSIENT_BACKOFF_MS)
+                false
+            } else {
+                val loc = locationProvider()
+                loc.start()
+                e.startNaviToPoint(
+                    fav.label, fav.lat, fav.lon, strategy,
+                    startLat = loc.lat, startLon = loc.lon,
+                    poiId = fav.poiId,
+                    avoidCongestion = NavigationSettings.load(this).avoidJam,
+                    simulated = simulated,
+                )
+                val ok = e.awaitRoute(SDK_ROUTE_TIMEOUT_MS)
+                val error = e.lastRouteErrorCode
+                if (!ok) {
+                    val keyError = error == 13 || error == 22
+                    blockSdk(
+                        if (keyError) "高德 Key/安全码校验失败(error=$error)" else "SDK 算路未完成(error=${error ?: "timeout"})",
+                        if (keyError) SDK_KEY_BACKOFF_MS else SDK_TRANSIENT_BACKOFF_MS,
+                    )
+                } else {
+                    sdkBlockedUntil = 0L
+                    sdkBlockedReason = ""
+                }
+                ok
+            }
         }
     } catch (t: Throwable) {
         NLog.w(TAG, "收藏点算路异常 ${t.message}")
+        blockSdk("SDK 算路异常", SDK_TRANSIENT_BACKOFF_MS)
         false
     }
 
@@ -429,6 +510,16 @@ class NavigationService : Service() {
     /** 供界面层发起导航（历史再导航用）。 */
     fun startNaviFromOuter(destination: String, strategy: Int): Long =
         binder.startNavi(destination, strategy)
+
+    /** 设备端测试入口：下一次导航使用 SDK 模拟器；Web 回退时回放路线坐标。 */
+    fun startSimulatedNaviFromOuter(destination: String): Long {
+        simulateNextRequest.set(true)
+        return binder.startNavi(destination, AmapNaviEngine.STRATEGY_RECOMMEND)
+    }
+
+    fun routeOptions(): List<AmapNaviEngine.RouteOption> = engine?.routeOptions().orEmpty()
+
+    fun selectRoute(pathId: Long): Boolean = engine?.selectRoute(pathId) ?: false
 
     /**
      * 请求停止导航（供 NavActivity 的退出按钮调）。

@@ -88,6 +88,15 @@ class Speaker(context: Context) {
 
     fun speak(text: String) = speakInternal(text, isNav = false)
 
+    /** For compact multi-item search readouts that intentionally exceed the default one-sentence limit. */
+    fun speakExpanded(text: String) = speakInternal(text, isNav = false, maxChars = 500)
+
+    /** Private on-device readout for notification contents; never sends text to a cloud TTS provider. */
+    fun speakLocal(text: String) {
+        if (AgentSettings.load().ttsEngine == AgentSettings.TTS_OFF) return
+        speakInternal(text, isNav = false, forceSystem = true)
+    }
+
     /**
      * 轻量播报：**不占麦克风闸门**。
      *
@@ -119,7 +128,7 @@ class Speaker(context: Context) {
      * 实际播报。
      * @param isNav true = 导航播报（独占、播完释放锁）
      */
-    private fun speakInternal(text: String, isNav: Boolean) {
+    private fun speakInternal(text: String, isNav: Boolean, forceSystem: Boolean = false, maxChars: Int = 60) {
         val t = text.trim()
         if (t.isEmpty()) {
             if (isNav) onNavSpoken()
@@ -134,7 +143,9 @@ class Speaker(context: Context) {
         }
 
         val s = AgentSettings.load()
-        val engine: SpeechOutput = when (s.ttsEngine) {
+        val engine: SpeechOutput = if (forceSystem) {
+            system ?: SystemTts(appContext).also { system = it }
+        } else when (s.ttsEngine) {
             AgentSettings.TTS_OFF -> {
                 if (isNav) onNavSpoken()
                 return
@@ -153,7 +164,7 @@ class Speaker(context: Context) {
         }
 
         // 播报只说重点。UI 上的日志可以很长，念出来超过 10 秒就没人听了。
-        val spoken = if (t.length > 60) t.take(60) + "……" else t
+        val spoken = if (t.length > maxChars) t.take(maxChars) + "……" else t
 
         // ★ 通知导航界面「正在播报」（显示喇叭动画）
         runCatching { VoiceState.write(appContext, VoiceState.SPEAKING) }

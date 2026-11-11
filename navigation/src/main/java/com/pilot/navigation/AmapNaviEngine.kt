@@ -39,6 +39,8 @@ class AmapNaviEngine(
     private val onStateChange: (String) -> Unit,
 ) : AMapNaviListener {
 
+    data class RouteOption(val pathId: Long, val distanceMeters: Int, val durationSeconds: Int)
+
     companion object {
         private const val TAG = "PilotNavEngine"
 
@@ -76,14 +78,42 @@ class AmapNaviEngine(
 
     /** 算路是否成功（awaitRoute 用）。 */
     @Volatile private var routeOk = false
+    @Volatile private var routePending = false
+    @Volatile private var routeNaviType = NaviType.GPS
+
+    /** 最近一次 SDK 算路错误码，供服务层区分配置错误和临时网络错误。 */
+    @Volatile var lastRouteErrorCode: Int? = null
+        private set
 
     /** SDK 引擎是否可用（初始化成功）。 */
     fun isReady(): Boolean = started && navi != null
+
+    /** 当前 SDK 返回的备选路线摘要，供导航界面提供手动切换。 */
+    fun routeOptions(): List<RouteOption> = runCatching {
+        navi?.naviPaths?.values.orEmpty().mapNotNull { path ->
+            val id = path.pathid
+            if (id < 0) null else RouteOption(id, path.allLength, path.allTime)
+        }.distinctBy { it.pathId }
+    }.onFailure { NLog.w(TAG, "读取备选路线失败 ${it.message}") }.getOrDefault(emptyList())
+
+    fun selectRoute(pathId: Long): Boolean = runCatching {
+        val n = navi
+        if (n == null) false else {
+            n.selectMainPathID(pathId)
+            NLog.i(TAG, "切换备选路线 pathId=$pathId 已提交")
+            true
+        }
+    }.onFailure { NLog.w(TAG, "切换备选路线失败 ${it.message}") }.getOrDefault(false)
 
     /** 等算路结果，超时返回 false。 */
     fun awaitRoute(timeoutMs: Long): Boolean {
         val latch = routeLatch ?: return false
         val done = latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        if (!done) {
+            // SDK 偶发迟到回调不能在 Web 回退已经开始后又启动第二条导航。
+            routePending = false
+            NLog.w(TAG, "SDK 算路等待超时，忽略迟到的路线回调")
+        }
         return done && routeOk
     }
 
@@ -104,6 +134,10 @@ class AmapNaviEngine(
         runCatching {
             val n = AMapNavi.getInstance(context)
             n.addAMapNaviListener(this)
+            runCatching { n.setTrafficSignalEnable(true) }
+                .onFailure { NLog.w(TAG, "开启红绿灯信号数据失败 ${it.message}") }
+            runCatching { n.setMultipleRouteNaviMode(true) }
+                .onFailure { NLog.w(TAG, "开启多路线导航模式失败 ${it.message}") }
             // ★ 关内置语音：我们要用统一 TTS 队列（导航播报要能抢占普通播报，
             //   而且要占麦克风闸门防自问自答），SDK 内置语音做不到这些。
             runCatching { n.setUseInnerVoice(false) }
@@ -147,8 +181,13 @@ class AmapNaviEngine(
         startLon: Double = 0.0,
         /** POI ID（有就用 NaviPoi 重载，SDK 会找正确入口）。 */
         poiId: String? = null,
+        /** 按导航设置应用拥堵偏好。 */
+        avoidCongestion: Boolean = true,
+        /** 显式测试模式：使用 SDK 模拟定位推进路线。 */
+        simulated: Boolean = false,
     ) {
         val n = navi ?: return
+        NavKeys.check(context)
         // ★★ 起点/终点用 **String 重载**（"经度,纬度"），这是关键。
         //
         //   踩过的坑：用 `List<NaviLatLng>` 重载时算路稳定报
@@ -171,8 +210,17 @@ class AmapNaviEngine(
         //           26:F6:15:CD:A0:6C:08:F4:7A:4B:BA:70:A3:20:DD:07:47:D7:91:7A
         //           填不带冒号的会被判无效（2026-11-10 实测）。
         routeOk = false
+        routePending = true
+        routeNaviType = if (simulated) NaviType.EMULATOR else NaviType.GPS
+        lastRouteErrorCode = null
         routeLatch = java.util.concurrent.CountDownLatch(1)
-        val pathStrategy = PathPlanningStrategy.DRIVING_MULTIPLE_ROUTES_DEFAULT
+        // 多路线策略由 SDK 官方转换器生成，确保“躲避拥堵”开关实际参与算路。
+        val pathStrategy = when (strategy) {
+            STRATEGY_SHORTEST -> PathPlanningStrategy.DRIVING_SHORTEST_DISTANCE
+            STRATEGY_HIGHWAY -> n.strategyConvert(avoidCongestion, false, false, true, true)
+            STRATEGY_AVOID_JAM -> n.strategyConvert(true, false, false, false, true)
+            else -> n.strategyConvert(avoidCongestion, false, false, false, true)
+        }
         // ★ 算路**之前**设车辆信息（nav-agent 同款）：
         //   官方文档说 setCarInfo 影响「路径规划时会躲避车辆限行区域和路线」，
         //   所以必须在 calculateDriveRoute 之前生效，不能只在 init 里设一次。
@@ -203,8 +251,14 @@ class AmapNaviEngine(
             }
             NLog.i(
                 TAG,
-                "算路 起点($startLat,$startLon) → $name($lat,$lon) poiId=${poiId?.take(12)} ok=$ok",
+                "算路 起点($startLat,$startLon) → $name($lat,$lon) poiId=${poiId?.take(12)} simulated=$simulated ok=$ok",
             )
+            if (!ok) {
+                routePending = false
+                lastRouteErrorCode = -1
+                routeLatch?.countDown()
+                NLog.w(TAG, "SDK 未接受算路请求（同步返回 false）")
+            }
             onStateChange("正在规划去${name}的路线")
         }.onFailure {
             NLog.e(TAG, "算路失败", it)
@@ -262,13 +316,18 @@ class AmapNaviEngine(
     private fun onRouteCalculated() {
         routeOk = true
         routeLatch?.countDown()
+        if (!routePending) {
+            NLog.w(TAG, "忽略已超时/取消的 SDK 算路成功回调")
+            return
+        }
+        routePending = false
         if (stopRequested) return
         // ★ startNavi 必须在算路成功之后调——先 startNavi 再算路会返回 false。
         val n = navi ?: return
         runCatching {
             // startNavi 要传定位类型（GPS = 真机定位）
-            val ok = n.startNavi(NaviType.GPS)
-            NLog.i(TAG, "startNavi=$ok")
+            val ok = n.startNavi(routeNaviType)
+            NLog.i(TAG, "startNavi type=$routeNaviType ok=$ok")
             if (ok) onStateChange("开始导航")
         }.onFailure {
             NLog.e(TAG, "startNavi 异常", it)
@@ -278,6 +337,8 @@ class AmapNaviEngine(
 
     override fun onCalculateRouteFailure(error: Int) {
         routeOk = false
+        routePending = false
+        lastRouteErrorCode = error
         routeLatch?.countDown()
         if (stopRequested) return
         NLog.w(TAG, "算路失败 error=$error")
@@ -286,6 +347,8 @@ class AmapNaviEngine(
 
     override fun onCalculateRouteFailure(result: AMapCalcRouteResult?) {
         routeOk = false
+        routePending = false
+        lastRouteErrorCode = result?.errorCode
         routeLatch?.countDown()
         if (stopRequested) return
         NLog.w(TAG, "算路失败 errorCode=${result?.errorCode}")
@@ -453,27 +516,35 @@ class AmapNaviEngine(
     }
 
     override fun showCross(cross: com.amap.api.navi.model.AMapNaviCross?) {
+        NLog.i(TAG, "路口放大图回调 available=${cross != null}")
     }
 
     override fun hideCross() {
+        NLog.i(TAG, "路口放大图隐藏")
     }
 
     override fun showModeCross(cross: com.amap.api.navi.model.AMapModelCross?) {
+        NLog.i(TAG, "模型路口图回调 available=${cross != null}")
     }
 
     override fun hideModeCross() {
+        NLog.i(TAG, "模型路口图隐藏")
     }
 
     override fun showLaneInfo(laneInfo: Array<out com.amap.api.navi.model.AMapLaneInfo>?, laneBitmap: ByteArray?, laneBitmap2: ByteArray?) {
+        NLog.i(TAG, "车道信息回调 lanes=${laneInfo?.size ?: 0} bitmap=${laneBitmap?.size ?: 0}/${laneBitmap2?.size ?: 0}")
     }
 
     override fun showLaneInfo(laneInfo: com.amap.api.navi.model.AMapLaneInfo?) {
+        NLog.i(TAG, "单车道信息回调 available=${laneInfo != null}")
     }
 
     override fun hideLaneInfo() {
+        NLog.i(TAG, "车道信息隐藏")
     }
 
     override fun updateCameraInfo(cameraInfo: Array<out com.amap.api.navi.model.AMapNaviCameraInfo>?) {
+        NLog.i(TAG, "摄像头信息更新 count=${cameraInfo?.size ?: 0}")
     }
 
     override fun updateIntervalCameraInfo(
@@ -481,15 +552,18 @@ class AmapNaviEngine(
         intervalCameraInfo: com.amap.api.navi.model.AMapNaviCameraInfo?,
         index: Int,
     ) {
+        NLog.i(TAG, "区间摄像头信息更新 index=$index current=${cameraInfo != null} next=${intervalCameraInfo != null}")
     }
 
     override fun OnUpdateTrafficFacility(
         trafficFacilityInfo: Array<out com.amap.api.navi.model.AMapNaviTrafficFacilityInfo>?,
     ) {
+        NLog.i(TAG, "交通设施更新 count=${trafficFacilityInfo?.size ?: 0}")
     }
 
     override fun OnUpdateTrafficFacility(
         trafficFacilityInfo: com.amap.api.navi.model.AMapNaviTrafficFacilityInfo?,
     ) {
+        NLog.i(TAG, "交通设施更新 available=${trafficFacilityInfo != null}")
     }
 }

@@ -169,6 +169,7 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
     // 用 TextFieldValue 而不是 String：才能把光标放到句末
     var input by remember { mutableStateOf(TextFieldValue("")) }
     var showSettings by remember { mutableStateOf(false) }
+    var showClearChatConfirm by remember { mutableStateOf(false) }
     // 当前哪条消息处于文字选择态；点对话区空白处就清空（放弃选择）
     var selectingEntryId by remember { mutableStateOf<Long?>(null) }
     // ★ 最近一次长按的时间戳。松手时父级也会收到一次 tap，
@@ -197,6 +198,7 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
         Header(
             vm,
             onSettings = { showSettings = true },
+            onClearChat = { showClearChatConfirm = true },
             onNavOpen = {
                 // 直接拉起导航界面（NavActivity 在 :navigation 进程）
                 runCatching {
@@ -335,6 +337,24 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
         )
     }
 
+    if (showClearChatConfirm) {
+        AlertDialog(
+            onDismissRequest = { showClearChatConfirm = false },
+            title = { Text("清空聊天记录？") },
+            text = { Text("当前对话和用于上下文的聊天记录都会清除。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    vm.clearChat()
+                    selectingEntryId = null
+                    showClearChatConfirm = false
+                }) { Text("清空", color = colors.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearChatConfirm = false }) { Text("取消") }
+            },
+        )
+    }
+
     if (showSettings) {
         SettingsDialog(vm, onDismiss = { showSettings = false })
     }
@@ -374,7 +394,7 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
 }
 
 @Composable
-private fun Header(vm: AgentViewModel, onSettings: () -> Unit, onNavOpen: () -> Unit) {
+private fun Header(vm: AgentViewModel, onSettings: () -> Unit, onClearChat: () -> Unit, onNavOpen: () -> Unit) {
     val colors = MaterialTheme.colorScheme
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
         // ★ 老板要求：标题左侧不要圆点
@@ -394,6 +414,10 @@ private fun Header(vm: AgentViewModel, onSettings: () -> Unit, onNavOpen: () -> 
             TextButton(onClick = onNavOpen) {
                 Text("导航", fontSize = 13.sp)
             }
+            TextButton(
+                onClick = onClearChat,
+                enabled = vm.chatLogs.isNotEmpty() && !vm.running && !vm.justSent,
+            ) { Text("清屏", fontSize = 13.sp) }
             TextButton(onClick = onSettings) { Text("设置", fontSize = 13.sp) }
         }
     }
@@ -1306,8 +1330,10 @@ private fun SettingsDialog(
     vm: AgentViewModel,
     onDismiss: () -> Unit,
 ) {
+    val settingsContext = LocalContext.current
     var baseUrl by remember { mutableStateOf(vm.settings.baseUrl) }
     var apiKey by remember { mutableStateOf(vm.settings.apiKey) }
+    var webSearchApiKey by remember { mutableStateOf(vm.settings.webSearchApiKey) }
     var model by remember { mutableStateOf(vm.settings.model) }
     var maxTurns by remember { mutableStateOf(vm.settings.maxTurns.toString()) }
     var preferOnDevice by remember { mutableStateOf(vm.settings.preferOnDevice) }
@@ -1330,6 +1356,7 @@ private fun SettingsDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
+        containerColor = Color(0xFF000000),
         title = { Text("设置", fontSize = 16.sp) },
         text = {
             Column(
@@ -1480,10 +1507,41 @@ private fun SettingsDialog(
                     }
                 }
 
+                SettingsSection(
+                    title = "网络搜索",
+                    hint = "通用网页搜索使用 Brave Search API。填写 API Key 后，查询词会发送给 Brave；Key 由 AndroidKeyStore 加密保存。新闻主题搜索仍可使用 Google News RSS，不需要 Key。",
+                ) {
+                    SmallField(webSearchApiKey, { webSearchApiKey = it }, "Brave Search API Key", secret = true)
+                    Text("API Key 可在 Brave Search API Dashboard 申请。", fontSize = 11.sp, color = colors.onSurfaceVariant)
+                }
+
+                SettingsSection(
+                    title = "个人助理权限",
+                    hint = "通知读取权限是可选的，只在系统授权后缓存新通知，且通知正文不会保存到磁盘或发送给云端语音合成。提醒需要允许 Pilot 发通知。日历由系统日历应用打开，只有你在日历里点保存才会创建事件。",
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(if (vm.notificationAccess) "通知读取：已开启" else "通知读取：未授权", fontSize = 12.sp, modifier = Modifier.weight(1f))
+                        TextButton(onClick = {
+                            runCatching {
+                                settingsContext.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                            }
+                        }) { Text(if (vm.notificationAccess) "管理" else "开启", fontSize = 12.sp) }
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(if (vm.reminderNotificationsAllowed) "提醒通知：可用" else "提醒通知：未授权", fontSize = 12.sp, modifier = Modifier.weight(1f))
+                        TextButton(onClick = {
+                            val intent = if (android.os.Build.VERSION.SDK_INT >= 26) {
+                                Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, settingsContext.packageName)
+                            } else Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:${settingsContext.packageName}"))
+                            runCatching { settingsContext.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+                        }) { Text("管理", fontSize = 12.sp) }
+                    }
+                }
+
                 // ---------------- 音乐 ----------------
                 SettingsSection(
                     title = "音乐",
-                    hint = "未登录只能播 30 秒试听。登录后 cookie 存在本机，不落服务器。",
+                    hint = "网页端登录不会自动同步到 Pilot；请在这里扫码登录。会员播放需要有效 Cookie，且仅保存在本机。",
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
@@ -1591,6 +1649,7 @@ private fun SettingsDialog(
                     vm.settings.copy(
                         baseUrl = baseUrl.trim(),
                         apiKey = apiKey.trim(),
+                        webSearchApiKey = webSearchApiKey.trim(),
                         model = model.trim(),
                         maxTurns = maxTurns.toIntOrNull()?.coerceIn(3, 60) ?: 25,
                         preferOnDevice = preferOnDevice,

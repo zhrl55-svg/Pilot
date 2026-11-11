@@ -6,11 +6,11 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
 
 private val PilotColorScheme = darkColorScheme(
-    primary = Color(0xFF6FD3C0),
-    onPrimary = Color(0xFF06201C),
-    primaryContainer = Color(0xFF13332E),
-    onPrimaryContainer = Color(0xFF9BE8D8),
-    secondary = Color(0xFF8AA0B8),
+    primary = Color(0xFF78A9FF),
+    onPrimary = Color(0xFF081A33),
+    primaryContainer = Color(0xFF19345B),
+    onPrimaryContainer = Color(0xFFBBD3FF),
+    secondary = Color(0xFF9BB9E8),
     background = Color(0xFF0E1116),
     onBackground = Color(0xFFE7EBF2),
     surface = Color(0xFF161A21),

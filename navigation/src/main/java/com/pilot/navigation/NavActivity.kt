@@ -60,6 +60,7 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
         private const val INITIAL_ZOOM = 14f
 
         const val EXTRA_DEST = "dest"
+        const val EXTRA_SIMULATE = "simulate"
 
         /** 当前活着的界面（到达自动退出时用）。 */
         @Volatile private var current: NavActivity? = null
@@ -90,6 +91,9 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
 
     /** 转弯提示框下方的搜索面板。 */
     private var searchPanel: SearchPanel? = null
+
+    /** 高德退出导航时会紧接着发 onAMapNaviViewExit；等用户确认前不能 finish Activity。 */
+    @Volatile private var exitConfirmationPending = false
 
     /** 根容器（Compose 设置面板要挂到这上面，不能挂 Dialog）。 */
     private var contentRoot: FrameLayout? = null
@@ -136,6 +140,12 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
         runCatching {
             val v = AMapNaviView(this)
             v.onCreate(savedInstanceState)
+            // 默认关闭倒计时气泡会导致路口只显示信号灯图标，没有秒数。
+            runCatching {
+                v.setTrafficLightsVisible(true)
+                v.setShowTrafficLightView(true)
+                NLog.i(TAG, "路线红绿灯与倒计时气泡已开启")
+            }.onFailure { NLog.w(TAG, "开启红绿灯倒计时显示失败 ${it.message}") }
             // ★ 必须注册 listener——否则「退出/设置」按钮点了没反应
             v.setAMapNaviViewListener(this)
             root.addView(v)
@@ -185,6 +195,13 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
 
         // Pilot 自己的按钮栏
         root.addView(buildPilotBar())
+
+        // 显式设备测试入口：adb am start --es dest ... --ez simulate true
+        val testDestination = intent.getStringExtra(EXTRA_DEST).orEmpty().trim()
+        if (intent.getBooleanExtra(EXTRA_SIMULATE, false) && testDestination.isNotBlank()) {
+            NLog.i(TAG, "收到模拟导航测试请求 destination=$testDestination")
+            root.postDelayed({ startNaviWithRetry(testDestination, attempt = 0, simulated = true) }, 1800L)
+        }
 
         // ★ 地图默认停在北京市——必须手动 moveCamera 到当前位置。
         //
@@ -287,6 +304,7 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
             gravity = Gravity.CENTER
         }
         side.addView(buildVoiceButton())
+        side.addView(roundButton("🛣") { showRouteChoices() })
         side.addView(roundButton("🕘") { showHistoryDialog() })
         side.addView(roundButton("🏠") { onHomeButton() })
         side.addView(roundButton("✕") { onExitApp() })
@@ -297,6 +315,22 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
         ).apply {
             gravity = Gravity.CENTER_VERTICAL or Gravity.END
             rightMargin = dp(8)
+        })
+
+        // 覆盖高德底栏左侧退出热区：部分 SDK 页面直接触发 onAMapNaviViewExit，
+        // 不经过 onNaviCancel，宿主无法显示“结束导航/取消”。保留原样式，只接管点击。
+        wrap.addView(View(this).apply {
+            contentDescription = "退出导航"
+            isClickable = true
+            setOnClickListener {
+                val active = NavigationService.peek()?.currentState in
+                    setOf(NavigationService.State.ROUTING, NavigationService.State.NAVIGATING)
+                if (active) requestEndNaviConfirmation() else onAMapNaviViewExit()
+            }
+        }, FrameLayout.LayoutParams(dp(74), dp(58)).apply {
+            gravity = Gravity.BOTTOM or Gravity.START
+            leftMargin = dp(4)
+            bottomMargin = dp(9)
         })
 
         pilotBar = side
@@ -447,11 +481,14 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
      *   直接调就是静默失败——**老板报的「选定后没有规划路线」就是这个**。
      *   重试 3 次、每次 300ms，覆盖服务冷启动。
      */
-    private fun startNaviWithRetry(destination: String, attempt: Int) {
+    private fun startNaviWithRetry(destination: String, attempt: Int, simulated: Boolean = false) {
         val svc = NavigationService.peek()
         if (svc != null) {
-            val jobId = runCatching { svc.startNaviFromOuter(destination, 0) }.getOrDefault(0L)
-            NLog.i(TAG, "发起导航「$destination」jobId=$jobId（第 ${attempt + 1} 次尝试）")
+            val jobId = runCatching {
+                if (simulated) svc.startSimulatedNaviFromOuter(destination)
+                else svc.startNaviFromOuter(destination, 0)
+            }.getOrDefault(0L)
+            NLog.i(TAG, "发起${if (simulated) "模拟" else "真实"}导航「$destination」jobId=$jobId（第 ${attempt + 1} 次尝试）")
             if (jobId != 0L) {
                 toast("正在规划去$destination 的路线")
                 return
@@ -461,7 +498,7 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
         }
         if (attempt < 3) {
             window.decorView.postDelayed({
-                startNaviWithRetry(destination, attempt + 1)
+                startNaviWithRetry(destination, attempt + 1, simulated)
             }, 300)
         } else {
             NLog.e(TAG, "发起导航失败：服务一直没就绪")
@@ -534,17 +571,13 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
      *   高德的按钮只负责「通知宿主」，具体做什么由我们自己决定。
      */
     override fun onNaviCancel() {
-        NLog.i(TAG, "高德界面：退出导航 → 弹确认框")
-        // ★ 老板要求：底部「退出」弹出**「结束导航」确认框**。
-        //
-        //   为什么必须弹框（而不是直接结束）：
-        //   高德的退出按钮点下去，它内部会**立刻 finish 掉 NavActivity**
-        //   （日志实测 onNaviCancel → 1ms 后 onAMapNaviViewExit → onDestroy）。
-        //   所以要在它销毁之前弹框，用户确认后才走「结束导航」流程
-        //   （结束导航 + 重建地图界面）。
-        //
-        //   副作用：高德点退出后会先把底部切成「退出/继续导航/设置」的浏览模式，
-        //   如果用户选「继续导航」，点一下就是恢复，体验可接受。
+        requestEndNaviConfirmation()
+    }
+
+    private fun requestEndNaviConfirmation() {
+        if (exitConfirmationPending || isFinishing || isDestroyed) return
+        exitConfirmationPending = true
+        NLog.i(TAG, "导航退出请求 → 宿主显示结束/取消确认")
         showEndNaviConfirm()
     }
 
@@ -557,16 +590,29 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
     private fun showEndNaviConfirm() {
         android.app.AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("结束导航")
-            .setMessage("要结束导航吗？地图会保留，可以继续搜别的地方。")
+            .setMessage("要结束当前导航吗？")
             .setPositiveButton("结束导航") { _, _ ->
                 NLog.i(TAG, "用户确认结束导航")
+                exitConfirmationPending = false
                 endNaviKeepMap()
+                finish()
             }
-            .setNegativeButton("继续导航", null)
+            .setNegativeButton("取消") { _, _ ->
+                NLog.i(TAG, "用户取消结束导航，继续当前路线")
+                exitConfirmationPending = false
+            }
+            .setOnCancelListener {
+                NLog.i(TAG, "用户关闭结束导航确认框，继续当前路线")
+                exitConfirmationPending = false
+            }
             .show()
     }
 
     override fun onAMapNaviViewExit() {
+        if (exitConfirmationPending) {
+            NLog.i(TAG, "忽略高德退出回调，等待用户选择结束或取消")
+            return
+        }
         NLog.i(TAG, "高德界面：视图退出")
         stopNaviAndFinish()
     }
@@ -599,6 +645,7 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
     override fun onNaviBackClick(): Boolean {
         // 返回键：结束导航但不退出地图（和底部「退出」一致）
         endNaviKeepMap()
+        finish()
         return true
     }
 
@@ -694,6 +741,33 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
             .setTitle("导航历史")
             .setView(scroll)
             .setPositiveButton("关闭", null)
+            .show()
+    }
+
+    /** 展示高德 SDK 当前可用的备选路线并切换主路线。 */
+    private fun showRouteChoices() {
+        val routes = NavigationService.peek()?.routeOptions().orEmpty()
+        if (routes.isEmpty()) {
+            toast("当前没有可选备选路线")
+            return
+        }
+        val labels = routes.mapIndexed { index, route ->
+            val km = "%.1f 公里".format(route.distanceMeters / 1000.0)
+            val minutes = ((route.durationSeconds + 59) / 60).coerceAtLeast(1)
+            "路线 ${index + 1}　$km　约 $minutes 分钟"
+        }.toTypedArray()
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("选择路线")
+            .setItems(labels) { dialog, which ->
+                val selected = routes[which]
+                if (NavigationService.peek()?.selectRoute(selected.pathId) == true) {
+                    toast("已切换到路线 ${which + 1}")
+                } else {
+                    toast("路线切换失败")
+                }
+                dialog.dismiss()
+            }
+            .setNegativeButton("取消", null)
             .show()
     }
 

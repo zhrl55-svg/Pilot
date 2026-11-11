@@ -25,6 +25,9 @@ interface INavigationService {
      */
     long startNavi(String destination, int strategy);
 
+    /** 仅供设备诊断触发模拟导航，目的地解析和路线规划流程与正式导航一致。 */
+    long startSimulatedNavi(String destination);
+
     /** 停止导航。 */
     boolean stopNavi(long jobId);
 

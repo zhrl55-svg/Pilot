@@ -134,6 +134,11 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     var accessibilityOn by mutableStateOf(false)
         private set
 
+    var notificationAccess by mutableStateOf(false)
+        private set
+    var reminderNotificationsAllowed by mutableStateOf(true)
+        private set
+
     var skillCount by mutableStateOf(0)
         private set
 
@@ -293,6 +298,11 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
 
     fun refreshStatus() {
         accessibilityOn = AgentSettings.isAccessibilityEnabled(getApplication())
+        notificationAccess = com.pilot.agent.service.NotificationInbox.isPermissionEnabled(getApplication())
+        reminderNotificationsAllowed = android.os.Build.VERSION.SDK_INT < 33 ||
+            getApplication<Application>().checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (reminderNotificationsAllowed) com.pilot.agent.action.ReminderManager.rescheduleAll(getApplication())
         skillCount = AgentRuntime.skills.all().size
         // ★ cookie 存在但 neteaseNick 为空（App 重启后）时，查一次昵称。
         //   原来昵称只在扫码成功那一刻赋值，重启后设置页就一直显示"未登录"（老板反馈）。
@@ -738,7 +748,9 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 chat(text)
             } else {
                 add(LogEntry.Kind.DONE, answer)
-                AgentRuntime.speaker.speak(answer)
+                val spokenSummary = com.pilot.agent.query.QueryEngine.speechSummary(answer)
+                if (spokenSummary != null) AgentRuntime.speaker.speakExpanded(spokenSummary)
+                else AgentRuntime.speaker.speak(answer)
             }
         }
     }
@@ -955,6 +967,12 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         add(LogEntry.Kind.OBSERVE, "技能库已清空")
     }
 
+    /** Clear visible conversation and its in-memory context together. */
+    fun clearChat() {
+        logs.clear()
+        chatHistory.clear()
+    }
+
     private fun handle(ev: AgentEvent) {
         syncSpeaking()
         when (ev) {
@@ -970,7 +988,8 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 add(LogEntry.Kind.DONE, text)
                 running = false
                 justSent = false
-                AgentRuntime.speaker.speak(text)
+                if (text.startsWith("最近的通知")) AgentRuntime.speaker.speakLocal(text)
+                else AgentRuntime.speaker.speak(text)
                 refreshStatus()
             }
             is AgentEvent.Failed -> {

@@ -77,13 +77,12 @@ class SearchPanel(
         val wrap = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
+                (activity.resources.displayMetrics.widthPixels / 2 - dp(24)).coerceAtLeast(dp(160)),
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             ).apply {
                 // 贴在转向提示框下方（高德顶部提示约 150dp 高）
                 topMargin = dp(158)
-                leftMargin = dp(12)
-                rightMargin = dp(12)
+                gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
             }
         }
 
@@ -95,10 +94,10 @@ class SearchPanel(
             textSize = 15f
             setSingleLine(true)
             imeOptions = EditorInfo.IME_ACTION_SEARCH
-            setPadding(dp(14), dp(10), dp(14), dp(10))
-            // 灰色系：浅灰底 + 中灰描边
+            setPadding(dp(14), dp(10), dp(42), dp(10))
+            // 80% 透明白底，保留深色文字与描边确保地图上仍可读。
             background = GradientDrawable().apply {
-                setColor(Color.parseColor("#E6EEEEEE"))
+                setColor(Color.parseColor("#33FFFFFF"))
                 cornerRadius = dp(10).toFloat()
                 setStroke(dp(1), Color.parseColor("#BDBDBD"))
             }
@@ -107,6 +106,7 @@ class SearchPanel(
                 override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
                 override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
                 override fun afterTextChanged(s: Editable?) {
+                    clearButton?.visibility = if (s.isNullOrEmpty()) View.GONE else View.VISIBLE
                     scheduleSearch(s?.toString()?.trim().orEmpty())
                 }
             })
@@ -119,7 +119,25 @@ class SearchPanel(
             }
         }
         input = box
-        wrap.addView(box)
+        val inputFrame = FrameLayout(activity)
+        inputFrame.addView(box, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+        ))
+        val clear = TextView(activity).apply {
+            text = "×"
+            textSize = 24f
+            gravity = Gravity.CENTER
+            setTextColor(Color.parseColor("#6C6C6C"))
+            contentDescription = "清除搜索文字"
+            visibility = View.GONE
+            isClickable = true
+            setOnClickListener { input?.text?.clear() }
+        }
+        clearButton = clear
+        inputFrame.addView(clear, FrameLayout.LayoutParams(dp(40), ViewGroup.LayoutParams.MATCH_PARENT).apply {
+            gravity = Gravity.END or Gravity.CENTER_VERTICAL
+        })
+        wrap.addView(inputFrame)
 
         // ---- 结果列表 ----
         val listWrap = ScrollView(activity).apply {
@@ -148,6 +166,7 @@ class SearchPanel(
     }
 
     private var resultScroll: ScrollView? = null
+    private var clearButton: TextView? = null
 
     /** 防抖：停止输入 600ms 才搜。 */
     private fun scheduleSearch(q: String) {

@@ -70,6 +70,17 @@ object NavigationClient {
         }
     }
 
+    /** 设备诊断入口：启动与正式流程相同的路线，但使用模拟定位。 */
+    suspend fun startSimulatedNavi(context: Context, destination: String): Long {
+        val svc = ensureBound(context) ?: return 0L
+        return try {
+            svc.startSimulatedNavi(destination)
+        } catch (t: Throwable) {
+            Dbg.w(TAG, "startSimulatedNavi 异常 ${t.message}")
+            0L
+        }
+    }
+
     fun stopNavi(jobId: Long): Boolean {
         val svc = service ?: return false
         return runCatching { svc.stopNavi(jobId) }.getOrDefault(false)
