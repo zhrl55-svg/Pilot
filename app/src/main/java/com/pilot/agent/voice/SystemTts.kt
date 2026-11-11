@@ -137,8 +137,10 @@ class SystemTts(context: Context) : SpeechOutput {
             t.voices?.forEach { v ->
                 val name = v.name ?: return@forEach
                 val loc = v.locale ?: return@forEach
-                // 只列中文音色（和播报用途一致），但中文判断放宽到 zh
-                if (loc.language.startsWith("zh")) {
+                // ★ 列出**所有**中文相关音色：zh、zh-CN、zh-TW、zh-HK，
+                //   还有 cmn（官话）等 language 标签。只按 startsWith("zh") 会漏掉一部分。
+                val lang = loc.language.lowercase()
+                if (lang.startsWith("zh") || lang == "cmn" || lang.startsWith("yue")) {
                     out += SystemVoice(
                         name = name,
                         needsNetwork = v.isNetworkConnectionRequired,
@@ -160,6 +162,31 @@ class SystemTts(context: Context) : SpeechOutput {
             }
         }
         return out.sortedBy { it.name }
+    }
+
+    /**
+     * 用指定音色播一段样音（预听），播完切回原来的音色。
+     *
+     * 系统的 setVoice 是全局的，所以要先记住原音色。
+     */
+    fun preview(text: String, voiceName: String) {
+        val t = tts ?: return
+        if (voiceName.isBlank()) return
+        val original = runCatching { t.voice?.name }.getOrNull()
+        runCatching {
+            val v = t.voices?.firstOrNull { it.name == voiceName } ?: return
+            if (t.setVoice(v) != TextToSpeech.SUCCESS) return
+            t.speak(text, TextToSpeech.QUEUE_FLUSH, null, "preview_${System.currentTimeMillis()}")
+            // 播完切回
+            main.postDelayed({
+                runCatching {
+                    original?.let { name ->
+                        t.voices?.firstOrNull { it.name == name }?.let { t.setVoice(it) }
+                    }
+                }
+            }, 3500)
+            Dbg.i(TAG, "系统 TTS 预览音色：$voiceName")
+        }
     }
 
     /** 切到指定音色（名字为空 = 用引擎默认）。 */

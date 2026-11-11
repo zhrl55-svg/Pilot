@@ -15,6 +15,15 @@
     <!-- 端侧语音识别需要自己持有麦克风（AudioRecord），系统 SpeechRecognizer 会被抢占 -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
+    <!-- 沙箱挂载目录：SAF 选目录需要存储读权限；
+         MANAGE_EXTERNAL_STORAGE 让 proot 能 bind 共享存储下的目录。 -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+
     <!-- ========== 系统能力直调：音量 / 亮度 / 电话 / 联系人 ========== -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.CALL_PHONE" />

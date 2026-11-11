@@ -171,14 +171,38 @@ class MiniMaxTts(private val context: Context) : SpeechOutput {
         currentFile = null
     }
 
-    private fun synth(text: String, s: AgentSettings): ByteArray? {
+    /**
+     * 用**指定音色**合成一段话（预听用），不改变当前设置。
+     */
+    fun preview(text: String, voiceId: String, onDone: () -> Unit) {
+        val s = AgentSettings.load()
+        if (s.apiKey.isBlank()) {
+            Dbg.w(TAG, "预览失败：没有 API Key")
+            onDone()
+            return
+        }
+        val gen = ++playGen
+        Thread {
+            val bytes = synth(text, s, voiceId)
+            if (bytes == null || bytes.isEmpty()) {
+                Dbg.w(TAG, "预览合成失败：$lastError")
+                main.post { onDone() }
+                return@Thread
+            }
+            main.post {
+                if (gen == playGen) play(bytes, onDone, { onDone() }) else onDone()
+            }
+        }.apply { name = "mm-tts-preview"; isDaemon = true }.start()
+    }
+
+    private fun synth(text: String, s: AgentSettings, voiceOverride: String? = null): ByteArray? {
         val payload = JSONObject()
             .put("model", s.ttsModel)
             .put("text", text)
             .put(
                 "voice_setting",
                 JSONObject()
-                    .put("voice_id", s.ttsVoiceId)
+                    .put("voice_id", voiceOverride ?: s.ttsVoiceId)
                     .put("speed", 1.0)
                     .put("vol", 1.0)
                     .put("pitch", 0)

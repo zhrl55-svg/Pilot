@@ -580,6 +580,35 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             .onFailure { add(LogEntry.Kind.ERROR, "挂载失败：${it.message}") }
     }
 
+    /**
+     * 手动添加挂载目录（直接给 POSIX 路径）。
+     *
+     * ★ 为什么要有这条：SAF 的 OpenDocumentTree 在部分 ROM（华为）上
+     *   不弹选择器或返回空 uri，"添加挂载目录"点了没反应（实测）。
+     *   而 proot bind mount 真正需要的只是宿主 POSIX 路径，
+     *   所以直接让用户填路径更稳。
+     */
+    fun mountSandboxPath(path: String, displayName: String) {
+        val p = path.trim()
+        if (!p.startsWith("/")) {
+            add(LogEntry.Kind.ERROR, "路径要以 / 开头，例如 /storage/emulated/0/Download")
+            return
+        }
+        val store = com.pilot.agent.sandbox.SandboxStores.mountedFolders(getApplication())
+        val name = displayName.ifBlank { p.trimEnd('/').substringAfterLast('/') }
+        runCatching {
+            store.add(name, p)
+            // 确认路径真的存在，别挂了个空目录进去
+            if (!java.io.File(p).isDirectory) {
+                throw IllegalStateException("目录不存在：$p")
+            }
+        }.onSuccess {
+            add(LogEntry.Kind.OBSERVE, "已挂载「$name」→ $p，重启沙箱进程后生效")
+        }.onFailure {
+            add(LogEntry.Kind.ERROR, "挂载失败：${it.message}")
+        }
+    }
+
     fun unmountSandboxFolder(name: String) {
         com.pilot.agent.sandbox.SandboxStores.mountedFolders(getApplication()).removeByName(name)
         add(LogEntry.Kind.OBSERVE, "已移除挂载「$name」")
@@ -824,6 +853,12 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
      * - 任务在跑 → 中止；
      * - 两个都在发生 → 两个都停。
      */
+    /** 预听音色（不改变当前设置）。 */
+    fun previewVoice(engine: String, voiceId: String) {
+        AgentRuntime.speaker.previewVoice(engine, voiceId)
+        add(LogEntry.Kind.OBSERVE, "正在试听该音色…")
+    }
+
     /** 音乐：暂停 / 继续 */
     fun toggleMusic() {
         val mp = com.pilot.agent.music.MusicPlayer.get(getApplication())

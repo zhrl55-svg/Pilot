@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
@@ -1043,6 +1044,155 @@ private fun SettingsSection(
 /**
  * 选项按钮组。选中态必须有底色——原来只改文字颜色，一眼看不出当前选的是哪个。
  */
+/**
+ * 下拉选择器（自绘，不用第三方库）。
+ *
+ * 音色有十几个，横向排不下，所以用下拉。
+ * 点击展开浮层列表，选中即收起。
+ */
+@Composable
+private fun DropdownSelector(
+    label: String,
+    options: List<Pair<String, String>>,
+    selected: String,
+    onSelect: (String) -> Unit,
+    placeholder: String = "请选择",
+    /** 预听：传入音色 key 就播一段样音 */
+    onPreview: ((String) -> Unit)? = null,
+) {
+    val colors = MaterialTheme.colorScheme
+    var expanded by remember { mutableStateOf(false) }
+    val currentLabel = options.firstOrNull { it.first == selected }?.second ?: placeholder
+
+    Box {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(colors.surface, RoundedCornerShape(10.dp))
+                .clickable { expanded = !expanded }
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+        ) {
+            Text(
+                label,
+                fontSize = 12.sp,
+                color = colors.onSurfaceVariant,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                currentLabel,
+                fontSize = 12.sp,
+                color = if (options.isEmpty()) colors.onSurfaceVariant else colors.onSurface,
+                fontWeight = FontWeight.Medium,
+            )
+            Spacer(Modifier.width(6.dp))
+            Text(
+                if (expanded) "▴" else "▾",
+                fontSize = 11.sp,
+                color = colors.onSurfaceVariant,
+            )
+        }
+
+        // ★ 浮层用 Dialog 承载：普通 Box 叠层会被设置列表后面的内容盖住
+        //   （层级不够 / 被裁剪），Dialog 是独立窗口，一定在最上层。
+        if (expanded) {
+            androidx.compose.ui.window.Dialog(
+                onDismissRequest = { expanded = false },
+                properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false),
+            ) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Box(
+                        Modifier
+                            .matchParentSize()
+                            .background(androidx.compose.ui.graphics.Color(0x66000000))
+                            .clickable { expanded = false },
+                    )
+                    Surface(
+                        color = colors.surface,
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.widthIn(min = 240.dp, max = 340.dp),
+                    ) {
+                        Column(
+                            Modifier
+                                .heightIn(max = 380.dp)
+                                .verticalScroll(rememberScrollState()),
+                        ) {
+                            Text(
+                                label,
+                                fontSize = 12.sp,
+                                color = colors.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                            )
+                            androidx.compose.material3.HorizontalDivider(
+                                color = colors.outlineVariant.copy(alpha = 0.4f),
+                            )
+                            options.forEach { (key, text) ->
+                                val active = key == selected
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .background(
+                                            if (active) colors.primary.copy(alpha = 0.12f) else Color.Transparent,
+                                        )
+                                        .clickable {
+                                            onSelect(key)
+                                            expanded = false
+                                        }
+                                        .padding(start = 14.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
+                                ) {
+                                    Text(
+                                        text,
+                                        fontSize = 13.sp,
+                                        color = if (active) colors.primary else colors.onSurface,
+                                        fontWeight = if (active) FontWeight.Medium else FontWeight.Normal,
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    // ★ 预听按钮：点喇叭只播样音，不改当前选择
+                                    if (onPreview != null) {
+                                        // ★ 试听按钮不能和外层的"选中"点击冲突：
+                                        //   TextButton 在 Row 里，点击会同时触发外层 Row 的 clickable
+                                        //   → 变成"选中音色"，浮层收起、试听没跑（实测）。
+                                        //   办法：试听做成纯 Text + 自己的 pointerInput，
+                                        //   在手势层就消费掉事件，不让它冒泡到外层。
+                                        Text(
+                                            "试听",
+                                            fontSize = 11.sp,
+                                            color = colors.primary,
+                                            modifier = Modifier
+                                                .pointerInput(key) {
+                                                    awaitEachGesture {
+                                                        awaitFirstDown(requireUnconsumed = false)
+                                                        awaitFirstDown(requireUnconsumed = true)
+                                                        // 消费掉这次点击
+                                                        while (true) {
+                                                            val ev = awaitPointerEvent()
+                                                            if (ev.changes.any { it.changedToUpIgnoreConsumed() }) break
+                                                        }
+                                                        onPreview(key)
+                                                    }
+                                                }
+                                                .padding(horizontal = 10.dp, vertical = 9.dp),
+                                        )
+                                    }
+                                }
+                            }
+                            if (options.isEmpty()) {
+                                Text(
+                                    "（没有可用音色）",
+                                    fontSize = 12.sp,
+                                    color = colors.onSurfaceVariant,
+                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 private fun OptionChips(
     options: List<Pair<String, String>>,
@@ -1289,35 +1439,31 @@ private fun SettingsDialog(
                     //   只显示当前引擎对应的那一个。
                     when (ttsEngine) {
                         AgentSettings.TTS_MINIMAX -> {
-                            Text(
-                                "MiniMax 音色",
-                                fontSize = 12.sp,
-                                color = colors.onSurfaceVariant,
-                            )
-                            OptionChips(
+                            DropdownSelector(
+                                label = "MiniMax 音色",
                                 options = com.pilot.agent.voice.MiniMaxTts.VOICES.map { it.id to it.label },
                                 selected = ttsVoiceId,
                                 onSelect = { ttsVoiceId = it },
+                                onPreview = { id ->
+                                    vm.previewVoice(AgentSettings.TTS_MINIMAX, id)
+                                },
                             )
                         }
                         AgentSettings.TTS_SYSTEM -> {
-                            Text(
-                                "系统音色",
-                                fontSize = 12.sp,
-                                color = colors.onSurfaceVariant,
+                            DropdownSelector(
+                                label = "系统音色",
+                                options = listOf("" to "默认（引擎自带）") +
+                                    vm.systemVoices.mapIndexed { i, v -> v.name to v.label(i) },
+                                selected = systemVoice,
+                                onSelect = { systemVoice = it },
+                                placeholder = if (vm.systemVoices.isEmpty()) "正在读取引擎音色…" else "请选择",
+                                onPreview = { id ->
+                                    if (id.isNotBlank()) {
+                                        vm.previewVoice(AgentSettings.TTS_SYSTEM, id)
+                                    }
+                                },
                             )
-                            if (vm.systemVoices.isEmpty()) {
-                                Hint("正在读取系统引擎的音色…")
-                            } else {
-                                OptionChips(
-                                    // ★ 华为引擎的音色 name 就是 "zh"，看不出区别。
-                                    //   用 quality + 网络标记做可辨识的标签。
-                                    options = listOf("" to "默认") +
-                                        vm.systemVoices.mapIndexed { i, v -> v.name to v.label(i) },
-                                    selected = systemVoice,
-                                    onSelect = { systemVoice = it },
-                                )
-                            }
+                            Hint("不同手机的系统音色不一样，这里列的是本机引擎实际提供的全部中文音色。")
                         }
                     }
                     Text(
@@ -1406,8 +1552,42 @@ private fun SettingsDialog(
                                 }
                             }
                         }
-                        TextButton(onClick = { mountPicker.launch(null) }) {
-                            Text("添加挂载目录", fontSize = 12.sp)
+                        // ★ 手动填路径：SAF 选择器在部分 ROM 上不弹/不返回，
+                        //   而 proot 真正需要的只是宿主 POSIX 路径，所以留这条兜底。
+                        var addPathDialog by remember { mutableStateOf(false) }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            TextButton(onClick = { mountPicker.launch(null) }) {
+                                Text("选目录添加", fontSize = 12.sp)
+                            }
+                            TextButton(onClick = { addPathDialog = true }) {
+                                Text("手动填路径", fontSize = 12.sp)
+                            }
+                        }
+                        if (addPathDialog) {
+                            var pathText by remember { mutableStateOf("/storage/emulated/0/Download") }
+                            var nameText by remember { mutableStateOf("") }
+                            AlertDialog(
+                                onDismissRequest = { addPathDialog = false },
+                                title = { Text("添加挂载目录", fontSize = 16.sp) },
+                                text = {
+                                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        SmallField(pathText, { pathText = it }, "目录路径", KeyboardType.Text)
+                                        SmallField(nameText, { nameText = it }, "名称（可留空）", KeyboardType.Text)
+                                        Hint("只能是共享存储下的路径，如 /storage/emulated/0/Download。")
+                                    }
+                                },
+                                confirmButton = {
+                                    TextButton(onClick = {
+                                        vm.mountSandboxPath(pathText, nameText)
+                                        addPathDialog = false
+                                    }) { Text("添加", fontSize = 12.sp) }
+                                },
+                                dismissButton = {
+                                    TextButton(onClick = { addPathDialog = false }) {
+                                        Text("取消", fontSize = 12.sp)
+                                    }
+                                },
+                            )
                         }
                         SmallField(
                             sandboxIdleMin, { sandboxIdleMin = it },

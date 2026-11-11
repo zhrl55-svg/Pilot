@@ -194,6 +194,27 @@ class Speaker(context: Context) {
     }
 
     /**
+     * 预听一个音色（不改变当前设置）。
+     *
+     * @param engine TTS_MINIMAX / TTS_SYSTEM
+     * @param voiceId MiniMax 是 voice_id；系统 TTS 是 Voice.name
+     */
+    fun previewVoice(engine: String, voiceId: String, sample: String = "你好，我是小派，这是音色的效果试听。") {
+        runCatching {
+            when (engine) {
+                com.pilot.agent.agent.AgentSettings.TTS_MINIMAX -> {
+                    val m = minimax ?: MiniMaxTts(appContext).also { minimax = it }
+                    m.preview(sample, voiceId) {}
+                }
+                com.pilot.agent.agent.AgentSettings.TTS_SYSTEM -> {
+                    val t = system ?: SystemTts(appContext).also { system = it }
+                    t.preview(sample, voiceId)
+                }
+            }
+        }.onFailure { Dbg.w(TAG, "预听失败 ${it.message}") }
+    }
+
+    /**
      * 列出系统 TTS 可用音色。
      *
      * ★ 复用 Speaker 自己的 system 实例（和实际播报同一个引擎），
