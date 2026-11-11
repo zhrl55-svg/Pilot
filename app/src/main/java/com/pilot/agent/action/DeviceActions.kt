@@ -11,6 +11,7 @@ import com.pilot.agent.perception.ScreenReader
 import kotlin.coroutines.resume
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * 执行层：所有对设备的写操作都从这里走。
@@ -26,6 +27,14 @@ class DeviceActions(
     private val service: AccessibilityService,
     private val reader: ScreenReader,
 ) {
+
+    /** 上次成功呼出搜索框的滑动手势（高度比例 from→to）；null 表示还没成功过 */
+    @Volatile
+    private var searchGesture: Pair<Float, Float>? = null
+
+    /** 呼出搜索前是否需要先翻一屏（华为首页「智慧助手」那屏不行） */
+    @Volatile
+    private var needPageTurn = false
 
     /** 系统能力直调（音量、亮度、电话），不发 Intent 也不点屏幕 */
     val systemOps: SystemOps by lazy { SystemOps(service) }
@@ -344,6 +353,20 @@ class DeviceActions(
 
         // 走到这里说明 6 秒内前台确实没换过，才轮到兜底。
         // （历史上这里写的是「后台启动被拦 → 桌面翻屏」，那个结论是误判，见上面注释。）
+        //
+        // ★ 先做一次"回桌面再来一遍"：目标 App 的任务栈可能停在某个奇怪状态，
+        //   系统没把它带到前台（实测设置页就卡过：startActivity 成功但窗口不动）。
+        //   回桌面等于换一个干净的起点，比去搜索页乱点靠谱。
+        Dbg.w(TAG, "启动未生效，回桌面后重试一次：$target")
+        service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
+        delay(600)
+        if (runCatching { service.startActivity(intent) }.isSuccess) {
+            when (awaitTransition(target, 4000L)) {
+                Transition.REACHED -> return true
+                Transition.MOVED -> return true
+                Transition.STUCK -> Unit
+            }
+        }
         Dbg.w(TAG, "目标 $target 未在预算内到达前台，尝试系统搜索拉起")
         // 桌面图标上显示的是**应用 label**（设置 / 蓝牙 / 手机管家），不是包名。
         val displayLabel = runCatching {
@@ -382,28 +405,36 @@ class DeviceActions(
 
         // 桌面下滑呼出搜索。★ 不是每一屏都能下滑出搜索：
         //   华为首页是「智慧助手」式布局，在那屏下滑没反应（实测）。所以要换屏重试。
+        //   ★ 而且试错很贵（一轮三四秒），所以把**上次成功的姿势**缓存下来，
+        //     第二次起直接照做——否则每次都从零试，任务整体时延会被这几秒吃掉。
         var edit: AccessibilityNodeInfo? = null
-        for (round in 0 until 3) {
-            for ((fx, from, to) in listOf(
-                Triple(0.5f, 0.22f, 0.62f),
-                Triple(0.5f, 0.55f, 0.90f),
-            )) {
-                gesture({ p ->
-                    p.moveTo((w * fx).toFloat(), (h * from).toFloat())
-                    p.lineTo((w * fx).toFloat(), (h * to).toFloat())
-                }, 400)
-                delay(900)
-                edit = findNodeDeepAnyWindow { it.isEditable }
-                if (edit != null) break
+        searchGesture?.let { (from, to) ->
+            if (needPageTurn) {
+                turnPage(w, h)
+                delay(600)
             }
-            if (edit != null) break
-            // 换到下一屏再试（从右往左滑）
-            Dbg.w(TAG, "全局搜索：这一屏下滑没反应，换屏重试（第 ${round + 1} 次）")
-            gesture({ p ->
-                p.moveTo((w * 0.85f).toFloat(), (h * 0.8f).toFloat())
-                p.lineTo((w * 0.15f).toFloat(), (h * 0.8f).toFloat())
-            }, 300)
-            delay(700)
+            swipeDown(w, h, from, to)
+            delay(800)
+            edit = findNodeDeepAnyWindow { it.isEditable }
+        }
+        if (edit == null) {
+            for (round in 0 until 3) {
+                for ((from, to) in SEARCH_SWIPES) {
+                    swipeDown(w, h, from, to)
+                    delay(900)
+                    edit = findNodeDeepAnyWindow { it.isEditable }
+                    if (edit != null) {
+                        searchGesture = from to to
+                        needPageTurn = round > 0
+                        Dbg.i(TAG, "全局搜索：记住姿势 from=$from to=$to 换屏=$needPageTurn")
+                        break
+                    }
+                }
+                if (edit != null) break
+                Dbg.w(TAG, "全局搜索：这一屏下滑没反应，换屏重试（第 ${round + 1} 次）")
+                turnPage(w, h)
+                delay(700)
+            }
         }
         if (edit == null) {
             Dbg.w(TAG, "桌面下滑没呼出搜索框，放弃全局搜索")
@@ -418,35 +449,72 @@ class DeviceActions(
             edit.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
         }
         Dbg.i(TAG, "全局搜索：已输入「$query」")
-        delay(900)
 
-        // 有的 ROM 输入即出结果，有的要回车。先回车提交一次（对 App 名常常直接拉起），
-        // 提交后如果目标包已经到前台，就到此为止。
-        val entered = runCatching {
-            edit.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
-        }.getOrDefault(false)
-        Dbg.i(TAG, "全局搜索：提交=$entered")
-        if (expectPkg != null && awaitForeground(expectPkg, 3000L)) return true
+        // ★ 输入即搜，不要按回车。
+        //   华为的桌面搜索是**边输边出联想列表**：输入框下面很快浮出建议，
+        //   最上面那个分区叫「最佳匹配」，其中第一条就是要找的东西（设置项会带「设置」标签）。
+        //   按回车反而跳到「完整搜索结果页」——那页顶部是「图片中找到的文字」OCR 缩略图，
+        //   命中关键词的常是图片卡片，点下去停在搜索页（实测踩过两次）。
+        val searchPkg = runCatching { edit.packageName?.toString() }.getOrNull()
 
-        // 点最匹配的那一条结果。
-        val hit = findBestResult(query)
-        if (hit == null) {
+        // 等列表出来（最多 2 秒），拿到一串候选
+        // ★ 不能"一有结果就点"：列表是分批渲染的，最早出现的往往只有一条网页建议
+        //   （实测「蓝牙」先只出来『蓝牙耳机怎么配对连接』，点了不动，白等 4 秒）。
+        //   所以要等到出现**标题型**候选（短名字，不是一整句话）再动手。
+        var list: List<AccessibilityNodeInfo> = emptyList()
+        var waited = 0L
+        while (waited < SUGGEST_WAIT_MS) {
+            val all = candidates(query, searchPkg)
+            val titleLike = all.filter { n ->
+                val t = n.text?.toString().orEmpty()
+                t.isNotEmpty() && t.length <= query.length + 6
+            }
+            if (titleLike.isNotEmpty()) { list = titleLike; break }
+            if (all.isNotEmpty()) list = all // 兜底：先记着，继续等更好的
+            delay(200)
+            waited += 200
+        }
+        Dbg.i(TAG, "全局搜索：候选 ${list.size} 个 用时 ${waited}ms 首个=${list.firstOrNull()?.text}")
+
+        // 联想没出来才退回"提交搜索"（老 ROM / 特殊桌面）
+        if (list.isEmpty()) {
+            val entered = runCatching {
+                edit.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+            }.getOrDefault(false)
+            Dbg.w(TAG, "全局搜索：联想为空，提交搜索 entered=$entered")
+            if (expectPkg != null && awaitForeground(expectPkg, 3000L)) return true
+            delay(800)
+            list = candidates(query, searchPkg)
+        }
+        if (list.isEmpty()) {
             Dbg.w(TAG, "全局搜索：没有匹配「$query」的结果")
             return false
         }
-        val pageBefore = foregroundPackage()
-        val clicked = runCatching { clickNodeOrParent(hit) }.getOrDefault(false)
-        Dbg.i(TAG, "全局搜索：点击结果「${hit.text ?: hit.contentDescription}」-> $clicked")
-        if (!clicked) return false
-        return if (expectPkg != null) {
-            awaitForeground(expectPkg, 4000L)
-        } else {
-            // 没指定目标包时，判据是"离开搜索页"——点了没反应也算失败，
-            // 否则会把"还停在搜索结果里"当成成功播报出去。
-            val left = awaitLeave(pageBefore, 3000L)
-            if (!left) Dbg.w(TAG, "全局搜索：点了结果但没离开搜索页（${foregroundPackage()}）")
-            left
+
+        // 逐个试：点一个、验一个。点完还停在搜索页就换下一个候选。
+        // 「最佳匹配」里也可能有好几条，光靠猜不如试。
+        for ((idx, cand) in list.take(3).withIndex()) {
+            delay(RESULT_SETTLE_MS)
+            val pageBefore = foregroundPackage()
+            val clicked = runCatching { clickNodeOrParent(cand) }.getOrDefault(false)
+            Dbg.i(TAG, "全局搜索：点候选#${idx + 1}「${cand.text ?: cand.contentDescription}」-> $clicked")
+            if (!clicked) continue
+            if (expectPkg != null) {
+                if (awaitForeground(expectPkg, 4000L)) return true
+            } else if (awaitLeave(pageBefore, 2500L)) {
+                return true
+            }
+            // 点进搜索 App 内嵌的网页了（点到了网页建议）：退回去，换下一个候选
+            if (looksLikeWebPage()) {
+                Dbg.w(TAG, "全局搜索：候选#${idx + 1} 进了内嵌网页，回退")
+                key("back")
+                delay(700)
+                continue
+            }
+            Dbg.w(TAG, "全局搜索：候选#${idx + 1} 没跳走（${foregroundPackage()}），试下一个")
         }
+        Dbg.w(TAG, "全局搜索：候选都点过，没能跳走")
+        return false
     }
 
     /** 等前台离开某个包（点结果后判断有没有真跳走）。 */
@@ -463,61 +531,111 @@ class DeviceActions(
     }
 
     /**
-     * 取搜索结果里最合适的一条：**先看匹配强度，同强度取最靠上**。
+     * 收集联想列表的候选：**「最佳匹配」分区优先，其次按匹配强度 + 靠上**，最多 5 个。
      *
-     * 只说"第一条"会踩坑：搜「蓝牙」时最上面那条是「蓝牙已连接。」这种状态句子，
-     * 点进去不是设置页。搜索页本身按相关度排，所以规则是：
-     *   完全同名(3) > 以关键词开头(2) > 包含关键词(1)，同级之间取 y 最小的一条。
-     * 同时排除输入框自己的文字（它必然包含关键词）。
+     * 为什么返回一串而不是一个：
+     * - 只取"最靠上"会点到「图片中找到的文字」缩略图，点完停在搜索页；
+     * - 只按字符串打分又会点到列表深处不相干的条目。
+     * 所以改成"给一串候选，点一个验一个"——点完没离开搜索页就点下一个。
+     *
+     * 排除：输入框自身（它的文字必然含关键词）、WebView 里的文字（那是网页搜索结果）。
      */
-    private suspend fun findBestResult(keyword: String): AccessibilityNodeInfo? {
-        val deadline = System.currentTimeMillis() + 3000
-        while (System.currentTimeMillis() < deadline) {
+    private suspend fun candidates(keyword: String, searchPkg: String?): List<AccessibilityNodeInfo> =
+        withTimeoutOrNull(4000L) {
             val roots = runCatching { service.windows.mapNotNull { it.root } }.getOrDefault(emptyList())
-            val stack = ArrayDeque<AccessibilityNodeInfo>()
-            roots.filter { it.packageName?.toString()?.contains("inputmethod", true) != true }
-                .forEach { stack.add(it) }
+            val mine = roots.filter { r ->
+                val p = r.packageName?.toString().orEmpty()
+                !p.contains("inputmethod", true) && (searchPkg == null || p == searchPkg)
+            }
             val rect = android.graphics.Rect()
-            var best: AccessibilityNodeInfo? = null
-            var bestScore = 0
-            var bestY = Int.MAX_VALUE
-            var guard = 0
-            while (stack.isNotEmpty() && guard++ < 1200) {
-                val n = stack.removeLast()
-                // 搜索框自己的文字必然含关键词，绝不能当结果
-                if (!n.isEditable) {
-                    val label = n.text?.toString().orEmpty() + n.contentDescription?.toString().orEmpty()
-                    val score = when {
-                        label.isBlank() -> 0
-                        label.equals(keyword, ignoreCase = true) -> 3
-                        label.startsWith(keyword, ignoreCase = true) -> 2
-                        label.contains(keyword, ignoreCase = true) && label.length <= keyword.length + 24 -> 1
-                        else -> 0
+
+            // 先定位「最佳匹配」分区标题的 y：它下面的条目优先
+            var bestMatchY = Int.MAX_VALUE
+            for (root in mine) {
+                val st = ArrayDeque<AccessibilityNodeInfo>()
+                st.add(root)
+                var g = 0
+                while (st.isNotEmpty() && g++ < 800) {
+                    val n = st.removeLast()
+                    if (n.text?.toString()?.contains("最佳匹配") == true &&
+                        runCatching { n.getBoundsInScreen(rect) }.isSuccess
+                    ) {
+                        bestMatchY = minOf(bestMatchY, rect.top)
                     }
-                    if (score > 0 && runCatching { n.getBoundsInScreen(rect) }.isSuccess && rect.height() > 0) {
-                        if (score > bestScore || (score == bestScore && rect.top < bestY)) {
-                            bestScore = score
-                            bestY = rect.top
-                            best = n
+                    for (i in 0 until n.childCount) n.getChild(i)?.let { st.add(it) }
+                }
+            }
+
+            val out = mutableListOf<Triple<AccessibilityNodeInfo, Int, Int>>() // node, rank, top
+            for (root in mine) {
+                val st = ArrayDeque<AccessibilityNodeInfo>()
+                st.add(root)
+                var g = 0
+                while (st.isNotEmpty() && g++ < 1200) {
+                    val n = st.removeLast()
+                    if (!n.isEditable && !underWebView(n)) {
+                        val label = n.text?.toString().orEmpty()
+                        val web = label.contains("百度") || label.contains("网页") || label.contains("查看更多")
+                        val score = when {
+                            label.isBlank() || web -> 0
+                            label.equals(keyword, ignoreCase = true) -> 3
+                            label.startsWith(keyword, ignoreCase = true) -> 2
+                            label.contains(keyword, ignoreCase = true) && label.length <= keyword.length + 24 -> 1
+                            else -> 0
+                        }
+                        if (score > 0 && runCatching { n.getBoundsInScreen(rect) }.isSuccess && rect.height() > 0) {
+                            val rank = if (bestMatchY != Int.MAX_VALUE && rect.top > bestMatchY) score * 10 else score
+                            out += Triple(n, rank, rect.top)
                         }
                     }
+                    for (i in 0 until n.childCount) n.getChild(i)?.let { st.add(it) }
                 }
-                for (i in 0 until n.childCount) n.getChild(i)?.let { stack.add(it) }
             }
-            if (best != null && bestScore >= 2) return best
-            if (best != null) return best
-            delay(250)
-        }
-        return null
-    }
+            out.sortedWith(
+                compareByDescending<Triple<AccessibilityNodeInfo, Int, Int>> { it.second }.thenBy { it.third },
+            ).map { it.first }
+                .distinctBy { node ->
+                    val r = android.graphics.Rect()
+                    runCatching { node.getBoundsInScreen(r) }
+                    "${r.top}/${r.left}"
+                }
+                .take(5)
+        } ?: emptyList()
 
     /**
-     * 点一条搜索结果。
+     * 当前页面是不是"网页"（点错建议时会进到搜索 App 内嵌的网页里）。
      *
-     * 先试 performAction；不行就**按坐标点节点中心**——搜索结果的文字节点
-     * （`com.huawei.search:id/author` 这种）自己不可点，可点的容器又常在 4 层以外，
-     * 靠「往上找可点父节点」会整条漏掉（实测：报"没有匹配的结果"，其实结果就在屏幕上）。
+     * ★ 不能按包名判：华为搜索的网页是**它自己内嵌 WebView 打开的**，
+     *   前台包一直是 com.huawei.search，看不到任何 browser 包（实测 dump 确认）。
+     *   所以按内容判：有 WebView 节点，或页面上出现"百度一下"这种网页标志。
      */
+    private fun looksLikeWebPage(): Boolean {
+        val roots = runCatching { service.windows.mapNotNull { it.root } }.getOrDefault(emptyList())
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        roots.forEach { stack.add(it) }
+        var guard = 0
+        while (stack.isNotEmpty() && guard++ < 1200) {
+            val n = stack.removeLast()
+            val cls = n.className?.toString().orEmpty()
+            if (cls.contains("WebView", ignoreCase = true)) return true
+            val t = n.text?.toString().orEmpty()
+            if (t.contains("百度一下") || t.contains("相关搜索") || t.contains("网页快照")) return true
+            for (i in 0 until n.childCount) n.getChild(i)?.let { stack.add(it) }
+        }
+        return false
+    }
+
+    /** 节点是否在 WebView 里（网页搜索结果的文字都在 WebView 里，点不得）。 */
+    private fun underWebView(node: AccessibilityNodeInfo): Boolean {
+        var p: AccessibilityNodeInfo? = node
+        var depth = 0
+        while (p != null && depth++ < 6) {
+            if (p.className?.toString()?.contains("WebView", ignoreCase = true) == true) return true
+            p = p.parent
+        }
+        return false
+    }
+
     private suspend fun clickNodeOrParent(node: AccessibilityNodeInfo): Boolean {
         if (node.isClickable && node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
         var p = node.parent
@@ -545,15 +663,117 @@ class DeviceActions(
     suspend fun setSettingsItem(keyword: String, on: Boolean): String? {
         // 已经在目标设置页上（页面文字里就有这个词）→ 直接拨当前页的开关，
         // 不用再退回桌面搜一遍。「打开蓝牙」走直达进了蓝牙页之后就是这条路。
-        if (onSettingsPage(keyword)) {
-            toggleTopSwitch(on)?.let { return it }
+        if (!onSettingsPage(keyword)) {
+            // ★ 设置项**不要走桌面全局搜索**：那个列表里混着应用市场条目、网页建议，
+            //   实测点「蓝牙」直接进了华为应用市场，点「护眼方法」进了内嵌网页。
+            //   设置 App 自己的搜索框结果干净（全是设置项），一步到位。
+            if (!searchInSettings(keyword)) {
+                Dbg.w(TAG, "设置开关：没在设置里搜到「$keyword」")
+                return null
+            }
         }
-        if (!globalSearch(keyword, null)) {
-            Dbg.w(TAG, "设置开关：没搜到「$keyword」")
+        // ★ 必须等页面真的落到「含这个词的设置页」再拨。
+        //   实测过一次假成功：刚点完搜索结果、页面还没切过去，
+        //   就读到搜索页里某个 checked=true 的开关，直接回答"已经是开启状态"，
+        //   而截图里蓝牙开关明明是关的。
+        if (!awaitSettingsPage(keyword, 3000L)) {
+            Dbg.w(TAG, "设置开关：没进到「$keyword」的设置页（pkg=${foregroundPackage()}）")
             return null
         }
+        return toggleTopSwitch(keyword, on)
+    }
+
+    /**
+     * 在**设置 App 内部**搜索某一项。
+     *
+     * 为什么不复用桌面全局搜索：桌面搜索的建议列表混着「应用市场」「网页搜索」条目，
+     * 点错了会跳应用市场或内嵌百度页（实测都踩到）。设置内的搜索只出设置项，干净。
+     */
+    private suspend fun searchInSettings(keyword: String): Boolean {
+        val settingsPkg = "com.android.settings"
+        val intent = Intent(android.provider.Settings.ACTION_SETTINGS)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (!startSafely(intent, settingsPkg)) {
+            Dbg.w(TAG, "设置内搜索：设置没打开")
+            return false
+        }
+        delay(600)
+
+        // 设置首屏顶部就有搜索框（AutoCompleteTextView，id=search_src_text）——按 isEditable 找
+        val edit = findNodeDeepAnyWindow { it.isEditable } ?: run {
+            Dbg.w(TAG, "设置内搜索：没找到搜索框（pkg=${foregroundPackage()}）")
+            return false
+        }
+        val args = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, keyword)
+        }
+        runCatching {
+            edit.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+            edit.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        }
+        Dbg.i(TAG, "设置内搜索：已输入「$keyword」")
         delay(700)
-        return toggleTopSwitch(on)
+
+        // 结果列表：优先「最佳匹配」分区里的标题型条目
+        var list: List<AccessibilityNodeInfo> = emptyList()
+        var waited = 0L
+        while (waited < 2500L) {
+            val all = candidates(keyword, settingsPkg)
+            val titleLike = all.filter { n ->
+                val t = n.text?.toString().orEmpty()
+                t.isNotEmpty() && t.length <= keyword.length + 8
+            }
+            if (titleLike.isNotEmpty()) { list = titleLike; break }
+            if (all.isNotEmpty()) list = all
+            delay(200)
+            waited += 200
+        }
+        if (list.isEmpty()) {
+            Dbg.w(TAG, "设置内搜索：没有「$keyword」的条目")
+            return false
+        }
+        for ((idx, cand) in list.take(3).withIndex()) {
+            delay(200)
+            val ok = runCatching { clickNodeOrParent(cand) }.getOrDefault(false)
+            Dbg.i(TAG, "设置内搜索：点#${idx + 1}「${cand.text}」-> $ok")
+            if (!ok) continue
+            // ★ 设置内部的页面跳转**不会换包名**（一直在 com.android.settings 里），
+            //   所以不能用"前台包变了"判断成功。判据换成：搜索框消失 + 页面里出现关键词。
+            if (awaitResultPage(keyword, 2500L)) return true
+        }
+        return false
+    }
+
+    /**
+     * 等"从搜索结果跳到了具体设置页"。
+     *
+     * 判据两条：搜索结果页的输入框消失 + 当前设置页文字里含关键词。
+     * 只看关键词不行——搜索结果页本身就含关键词。
+     */
+    private suspend fun awaitResultPage(keyword: String, timeoutMs: Long): Boolean {
+        var waited = 0L
+        while (waited < timeoutMs) {
+            val pkg = foregroundPackage().orEmpty()
+            if (pkg.contains("settings", true)) {
+                val root = service.rootInActiveWindow
+                val hasSearchBox = root != null && findNodeDeep(root) { it.isEditable } != null
+                if (!hasSearchBox && onSettingsPage(keyword)) return true
+            }
+            delay(200)
+            waited += 200
+        }
+        return false
+    }
+
+    /** 轮询等"包含关键词的设置页"出现。 */
+    private suspend fun awaitSettingsPage(keyword: String, timeoutMs: Long): Boolean {
+        var waited = 0L
+        while (waited < timeoutMs) {
+            if (onSettingsPage(keyword)) return true
+            delay(200)
+            waited += 200
+        }
+        return false
     }
 
     /** 当前前台是不是「包含这个词的设置页」。 */
@@ -575,8 +795,12 @@ class DeviceActions(
     }
 
     /** 把当前页最靠上的开关拨到目标状态，回读确认。返回话术，失败返回 null。 */
-    private suspend fun toggleTopSwitch(on: Boolean): String? {
+    private suspend fun toggleTopSwitch(keyword: String, on: Boolean): String? {
         val verb = if (on) "开启" else "关闭"
+        if (!onSettingsPage(keyword)) {
+            Dbg.w(TAG, "设置开关：当前页不是「$keyword」（pkg=${foregroundPackage()}），不拨")
+            return null
+        }
         repeat(3) {
             val sw = findTopSwitch() ?: return null
             // ★ 认人不能靠"第一个开关"，也不能只靠 viewId：
@@ -584,6 +808,7 @@ class DeviceActions(
             val id = sw.viewIdResourceName
             val box = android.graphics.Rect().also { runCatching { sw.getBoundsInScreen(it) } }
             if (sw.isChecked == on) {
+                Dbg.i(TAG, "设置开关：目标已是 $on（checked=${sw.isChecked}），无需操作")
                 return "已经是${if (on) "开启" else "关闭"}状态"
             }
 
@@ -678,24 +903,22 @@ class DeviceActions(
      */
     suspend fun searchSettings(keyword: String): Boolean {
         if (keyword.isBlank()) return false
-        return globalSearch(keyword, null)
+        return globalSearch(keyword, "com.android.settings")
     }
 
-    /**
-     * 轮询找节点。用于「刚点完一跳，新页面还没铺好」的场景：
-     * `rootInActiveWindow` 在窗口切换期是 null，查一次就下结论必然误判。
-     */
-    private suspend fun findNodeDeepRetry(
-        timeoutMs: Long,
-        match: (AccessibilityNodeInfo) -> Boolean,
-    ): AccessibilityNodeInfo? {
-        var waited = 0L
-        while (waited < timeoutMs) {
-            findNodeDeepAnyWindow(match)?.let { return it }
-            delay(200)
-            waited += 200
-        }
-        return null
+    private suspend fun swipeDown(w: Int, h: Int, from: Float, to: Float) {
+        gesture({ p ->
+            p.moveTo((w * 0.5f).toFloat(), (h * from).toFloat())
+            p.lineTo((w * 0.5f).toFloat(), (h * to).toFloat())
+        }, 400)
+    }
+
+    /** 桌面翻到下一屏（从右往左滑）。 */
+    private suspend fun turnPage(w: Int, h: Int) {
+        gesture({ p ->
+            p.moveTo((w * 0.85f).toFloat(), (h * 0.8f).toFloat())
+            p.lineTo((w * 0.15f).toFloat(), (h * 0.8f).toFloat())
+        }, 300)
     }
 
     /**
@@ -703,8 +926,7 @@ class DeviceActions(
      *
      * ★ `rootInActiveWindow` 只给"当前活动窗口"，而**输入法弹出来时它给的是键盘**——
      *   实测点开设置搜索框后它返回 `com.huawei.ohos.inputmethod`，
-     *   于是"搜索页没有输入框"这种假结论就出来了（页面明明开着）。
-     *   所以要遍历 `service.windows`，把 inputmethod 的窗口压到最后。
+     *   于是"页面上没有输入框"这种假结论就出来了（页面明明开着）。
      */
     private fun findNodeDeepAnyWindow(
         match: (AccessibilityNodeInfo) -> Boolean,
@@ -712,8 +934,7 @@ class DeviceActions(
         val roots = runCatching { service.windows.mapNotNull { it.root } }.getOrDefault(emptyList())
         if (roots.isEmpty()) return findNodeDeep(service.rootInActiveWindow, match)
         val ordered = roots.sortedBy {
-            val p = it.packageName?.toString().orEmpty()
-            if (p.contains("inputmethod", true)) 1 else 0
+            if (it.packageName?.toString()?.contains("inputmethod", true) == true) 1 else 0
         }
         for (r in ordered) findNodeDeep(r, match)?.let { return it }
         return null
@@ -833,6 +1054,15 @@ class DeviceActions(
          * 在卡片上横滑会被卡片吞掉。所以换几个高度各试一次，翻不动再判死。
          */
         private val SWIPE_YS = listOf(0.82f, 0.30f, 0.55f)
+
+        /** 输入后等联想列表浮出来（输入即搜，不用回车） */
+        private const val SUGGEST_WAIT_MS = 2000L
+
+        /** 搜索结果出现后先等一拍再点（列表还在排版，位置会动） */
+        private const val RESULT_SETTLE_MS = 250L
+
+        /** 桌面下滑呼出搜索的候选手势（高度比例 from→to） */
+        private val SEARCH_SWIPES = listOf(0.22f to 0.62f, 0.55f to 0.90f)
         /**
          * 中文别名 → 候选包名。
          *

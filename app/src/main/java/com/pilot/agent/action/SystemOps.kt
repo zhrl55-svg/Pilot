@@ -216,8 +216,50 @@ class SystemOps(private val ctx: Context) {
          * - **相对**：增大 20% / 减小 20% / 音量 60%（裸百分比按"设成"处理）
          * - **方向词**：大一点 → Delta(+10)、大很多 → Delta(+40)、只给方向 → Delta(±20)
          */
+        /**
+         * 把中文数字的百分比说成 `N%`。
+         *
+         * `音量调到百分之五十` → `音量调到50%`
+         * `音量调到五十`       → `音量调到50%`
+         */
+        private fun normalizePercent(input: String): String {
+            var out = input
+            Regex("百分之([零一二两三四五六七八九十百]{1,4})").findAll(out).toList().reversed().forEach { m ->
+                val n = chineseNumber(m.groupValues[1]) ?: return@forEach
+                out = out.replaceRange(m.range, "$n%")
+            }
+            // "调到五十" 这种省略"百分之"的
+            Regex("(调到|调至|调成|设成|设为|改为|变成)([零一二两三四五六七八九十百]{1,4})")
+                .find(out)?.let { m ->
+                    val n = chineseNumber(m.groupValues[2]) ?: return@let
+                    out = out.replaceRange(m.range, "${m.groupValues[1]}$n%")
+                }
+            return out
+        }
+
+        /** 中文数字 → 整数，支持 0~100（五、十五、五十、五十五、一百）。 */
+        private fun chineseNumber(src: String): Int? {
+            val d = mapOf(
+                '零' to 0, '一' to 1, '二' to 2, '两' to 2, '三' to 3, '四' to 4,
+                '五' to 5, '六' to 6, '七' to 7, '八' to 8, '九' to 9,
+            )
+            if (src.isEmpty()) return null
+            if (src == "一百") return 100
+            if (src.length == 1) return d[src[0]]
+            val ten = src.indexOf('十')
+            if (ten >= 0) {
+                val tens: Int = if (ten == 0) 1 else (d[src[0]] ?: return null)
+                val ones: Int = if (ten == src.length - 1) 0 else (d[src[ten + 1]] ?: return null)
+                return tens * 10 + ones
+            }
+            return null
+        }
+
         fun parseLevelChange(text: String): LevelChange? {
-            val t = text
+            // ★ 语音识别给的是中文数字：「音量调到百分之五十」。
+            //   只认 `50%` 会把这句话漏给端侧小模型，实测它会瞎编 set_volume 这种不存在的动作，
+            //   一路烧到 25 步。所以先把它归一化成 `50%` 再走统一规则。
+            val t = normalizePercent(text)
 
             // 1) 绝对：调到/设成/变成/改成 N%
             Regex("(?:调到|调至|调成|设成|设为|设置到|变成|变到|改成|改为|转到|到)\\s*(\\d{1,3})\\s*%")

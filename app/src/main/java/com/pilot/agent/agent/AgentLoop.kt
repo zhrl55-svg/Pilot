@@ -260,6 +260,20 @@ class AgentLoop(
                 }
             }
 
+            // ★ 未知动作名：执行层只会默默返回 false，不拦的话会一路"失败"到 maxTurns。
+            //   实测「音量调到百分之五十」被端侧模型接成 set_volume，烧了 23 步。
+            if (action.action !in KNOWN_ACTIONS) {
+                invalidStreak++
+                history += "${action.action}（未知动作，不可执行）"
+                Dbg.w(TAG, "step=$step 未知动作=${action.action} streak=$invalidStreak planner=$plannerId")
+                emit(AgentEvent.Observe("这一步的动作执行不了，换个做法"))
+                if (invalidStreak >= 2) {
+                    throw IllegalStateException("规划器连续给出无法执行的动作（${action.action}），已中止。")
+                }
+                delay(300)
+                continue
+            }
+
             // 2. 护栏在动作落地之前
             val risk = guard.riskOf(action, snap)
             // 高风险确认是策略约束，不受普通设置开关影响。

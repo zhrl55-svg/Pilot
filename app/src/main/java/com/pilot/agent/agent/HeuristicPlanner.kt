@@ -36,25 +36,6 @@ class HeuristicPlanner(
         // ★ 系统能力直调：音量、亮度、打电话——不发 Intent、不开界面，直接改状态
         ruleSystemOp(goal)?.let { return AgentDecision("系统能力直调", it) }
 
-        // ★ 开关类设置项优先：「打开护眼模式」「关闭蓝牙」要的是开关真的到位，
-        //   不是打开设置页。这类指令先于直达/索引处理——
-        //   已经在目标页时直接拨当前页开关，没在的话先搜再拨。
-        settingsKeyword(goal)?.let { kw ->
-            val off = Regex("关闭|关掉|停用|禁用|取消|关一下").containsMatchIn(goal)
-            val on = Regex("打开|开启|启用|开一下|亮起|启动").containsMatchIn(goal) && !off
-            if (on || off) {
-                return AgentDecision(
-                    thought = "设置开关：$kw → ${if (on) "开" else "关"}",
-                    action = AgentAction(
-                        action = "systemop",
-                        target = if (on) "settings_switch_on" else "settings_switch_off",
-                        text = kw,
-                        summary = "${if (on) "开启" else "关闭"} $kw",
-                    ),
-                )
-            }
-        }
-
         // ★ 能用一个 Intent 启动的，绝不去点屏幕。
         //   顺序：系统动作/设置页（静态表） → App 内入口（运行时索引） → 应用启动 → 点击兜底。
         // 直达每个任务只试一次：成败都不再试。
@@ -75,7 +56,10 @@ class HeuristicPlanner(
         // App 内功能（扫一扫、收款码这类 exported 入口）
         appIndexProvider()?.resolve(goal)?.let { e ->
             val label = "${e.appLabel} ${e.label}"
-            val failedBefore = req.history.any { it.startsWith("直达 $label") && it.contains("fail") }
+            // 已经直达成功过就跳过，否则会一直重复"打开这个页面"，永远走不到拨开关那一步
+            val openedBefore = req.history.any { it.startsWith("直达 $label") && it.contains("ok") }
+            val failedBefore = req.history.any { it.startsWith("直达 $label") && it.contains("fail") } ||
+                openedBefore
             if (!failedBefore) {
                 return AgentDecision(
                     thought = "App 内入口：$label",
@@ -92,6 +76,25 @@ class HeuristicPlanner(
         //   就用设置自带的搜索框去搜。华为把大量设置项埋进二三级菜单（电池优化、应用启动管理…），
         //   逐级点既脆又慢，搜索是官方正路。
         //   白名单卡死范围，避免把"打开某个没索引的小 App"也塞进设置搜索。
+        // ★ 开关类设置项：「打开蓝牙」要的是开关真的到位，不是打开设置页。
+        //   顺序很关键——先让直达/索引把页面打开（毫秒级、稳），再拨开关；
+        //   如果直达没有对应入口，才落到"设置内搜索 → 拨开关"。
+        settingsKeyword(goal)?.let { kw ->
+            val off = Regex("关闭|关掉|停用|禁用|取消|关一下").containsMatchIn(goal)
+            val on = Regex("打开|开启|启用|开一下|亮起|启动").containsMatchIn(goal) && !off
+            if (on || off) {
+                return AgentDecision(
+                    thought = "设置开关：$kw → ${if (on) "开" else "关"}",
+                    action = AgentAction(
+                        action = "systemop",
+                        target = if (on) "settings_switch_on" else "settings_switch_off",
+                        text = kw,
+                        summary = "${if (on) "开启" else "关闭"} $kw",
+                    ),
+                )
+            }
+        }
+
         // 纯导航类（"点击电池"这种没有开关动词的）→ 只是进到这一项的页面
         settingsKeyword(goal)?.let { kw ->
             return AgentDecision(

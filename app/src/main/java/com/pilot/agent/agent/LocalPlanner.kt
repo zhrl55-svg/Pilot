@@ -105,6 +105,12 @@ class LocalPlanner(private val llmProvider: () -> LocalLlm) : Planner {
             return null
         }
         if (actionName == "open" && action.target.isNullOrBlank()) return null
+        // ★ 小模型会自己发明动作名（实测吐过 `set_volume`，一路执行失败到 maxTurns）。
+        //   不在这份白名单里的一律当解析失败，让上层换规划器。
+        if (actionName !in KNOWN_ACTIONS) {
+            Dbg.w(TAG, "端侧模型给了未知动作 $actionName，已拒绝")
+            return null
+        }
         return AgentDecision(thought = "端侧模型决策", action = action)
     }
 

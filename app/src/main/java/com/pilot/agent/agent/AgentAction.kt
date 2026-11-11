@@ -62,3 +62,16 @@ data class AgentAction(
 }
 
 enum class Risk { NONE, MONEY, IRREVERSIBLE, EXTERNAL, SENSITIVE }
+
+/**
+ * 可执行的动作名白名单。
+ *
+ * 端侧小模型会**编**动作名（实测吐出 `set_volume`），而 execute() 的 else 分支只会默默返回 false，
+ * 于是每步都"执行失败但不算无效动作"，一路烧到 maxTurns。
+ * 各处（解析、执行、无效动作判定）统一以这份清单为准。
+ */
+val KNOWN_ACTIONS: Set<String> = setOf(
+    "tap", "tap_node", "long_press", "input", "swipe", "scroll",
+    "open", "shortcut", "component", "key", "systemop",
+    "done", "wait", "ask", "unable", "app_func",
+)
