@@ -402,6 +402,28 @@ class AgentLoop(
                 if (r == null) false else { emit(AgentEvent.Observe(r)); true }
             }
 
+            "volume_set" -> {
+                val r = actions.systemOps.setVolume(arg.toIntOrNull() ?: return false)
+                if (r == null) false else { emit(AgentEvent.Observe(r)); true }
+            }
+
+            "brightness_set" -> {
+                val r = actions.systemOps.setBrightness(arg.toIntOrNull() ?: return false)
+                when (r) {
+                    null -> false
+                    com.pilot.agent.action.SystemOps.NEED_WRITE_SETTINGS -> {
+                        emit(AgentEvent.Observe("调亮度需要「修改系统设置」权限，正在打开授权页"))
+                        actions.systemOps.openWriteSettingsPage()
+                        false
+                    }
+
+                    else -> {
+                        emit(AgentEvent.Observe(r))
+                        true
+                    }
+                }
+            }
+
             "brightness" -> {
                 val r = actions.systemOps.adjustBrightness(arg.toIntOrNull() ?: 0)
                 when (r) {

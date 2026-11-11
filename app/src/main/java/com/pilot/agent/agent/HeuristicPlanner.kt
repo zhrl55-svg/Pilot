@@ -1,5 +1,6 @@
 package com.pilot.agent.agent
 
+import com.pilot.agent.action.LevelChange
 import com.pilot.agent.perception.UiNode
 
 /**
@@ -149,22 +150,27 @@ class HeuristicPlanner(
      * 不需要打开设置页、不需要点滑块。这是「执行力」和「导航」的分界线。
      */
     private fun ruleSystemOp(goal: String): AgentAction? {
-        // 音量
-        if (goal.contains("音量") || goal.contains("声音")) {
-            com.pilot.agent.action.SystemOps.parseDelta(goal)?.let { d ->
-                return AgentAction(
-                    action = "systemop", target = "volume",
-                    text = d.toString(), summary = "音量",
-                )
-            }
+        // 音量 / 亮度。相对加减走 volume/brightness，设具体值走 volume_set/brightness_set——
+        // 两者不能混：「调到 60%」是设定值，不是加 60%。
+        val levelOp = when {
+            goal.contains("音量") || goal.contains("声音") -> "volume"
+            goal.contains("亮度") || goal.contains("屏幕亮") -> "brightness"
+            else -> null
         }
-        // 亮度
-        if (goal.contains("亮度") || goal.contains("屏幕亮")) {
-            com.pilot.agent.action.SystemOps.parseDelta(goal)?.let { d ->
-                return AgentAction(
-                    action = "systemop", target = "brightness",
-                    text = d.toString(), summary = "亮度",
+        if (levelOp != null) {
+            when (val change = com.pilot.agent.action.SystemOps.parseLevelChange(goal)) {
+                is LevelChange.Delta -> return AgentAction(
+                    action = "systemop", target = levelOp,
+                    text = change.percent.toString(), summary = if (levelOp == "volume") "音量" else "亮度",
                 )
+
+                is LevelChange.Absolute -> return AgentAction(
+                    action = "systemop", target = "${levelOp}_set",
+                    text = change.percent.toString(),
+                    summary = if (levelOp == "volume") "音量" else "亮度",
+                )
+
+                null -> Unit
             }
         }
         // 打电话：给X打电话 / 拨打X

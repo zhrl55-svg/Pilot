@@ -132,7 +132,7 @@ adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent.debug --es goa
 
 - `action/SystemOps.kt` 音量/亮度/电话/闹钟，不碰界面
 - `action/Contacts.kt` 姓名 → 号码
-- `parseDelta()` 自然语言 → 百分比（「大一点」= +15%）
+- `parseLevelChange()` 自然语言 → 相对增减/设定值（「增大音量」= +20%，「调到60%」= 设成 60%）
 
 ### 6. 直达（能启动的都不点）
 
