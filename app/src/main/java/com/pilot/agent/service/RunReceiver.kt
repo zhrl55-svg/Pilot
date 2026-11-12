@@ -267,6 +267,7 @@ class RunReceiver : BroadcastReceiver() {
                                 "你是手机助手 Pilot，运行在这台安卓手机上。现在是 $now。" +
                                     "用一到两句话回答，简短口语化，不要用列表。" +
                                     "你能开关应用、查天气、股票和火车余票、播音乐、跑 shell 命令、做导航。" +
+                                    com.pilot.agent.agent.IntentGate.SELF_KNOWLEDGE +
                                     memoryPrompt,
                             )
                         })
@@ -298,6 +299,7 @@ class RunReceiver : BroadcastReceiver() {
         return llm.generate(
             "system\n你是手机助手 Pilot，运行在这台安卓手机上，现在是 $now。" +
                 "能开关应用、查天气股票和火车余票、播音乐、跑命令、做导航。" +
+                com.pilot.agent.agent.IntentGate.SELF_KNOWLEDGE +
                 memoryPrompt +
                 "回答简短口语化，不超过 25 个字。$noThink\n" +
                 "user\n$text\nassistant\n"

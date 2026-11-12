@@ -100,6 +100,14 @@ class DeviceActions(
     }
 
     suspend fun openApp(pkgOrName: String): Boolean {
+        val requested = pkgOrName.trim()
+        if (requested == "终端" || requested.equals("Pilot 终端", ignoreCase = true) ||
+            requested.equals("Pilot Terminal", ignoreCase = true)
+        ) {
+            val intent = Intent(service, com.pilot.agent.ui.TerminalActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            return startSafely(intent, service.packageName)
+        }
         val pkg = resolvePackage(pkgOrName) ?: return false
         val intent = service.packageManager.getLaunchIntentForPackage(pkg) ?: return false
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)

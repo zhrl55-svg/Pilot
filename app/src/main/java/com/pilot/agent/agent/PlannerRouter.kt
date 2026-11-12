@@ -25,9 +25,9 @@ class PlannerRouter(
         val simple = isSingleStep(goal)
         return buildList {
             if (s.mode == AssistantMode.AGENT) {
-                // Fast rules still get first refusal for atomic system actions.
-                add(onDevice)
+                // Agent 模式由模型主导决策；规则只在云端不可用或解析失败时兜底。
                 if (s.cloudReady) add(cloud)
+                add(onDevice)
                 if (s.enableLocalModel) add(local)
                 return@buildList
             }

@@ -9,25 +9,17 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.RectF
-import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.provider.Settings
-import android.text.SpannableString
-import android.text.Spanned
-import android.text.style.ForegroundColorSpan
-import android.text.style.StyleSpan
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
-import android.widget.LinearLayout
-import android.widget.TextView
 import com.pilot.agent.Dbg
 import kotlin.math.abs
 import kotlin.math.sin
 
-/** Draggable, dismissible status pill shown only while Pilot is in the background. */
+/** Draggable status circle shown only while Pilot is working in the background. */
 object PilotStatusOverlay {
     private const val TAG = "PilotStatusOverlay"
     private const val PREFS = "floating_status_overlay_v2"
@@ -35,22 +27,17 @@ object PilotStatusOverlay {
     private const val KEY_Y = "y"
 
     private var windowManager: WindowManager? = null
-    private var pill: LinearLayout? = null
-    private var label: TextView? = null
-    private var glyph: StatusGlyphView? = null
+    private var statusView: StatusGlyphView? = null
     private var latestStatus = "正在待命"
-    private var renderedStatus: String? = null
-    private var dismissedUntilForeground = false
 
     fun onAppForeground(context: Context) {
-        dismissedUntilForeground = false
         remove(context)
     }
 
     fun show(context: Context, status: String) {
         latestStatus = status
-        if (dismissedUntilForeground || !canDraw(context)) return
-        if (pill != null) {
+        if (!canDraw(context)) return
+        if (statusView != null) {
             render()
             return
         }
@@ -58,47 +45,14 @@ object PilotStatusOverlay {
             val appContext = context.applicationContext
             val wm = appContext.getSystemService(Context.WINDOW_SERVICE) as WindowManager
             val density = appContext.resources.displayMetrics.density
-            val bar = LinearLayout(appContext).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                minimumHeight = dp(42, density)
-                setPadding(dp(12, density), 0, dp(3, density), 0)
-                elevation = dp(10, density).toFloat()
-            }
             val indicator = StatusGlyphView(appContext, density).apply {
-                layoutParams = LinearLayout.LayoutParams(dp(20, density), dp(20, density)).apply {
-                    marginEnd = dp(8, density)
-                }
+                isClickable = true
             }
-            val text = TextView(appContext).apply {
-                gravity = Gravity.CENTER_VERTICAL
-                setTextColor(Color.rgb(242, 247, 255))
-                textSize = 12.5f
-                typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-                maxLines = 1
-                ellipsize = android.text.TextUtils.TruncateAt.END
-                maxWidth = (appContext.resources.displayMetrics.widthPixels * 0.74f).toInt()
-                includeFontPadding = false
-                setPadding(0, 0, dp(4, density), 0)
-            }
-            val close = TextView(appContext).apply {
-                this.text = "×"
-                gravity = Gravity.CENTER
-                setTextColor(Color.rgb(179, 194, 212))
-                textSize = 18f
-                includeFontPadding = false
-                contentDescription = "隐藏悬浮条"
-                layoutParams = LinearLayout.LayoutParams(dp(32, density), dp(42, density))
-            }
-            bar.addView(indicator)
-            bar.addView(text, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(42, density)))
-            bar.addView(close)
-            applyBackground(bar, density, COLOR_STANDBY)
 
             val prefs = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             val lp = WindowManager.LayoutParams(
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.WRAP_CONTENT,
+                dp(40, density),
+                dp(40, density),
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                     WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
                 else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE,
@@ -111,16 +65,14 @@ object PilotStatusOverlay {
                 x = prefs.getInt(KEY_X, dp(16, density))
                 y = prefs.getInt(KEY_Y, dp(56, density))
             }
-            installTouchHandler(appContext, bar, wm, lp, density)
-            wm.addView(bar, lp)
+            installTouchHandler(appContext, indicator, wm, lp, density)
+            wm.addView(indicator, lp)
             windowManager = wm
-            pill = bar
-            label = text
-            glyph = indicator
+            statusView = indicator
             render()
-            Dbg.i(TAG, "状态悬浮条已显示")
+            Dbg.i(TAG, "状态悬浮圆已显示")
         } catch (t: Throwable) {
-            Dbg.w(TAG, "显示状态悬浮条失败 ${t.message}")
+            Dbg.w(TAG, "显示状态悬浮圆失败 ${t.message}")
             remove(context)
         }
     }
@@ -131,7 +83,7 @@ object PilotStatusOverlay {
             remove(context)
             return
         }
-        if (pill != null) render()
+        if (statusView != null) render()
     }
 
     fun hide(context: Context) = remove(context)
@@ -141,26 +93,11 @@ object PilotStatusOverlay {
     }.getOrDefault(false)
 
     private fun render() {
-        val bar = pill ?: return
-        val text = label ?: return
-        val indicator = glyph ?: return
+        val indicator = statusView ?: return
         val mode = modeFor(latestStatus)
         val tint = colorFor(mode)
-        val density = bar.resources.displayMetrics.density
-        if (renderedStatus != latestStatus) {
-            renderedStatus = latestStatus
-            val brand = "PILOT"
-            text.text = SpannableString("$brand  ·  $latestStatus").apply {
-                setSpan(ForegroundColorSpan(Color.rgb(179, 198, 220)), 0, brand.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                setSpan(StyleSpan(Typeface.BOLD), 0, brand.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-            }
-            text.contentDescription = "Pilot 状态：$latestStatus。点击打开 Pilot，拖动可移动，点右侧叉号隐藏。"
-            text.alpha = 0.72f
-            text.animate().cancel()
-            text.animate().alpha(1f).setDuration(220L).start()
-        }
         indicator.setVisual(mode, tint)
-        applyBackground(bar, density, tint)
+        indicator.contentDescription = "Pilot 状态：$latestStatus。点击打开 Pilot，拖动可移动。"
     }
 
     private fun modeFor(status: String): StatusMode = when {
@@ -185,20 +122,9 @@ object PilotStatusOverlay {
         StatusMode.OFF -> Color.rgb(130, 146, 166)
     }
 
-    private fun applyBackground(bar: LinearLayout, density: Float, tint: Int) {
-        val background = GradientDrawable(
-            GradientDrawable.Orientation.LEFT_RIGHT,
-            intArrayOf(Color.argb(246, 18, 29, 44), Color.argb(238, 29, 43, 61)),
-        ).apply {
-            cornerRadius = dp(24, density).toFloat()
-            setStroke(dp(1, density), (tint and 0x00FFFFFF) or 0xA0000000.toInt())
-        }
-        bar.background = background
-    }
-
     private fun installTouchHandler(
         context: Context,
-        view: LinearLayout,
+        view: View,
         wm: WindowManager,
         lp: WindowManager.LayoutParams,
         density: Float,
@@ -237,19 +163,13 @@ object PilotStatusOverlay {
                         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
                             .putInt(KEY_X, lp.x).putInt(KEY_Y, lp.y).apply()
                     } else {
-                        if (event.x >= view.width - dp(42, density)) {
-                            dismissedUntilForeground = true
-                            Dbg.i(TAG, "用户隐藏状态悬浮条")
-                            remove(context)
-                        } else {
-                            remove(context)
-                            runCatching {
-                                context.startActivity(
-                                    Intent(context, MainActivity::class.java)
-                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
-                                )
-                            }.onFailure { Dbg.w(TAG, "点悬浮条打开 Pilot 失败 ${it.message}") }
-                        }
+                        remove(context)
+                        runCatching {
+                            context.startActivity(
+                                Intent(context, MainActivity::class.java)
+                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                            )
+                        }.onFailure { Dbg.w(TAG, "点状态悬浮圆打开 Pilot 失败 ${it.message}") }
                     }
                     true
                 }
@@ -260,15 +180,12 @@ object PilotStatusOverlay {
     }
 
     private fun remove(context: Context) {
-        val view = pill ?: return
+        val view = statusView ?: return
         val wm = windowManager ?: context.applicationContext.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
-        pill = null
-        label = null
-        glyph = null
-        renderedStatus = null
+        statusView = null
         windowManager = null
         runCatching { wm?.removeView(view) }
-            .onFailure { Dbg.w(TAG, "移除状态悬浮条失败 ${it.message}") }
+            .onFailure { Dbg.w(TAG, "移除状态悬浮圆失败 ${it.message}") }
     }
 
     private fun dp(value: Int, density: Float): Int = (value * density + 0.5f).toInt()
@@ -316,14 +233,16 @@ object PilotStatusOverlay {
             super.onDraw(canvas)
             val cx = width / 2f
             val cy = height / 2f
-            val base = 3.5f * density
+            val visualScale = 2f
+            val base = 3.5f * visualScale * density
             paint.color = color
             paint.style = Paint.Style.FILL
+            paint.alpha = 255
             when (mode) {
                 StatusMode.LISTENING -> {
-                    val radius = (4f + phase * 6f) * density
+                    val radius = (4f + phase * 5.25f) * visualScale * density
                     paint.style = Paint.Style.STROKE
-                    paint.strokeWidth = 1.8f * density
+                    paint.strokeWidth = 1.8f * visualScale * density
                     paint.alpha = ((1f - phase) * 170).toInt()
                     canvas.drawCircle(cx, cy, radius, paint)
                     paint.style = Paint.Style.FILL
@@ -332,34 +251,34 @@ object PilotStatusOverlay {
                 }
                 StatusMode.PROCESSING -> {
                     paint.style = Paint.Style.STROKE
-                    paint.strokeWidth = 2.2f * density
+                    paint.strokeWidth = 2.2f * visualScale * density
                     paint.strokeCap = Paint.Cap.ROUND
-                    val r = 6.5f * density
+                    val r = 6.5f * visualScale * density
                     val oval = RectF(cx - r, cy - r, cx + r, cy + r)
                     canvas.drawArc(oval, phase * 360f, 250f, false, paint)
                     paint.style = Paint.Style.FILL
                 }
                 StatusMode.SPEAKING -> {
-                    val barWidth = 2.2f * density
+                    val barWidth = 2.2f * visualScale * density
                     for (i in 0..2) {
                         val wave = sin((phase * Math.PI * 2.0) + i * 1.8).toFloat()
-                        val h = (4f + (wave + 1f) * 3f) * density
-                        val x = cx + (i - 1) * 5f * density
+                        val h = (4f + (wave + 1f) * 3f) * visualScale * density
+                        val x = cx + (i - 1) * 5f * visualScale * density
                         canvas.drawRoundRect(x - barWidth, cy - h / 2f, x + barWidth, cy + h / 2f, barWidth, barWidth, paint)
                     }
                 }
                 StatusMode.NAVIGATION -> {
                     paint.style = Paint.Style.STROKE
-                    paint.strokeWidth = 1.7f * density
-                    canvas.drawCircle(cx, cy, 6.5f * density, paint)
+                    paint.strokeWidth = 1.7f * visualScale * density
+                    canvas.drawCircle(cx, cy, 6.5f * visualScale * density, paint)
                     paint.style = Paint.Style.FILL
                     canvas.save()
                     canvas.rotate(phase * 360f, cx, cy)
                     val arrow = Path().apply {
-                        moveTo(cx, cy - 7f * density)
-                        lineTo(cx + 3f * density, cy + 4f * density)
-                        lineTo(cx, cy + 2f * density)
-                        lineTo(cx - 3f * density, cy + 4f * density)
+                        moveTo(cx, cy - 7f * visualScale * density)
+                        lineTo(cx + 3f * visualScale * density, cy + 4f * visualScale * density)
+                        lineTo(cx, cy + 2f * visualScale * density)
+                        lineTo(cx - 3f * visualScale * density, cy + 4f * visualScale * density)
                         close()
                     }
                     canvas.drawPath(arrow, paint)
@@ -367,7 +286,7 @@ object PilotStatusOverlay {
                 }
                 StatusMode.STANDBY -> {
                     paint.alpha = (110 + 45 * sin(phase * Math.PI * 2.0)).toInt()
-                    canvas.drawCircle(cx, cy, (6.5f + phase * 1.2f) * density, paint)
+                    canvas.drawCircle(cx, cy, (6.5f + phase * 1.2f) * visualScale * density, paint)
                     paint.alpha = 255
                     canvas.drawCircle(cx, cy, base, paint)
                 }

@@ -157,6 +157,7 @@ class VoiceInput(
         if (!ensureCapture()) return false
         mode = Mode.WAKE
         resumeToWake = true
+        dndRequested = false
         ring.clear()
         emitState(State.WAKE_WAIT)
         Dbg.i(TAG, "进入待命，KWS 词表=$allWords")
@@ -199,6 +200,7 @@ class VoiceInput(
             AudioFocusManager.pauseMusicForVoice()
         }
         resumeToWake = resumeWake
+        dndRequested = false
         wakeAuthorized = true
         vad?.reset()
         mode = Mode.LISTEN
@@ -703,6 +705,16 @@ class VoiceInput(
     }
 
     private fun backToIdleOrWake() {
+        // A recognition worker can finish after the main thread has already
+        // switched to do-not-disturb. Never publish ACTIVE/WAKE_WAIT over DND.
+        if (dndRequested) {
+            mode = Mode.WAKE
+            wake.reset()
+            vad?.reset()
+            emitState(State.ASLEEP)
+            Dbg.i(TAG, "免打扰已生效，跳过活跃期恢复")
+            return
+        }
         AudioFocusManager.resumeMusicAfterVoice()
         if (resumeToWake) {
             val sec = AgentSettings.load().idleSleepSeconds

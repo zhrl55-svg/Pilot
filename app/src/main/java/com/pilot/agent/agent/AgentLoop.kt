@@ -1038,7 +1038,7 @@ class AgentLoop(
         }
         skills.recordHit(skill.id)
         Dbg.i(TAG, "replay done goal=${skill.goal} steps=${skill.steps.size}")
-        return "按已学技能完成：${skill.goal}"
+        return "${skill.goal.trim().trimEnd('。', '！', '!', '；', ';')}已完成"
     }
 
     private suspend fun replayStep(step: SkillStep, snap: ScreenSnapshot): Boolean = when (step.action) {

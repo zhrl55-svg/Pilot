@@ -12,6 +12,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.pilot.agent.Dbg
 import com.pilot.agent.agent.AgentEvent
+import com.pilot.agent.agent.AgentIntentRouter
 import com.pilot.agent.agent.AgentSettings
 import com.pilot.agent.agent.AssistantMode
 import com.pilot.agent.agent.IntentGate
@@ -462,6 +463,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     private var lastAccessibilityPromptAt = 0L
     @Volatile
     private var pendingToolConfirm: PendingToolConfirm? = null
+    private var dispatchJob: kotlinx.coroutines.Job? = null
     private var seq = 0L
 
     init {
@@ -676,7 +678,10 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         voice = AgentRuntime.ensureVoiceInput()
         voice?.let { v ->
             // 单例复用：把回调换成当前 ViewModel 的
-            v.onState = { voiceState = it }
+            v.onState = {
+                voiceState = it
+                dndRequested = v.dndRequested
+            }
             v.onText = { text ->
                 // ★ 去重：同一条内容短时间内重复到达只显示一次。
                 //   长按录音松手时，VAD 会 flush 出一句；麦克风还在录，
@@ -1152,6 +1157,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                                 "用一到两句话回答，简短口语化，不要用列表。" +
                                 "你能开关应用、查天气、股票和火车余票、播音乐、做导航，" +
                                 "也能在明确请求下查看设备状态、读取指定文件和管理本机长期记忆。" +
+                                IntentGate.SELF_KNOWLEDGE +
                                 memoryPrompt +
                                 "下面是最近的对话，接住其中的指代和上下文。",
                         )
@@ -1207,6 +1213,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         return llm.generate(
             "system\n你是手机助手 Pilot，运行在这台安卓手机上，现在是 $now。" +
                 "能开关应用、查天气股票和火车余票、播音乐、跑命令、做导航。" +
+                IntentGate.SELF_KNOWLEDGE +
                 memoryPrompt +
                 "回答简短口语化，不超过 25 个字。$noThink\n" +
                 "user\n$text\nassistant\n"
@@ -1292,18 +1299,100 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         if (tryRunLocalTool(g, allowConfirmation = true, matchedTool = invocation)) return
 
         val kind = IntentGate.classify(g)
-        when (mode) {
-            AssistantMode.ASSISTANT -> when (kind) {
+        Dbg.i(TAG, "dispatch intent=${kind.name.lowercase()} mode=${mode.storageValue}")
+        if (mode == AssistantMode.ASSISTANT) {
+            when (kind) {
                 IntentGate.Kind.QUERY -> query(g)
                 IntentGate.Kind.CHAT -> chat(g)
                 IntentGate.Kind.TASK -> startAgent(g, AssistantMode.ASSISTANT)
             }
-            AssistantMode.AGENT -> when (kind) {
-                IntentGate.Kind.QUERY, IntentGate.Kind.TASK ->
-                    startAgent(g, AssistantMode.AGENT)
-                IntentGate.Kind.CHAT -> chat(g)
-            }
+            return
         }
+        routeAgentRequest(g, kind)
+    }
+
+    /**
+     * Agent 模式先让模型决定回答还是执行。关键词分类只作为云端不可用、
+     * 请求失败或响应无法解析时的安全兜底。
+     */
+    private fun routeAgentRequest(
+        text: String,
+        fallbackKind: IntentGate.Kind,
+    ) {
+        if (running) return
+        val current = AgentSettings.load()
+        if (!current.cloudReady) {
+            Dbg.i(TAG, "agent router fallback: cloud unavailable")
+            fallbackAgentDispatch(text, fallbackKind)
+            return
+        }
+
+        running = true
+        justSent = true
+        activeTaskLabel = "Agent 判断目标"
+        publishNotificationStatus()
+        add(LogEntry.Kind.THINK, "Agent 正在理解目标并选择回答或执行…")
+        dispatchJob = viewModelScope.launch {
+            val now = java.text.SimpleDateFormat("yyyy年M月d日 EEEE HH:mm", java.util.Locale.CHINA)
+                .format(java.util.Date())
+            val memory = AgentRuntime.localTools.memory.promptContext(text, 5)
+            val decision = try {
+                AgentIntentRouter { AgentSettings.load() }
+                    .decide(text, chatHistory.toList(), memory, now)
+            } catch (t: kotlinx.coroutines.CancellationException) {
+                throw t
+            } catch (t: Throwable) {
+                Dbg.w(TAG, "agent router unavailable: ${t.message}")
+                null
+            }
+
+            running = false
+            justSent = false
+            activeTaskLabel = ""
+            publishNotificationStatus()
+            dispatchJob = null
+
+            if (decision == null) {
+                fallbackAgentDispatch(text, fallbackKind)
+                return@launch
+            }
+            if (decision.execute) {
+                if (decision.thought.isNotBlank()) {
+                    add(LogEntry.Kind.THINK, "Agent 判断：${decision.thought}")
+                }
+                Dbg.i(TAG, "agent router -> agent thought=${decision.thought}")
+                startAgent(text, AssistantMode.AGENT)
+                return@launch
+            }
+
+            val answer = decision.answer?.trim().orEmpty()
+            if (answer.isBlank()) {
+                fallbackAgentDispatch(text, fallbackKind)
+                return@launch
+            }
+            Dbg.i(TAG, "agent router -> reply chars=${answer.length} thought=${decision.thought}")
+            finishDirectAnswer(text, answer)
+        }
+    }
+
+    private fun fallbackAgentDispatch(
+        text: String,
+        kind: IntentGate.Kind,
+    ) {
+        when (kind) {
+            IntentGate.Kind.CHAT -> chat(text)
+            IntentGate.Kind.QUERY, IntentGate.Kind.TASK ->
+                startAgent(text, AssistantMode.AGENT)
+        }
+    }
+
+    private fun finishDirectAnswer(question: String, answer: String) {
+        val clean = answer.trim().take(1_200)
+        chatHistory.addLast(question to clean)
+        while (chatHistory.size > 40) chatHistory.removeFirst()
+        add(LogEntry.Kind.DONE, clean)
+        AgentRuntime.speaker.speak(clean)
+        refreshStatus()
     }
 
     private fun startAgent(g: String, effectiveMode: AssistantMode) {
@@ -1454,6 +1543,8 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             did = true
         }
         if (running || justSent) {
+            dispatchJob?.cancel()
+            dispatchJob = null
             AgentRuntime.loop?.cancel()
             running = false
             justSent = false
@@ -1467,6 +1558,8 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun stop() {
+        dispatchJob?.cancel()
+        dispatchJob = null
         AgentRuntime.loop?.cancel()
         pendingToolConfirm?.deferred?.complete(false)
         pendingToolConfirm = null

@@ -326,9 +326,11 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
             running = vm.running,
             sessionListening = run {
                 val st = vm.voiceState
-                st == com.pilot.agent.voice.VoiceInput.State.ACTIVE ||
-                    st == com.pilot.agent.voice.VoiceInput.State.LISTENING ||
-                    st == com.pilot.agent.voice.VoiceInput.State.RECOGNIZING
+                !vm.dndRequested && (
+                    st == com.pilot.agent.voice.VoiceInput.State.ACTIVE ||
+                        st == com.pilot.agent.voice.VoiceInput.State.LISTENING ||
+                        st == com.pilot.agent.voice.VoiceInput.State.RECOGNIZING
+                )
             },
             onSend = {
                 vm.run(input.text)
@@ -1524,22 +1526,27 @@ private fun InputBar(
         }
     }
 
-    val spin = rememberInfiniteTransition(label = "rec")
-    val phase by spin.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            tween(3600, easing = LinearEasing),   // 慢一点，像"在录"而不是"在闪"
-            repeatMode = RepeatMode.Reverse,
-        ),
-        label = "phase",
-    )
-
     // ★ 老板要求：语音唤醒或长按激活后进入连续对话，只要麦克风还在收，
     //   输入框就要显示「正在听…」+ 流光边框。
     //   但排除 WAKE_WAIT/ASLEEP（常驻待命也在开麦，那不算"在听"）——
     //   这正是之前"输入框一直显示正在听"的坑，靠 sessionListening 区分。
     val live = recording || sessionListening
+    // 只在实际聆听时创建动画；进入休眠后立即销毁，避免隐藏边框继续空转。
+    val phase = if (live) {
+        val spin = rememberInfiniteTransition(label = "rec")
+        val animatedPhase by spin.animateFloat(
+            initialValue = 0f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(
+                tween(3600, easing = LinearEasing),   // 慢一点，像"在录"而不是"在闪"
+                repeatMode = RepeatMode.Reverse,
+            ),
+            label = "phase",
+        )
+        animatedPhase
+    } else {
+        0f
+    }
 
     Row(verticalAlignment = Alignment.Bottom) {
         Box(Modifier.weight(1f)) {

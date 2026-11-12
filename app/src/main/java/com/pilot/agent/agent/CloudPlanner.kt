@@ -56,8 +56,18 @@ class CloudPlanner(private val settingsProvider: () -> AgentSettings) : Planner 
 
     private fun call(s: AgentSettings, req: AgentRequest, retryHint: String?): String {
         val history = req.history.takeLast(8)
+        val memory = com.pilot.agent.runtime.AgentRuntime.localTools.memory
+            .promptContext(req.goal, 5)
+        val now = java.text.SimpleDateFormat(
+            "yyyy年M月d日 EEEE HH:mm",
+            java.util.Locale.CHINA,
+        ).format(java.util.Date())
         val userText = buildString {
             append("用户目标: ").append(req.goal).append('\n')
+            append("当前时间: ").append(now).append('\n')
+            if (memory.isNotBlank()) {
+                append("相关长期记忆:\n").append(memory).append('\n')
+            }
             if (history.isNotEmpty()) {
                 append("已执行步骤:\n")
                 history.forEachIndexed { i, h -> append(i + 1).append(". ").append(h).append('\n') }
@@ -140,7 +150,9 @@ class CloudPlanner(private val settingsProvider: () -> AgentSettings) : Planner 
 """.trimIndent()
 
         val SYSTEM_PROMPT: String = """
-你是手机操作助手 Pilot，代替用户在 Android 手机上完成任务。每次只输出一个动作。
+你是系统级手机助理 Pilot 的 Agent 执行模型。你要先理解用户目标和当前屏幕，
+再自主选择下一步，不能机械复述关键词或把用户问题重新输入 Pilot。
+每次只输出一个动作。
 
 严格输出 JSON，不要 markdown 代码块：
 {"thought":"一句话推理","action":{"action":"tap_node","id":3}}
@@ -171,6 +183,8 @@ class CloudPlanner(private val settingsProvider: () -> AgentSettings) : Planner 
 - ask {summary}                     信息不足或需要用户确认
 
 规则：
+0. 先判断用户是在问信息还是需要操作。若当前请求只需回答、无需继续操作，直接 done，
+   summary 写自然、准确的回答；绝不打开或操作 Pilot 自己的聊天界面来重复提交。
 1. 优先 tap_node 并引用列表里的节点 id，不要自己推算坐标。
 2. 同一动作连续失败两次就换策略，绝不重复。
 3. 目标内容可能不在当前屏，先 scroll 再看。
@@ -179,6 +193,9 @@ class CloudPlanner(private val settingsProvider: () -> AgentSettings) : Planner 
 6. 需要登录或动态网页时使用 browser_*；browser_read 读不到正文时先 browser_click 关闭遮挡层、处理同意按钮或等待。
 7. 调用会产生外部副作用的 MCP 工具前先用 ask 确认；只读查询可直接调用。
 8. 只输出 JSON。
+9. 不声称已完成未执行的动作；需要实时信息时必须使用浏览器、MCP 或已有工具读取。
+
+${IntentGate.SELF_KNOWLEDGE}
 """.trimIndent()
     }
 }

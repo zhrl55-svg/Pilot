@@ -35,6 +35,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
@@ -42,7 +43,6 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -57,13 +57,16 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -311,13 +314,13 @@ private fun SettingsTopBar(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 18.dp, vertical = 14.dp),
+            .padding(horizontal = 16.dp, vertical = 8.dp),
     ) {
         if (page == null) {
             Box(
                 modifier = Modifier
-                    .size(42.dp)
-                    .clip(RoundedCornerShape(14.dp))
+                    .size(38.dp)
+                    .clip(RoundedCornerShape(12.dp))
                     .background(
                         Brush.linearGradient(
                             listOf(SettingsBlue.copy(alpha = 0.24f), Color.Transparent),
@@ -326,11 +329,16 @@ private fun SettingsTopBar(
                     .border(
                         1.dp,
                         SettingsBlue.copy(alpha = 0.35f),
-                        RoundedCornerShape(14.dp),
+                        RoundedCornerShape(12.dp),
                     ),
                 contentAlignment = Alignment.Center,
             ) {
-                Text("设", color = SettingsBlue, fontWeight = FontWeight.Bold, fontSize = 17.sp)
+                SettingsGearGlyph(
+                    color = SettingsBlue,
+                    modifier = Modifier
+                        .size(21.dp)
+                        .semantics { contentDescription = "设置中心" },
+                )
             }
         } else {
             SettingsRoundButton(
@@ -340,24 +348,61 @@ private fun SettingsTopBar(
             )
         }
 
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text(
-                page?.title ?: "设置中心",
-                fontSize = 21.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = colors.onBackground,
-            )
-            Text(
-                page?.subtitle ?: "按功能分类管理 Pilot",
-                fontSize = 11.sp,
-                color = SettingsMuted,
-            )
+        if (page == null) {
+            Spacer(Modifier.weight(1f))
+        } else {
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    page.title,
+                    fontSize = 19.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = colors.onBackground,
+                )
+                Text(
+                    page.subtitle,
+                    fontSize = 10.sp,
+                    color = SettingsMuted,
+                )
+            }
         }
         SettingsRoundButton(
             text = "×",
             contentDescription = "关闭设置，不保存修改",
             onClick = onClose,
+        )
+    }
+}
+
+@Composable
+private fun SettingsGearGlyph(
+    color: Color,
+    modifier: Modifier = Modifier,
+) {
+    Canvas(modifier) {
+        val center = Offset(size.width / 2f, size.height / 2f)
+        val stroke = 1.8.dp.toPx()
+        val gear = Path()
+        repeat(16) { index ->
+            val angle = Math.toRadians((index * 22.5) - 90.0)
+            val radius = size.minDimension * if (index % 2 == 0) 0.47f else 0.34f
+            val point = Offset(
+                center.x + kotlin.math.cos(angle).toFloat() * radius,
+                center.y + kotlin.math.sin(angle).toFloat() * radius,
+            )
+            if (index == 0) {
+                gear.moveTo(point.x, point.y)
+            } else {
+                gear.lineTo(point.x, point.y)
+            }
+        }
+        gear.close()
+        drawPath(gear, color = color, style = Stroke(width = stroke))
+        drawCircle(
+            color = color,
+            radius = size.minDimension * 0.11f,
+            center = center,
+            style = Stroke(width = stroke),
         )
     }
 }
@@ -370,7 +415,7 @@ private fun SettingsRoundButton(
 ) {
     Box(
         modifier = Modifier
-            .size(40.dp)
+            .size(36.dp)
             .clip(CircleShape)
             .background(SettingsCardRaised)
             .border(1.dp, SettingsLine, CircleShape)
@@ -378,7 +423,7 @@ private fun SettingsRoundButton(
             .clickable(onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
-        Text(text, color = MaterialTheme.colorScheme.onSurface, fontSize = 22.sp)
+        Text(text, color = MaterialTheme.colorScheme.onSurface, fontSize = 20.sp)
     }
 }
 
@@ -389,7 +434,6 @@ private fun SettingsHome(
     listState: androidx.compose.foundation.lazy.LazyListState,
     onOpen: (SettingsPage) -> Unit,
 ) {
-    val colors = MaterialTheme.colorScheme
     val permissionCount = listOf(
         vm.notificationAccess,
         vm.reminderNotificationsAllowed,
@@ -400,88 +444,13 @@ private fun SettingsHome(
         modifier = Modifier.fillMaxSize(),
         state = listState,
         contentPadding = PaddingValues(
-            start = 18.dp,
-            top = 16.dp,
-            end = 18.dp,
-            bottom = 28.dp,
+            start = 16.dp,
+            top = 10.dp,
+            end = 16.dp,
+            bottom = 24.dp,
         ),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        item {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(24.dp))
-                    .background(
-                        Brush.linearGradient(
-                            listOf(
-                                Color(0xFF152744),
-                                Color(0xFF0C1423),
-                                Color(0xFF080A0F),
-                            ),
-                        ),
-                    )
-                    .border(
-                        1.dp,
-                        SettingsBlue.copy(alpha = 0.28f),
-                        RoundedCornerShape(24.dp),
-                    )
-                    .padding(18.dp),
-            ) {
-                Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text(
-                                "Pilot 设置",
-                                fontSize = 18.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = colors.onBackground,
-                            )
-                            Text(
-                                "配置能力、连接和服务",
-                                fontSize = 11.sp,
-                                color = SettingsMuted,
-                            )
-                        }
-                        StatusPill(
-                            text = if (vm.accessibilityOn) "助理已就绪" else "助理未连接",
-                            active = vm.accessibilityOn,
-                        )
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        StatusMetric(
-                            label = "通知",
-                            value = if (vm.notificationAccess) "已开" else "未开",
-                            active = vm.notificationAccess,
-                            modifier = Modifier.weight(1f),
-                        )
-                        StatusMetric(
-                            label = "文件",
-                            value = if (vm.allFilesAccess) "已开" else "未开",
-                            active = vm.allFilesAccess,
-                            modifier = Modifier.weight(1f),
-                        )
-                        StatusMetric(
-                            label = "权限",
-                            value = "$permissionCount/3",
-                            active = permissionCount == 3,
-                            modifier = Modifier.weight(1f),
-                        )
-                    }
-                }
-            }
-        }
-
-        item {
-            Text(
-                "功能分类",
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Medium,
-                color = colors.onSurfaceVariant,
-                modifier = Modifier.padding(start = 2.dp, top = 4.dp),
-            )
-        }
-
         item {
             SettingsCategoryCard(
                 page = SettingsPage.VOICE,
@@ -541,20 +510,20 @@ private fun SettingsHome(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(16.dp))
+                    .clip(RoundedCornerShape(14.dp))
                     .background(SettingsCard.copy(alpha = 0.7f))
-                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                    .padding(horizontal = 12.dp, vertical = 9.dp),
             ) {
                 Box(
                     Modifier
-                        .size(8.dp)
+                        .size(6.dp)
                         .clip(CircleShape)
                         .background(SettingsBlue),
                 )
-                Spacer(Modifier.width(9.dp))
+                Spacer(Modifier.width(8.dp))
                 Text(
                     "设置保存在本机；密钥字段使用加密存储。",
-                    fontSize = 11.sp,
+                    fontSize = 10.sp,
                     color = SettingsMuted,
                 )
             }
@@ -580,27 +549,6 @@ private fun StatusPill(text: String, active: Boolean) {
 }
 
 @Composable
-private fun StatusMetric(
-    label: String,
-    value: String,
-    active: Boolean,
-    modifier: Modifier = Modifier,
-) {
-    val tint = if (active) Color(0xFF79AFFF) else SettingsMuted
-    Column(
-        modifier = modifier
-            .clip(RoundedCornerShape(13.dp))
-            .background(Color.Black.copy(alpha = 0.24f))
-            .border(1.dp, SettingsLine.copy(alpha = 0.65f), RoundedCornerShape(13.dp))
-            .padding(horizontal = 10.dp, vertical = 9.dp),
-    ) {
-        Text(label, fontSize = 9.sp, color = SettingsMuted)
-        Spacer(Modifier.height(2.dp))
-        Text(value, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = tint)
-    }
-}
-
-@Composable
 private fun SettingsCategoryCard(
     page: SettingsPage,
     status: String,
@@ -619,41 +567,41 @@ private fun SettingsCategoryCard(
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(horizontal = 15.dp, vertical = 14.dp),
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
         ) {
             Box(
                 modifier = Modifier
-                    .size(46.dp)
-                    .clip(RoundedCornerShape(15.dp))
+                    .size(40.dp)
+                    .clip(RoundedCornerShape(13.dp))
                     .background(page.accent.copy(alpha = 0.13f))
                     .border(
                         1.dp,
                         page.accent.copy(alpha = 0.24f),
-                        RoundedCornerShape(15.dp),
+                        RoundedCornerShape(13.dp),
                     ),
                 contentAlignment = Alignment.Center,
             ) {
                 SettingsCategoryGlyph(page)
             }
-            Spacer(Modifier.width(13.dp))
+            Spacer(Modifier.width(10.dp))
             Column(Modifier.weight(1f)) {
                 Text(
                     page.title,
-                    fontSize = 15.sp,
+                    fontSize = 14.sp,
                     fontWeight = FontWeight.Medium,
                     color = colors.onSurface,
                 )
-                Spacer(Modifier.height(3.dp))
+                Spacer(Modifier.height(1.dp))
                 Text(
                     page.subtitle,
-                    fontSize = 10.sp,
+                    fontSize = 9.sp,
                     color = SettingsMuted,
-                    lineHeight = 14.sp,
+                    lineHeight = 12.sp,
                 )
-                Spacer(Modifier.height(6.dp))
+                Spacer(Modifier.height(4.dp))
                 Text(
                     status,
-                    fontSize = 10.sp,
+                    fontSize = 9.sp,
                     color = if (statusActive) page.accent else SettingsMuted,
                     maxLines = 1,
                 )
@@ -875,11 +823,10 @@ private fun VoiceSettingsPage(vm: AgentViewModel, draft: SettingsDraft) {
                     onCheckedChange = { draft.requireVoiceprint = it },
                 )
                 SettingsTextField(
-                    label = "声纹阈值",
+                    label = "声纹阈值（0.10–0.90，越低越宽松）",
                     value = draft.voiceprintThreshold,
                     onValueChange = { draft.voiceprintThreshold = it },
                     keyboardType = KeyboardType.Decimal,
-                    helper = "0.10–0.90，越低越宽松",
                 )
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
@@ -903,11 +850,10 @@ private fun VoiceSettingsPage(vm: AgentViewModel, draft: SettingsDraft) {
                 description = "唤醒后在一段时间内可直接连续对话；可设置播报期间用语音打断。",
             ) {
                 SettingsTextField(
-                    label = "对话结束后休眠",
+                    label = "对话结束后休眠（秒；0 表示持续保持聆听）",
                     value = draft.idleSleepSeconds,
                     onValueChange = { draft.idleSleepSeconds = it },
                     keyboardType = KeyboardType.Number,
-                    helper = "秒；0 表示持续保持聆听",
                 )
                 SettingsToggleRow(
                     title = "语音打断",
@@ -990,16 +936,15 @@ private fun AiSettingsPage(draft: SettingsDraft) {
         item {
             SettingsSectionCard(
                 title = "对话模型",
-                description = "兼容 OpenAI Chat Completions 接口。API Key 会加密保存在本机。",
             ) {
                 SettingsTextField(
-                    label = "Base URL",
+                    label = "Base URL（OpenAI Chat Completions 兼容接口）",
                     value = draft.baseUrl,
                     onValueChange = { draft.baseUrl = it },
                     keyboardType = KeyboardType.Uri,
                 )
                 SettingsSecretField(
-                    label = "API Key",
+                    label = "API Key（加密保存在本机）",
                     value = draft.apiKey,
                     onValueChange = { draft.apiKey = it },
                 )
@@ -1009,11 +954,10 @@ private fun AiSettingsPage(draft: SettingsDraft) {
                     onValueChange = { draft.model = it },
                 )
                 SettingsTextField(
-                    label = "上下文轮数",
+                    label = "上下文轮数（普通聊天携带最近几轮问答）",
                     value = draft.maxChatTurns,
                     onValueChange = { draft.maxChatTurns = it },
                     keyboardType = KeyboardType.Number,
-                    helper = "普通聊天携带最近几轮问答",
                 )
                 SettingsToggleRow(
                     title = "简单指令优先走端侧",
@@ -1027,14 +971,13 @@ private fun AiSettingsPage(draft: SettingsDraft) {
         item {
             SettingsSectionCard(
                 title = "网络搜索",
-                description = "通用网页搜索使用 Brave Search API；新闻主题仍可通过 Google News RSS 获取。",
+                description = "新闻主题仍可通过 Google News RSS 获取。",
             ) {
                 SettingsSecretField(
-                    label = "Brave Search API Key",
+                    label = "Brave Search API Key（通用网页搜索，可在 Dashboard 申请）",
                     value = draft.webSearchApiKey,
                     onValueChange = { draft.webSearchApiKey = it },
                 )
-                InfoLine("可在 Brave Search API Dashboard 申请 Key")
             }
         }
     }
@@ -1065,11 +1008,11 @@ private fun AgentSettingsPage(vm: AgentViewModel, draft: SettingsDraft) {
                 )
                 InfoLine(draft.mode.description)
                 SettingsTextField(
-                    label = "Agent 最大执行步数",
+                    label = "Agent 最大执行步数（${AgentSettings.MIN_AGENT_TURNS}–" +
+                        "${AgentSettings.MAX_AGENT_TURNS}，默认 ${AgentSettings.DEFAULT_MAX_TURNS}）",
                     value = draft.maxTurns,
                     onValueChange = { draft.maxTurns = it.filter(Char::isDigit).take(2) },
                     keyboardType = KeyboardType.Number,
-                    helper = "${AgentSettings.MIN_AGENT_TURNS}–${AgentSettings.MAX_AGENT_TURNS} 步；默认 ${AgentSettings.DEFAULT_MAX_TURNS}",
                 )
                 DropdownSetting(
                     label = "模型思考强度",
@@ -1243,13 +1186,13 @@ private fun MusicSettingsPage(vm: AgentViewModel, draft: SettingsDraft) {
                 description = "Wi‑Fi 下优先局域网，移动网络下优先 Tailnet；主地址失败时自动尝试备用地址。",
             ) {
                 SettingsTextField(
-                    label = "在线 API 主地址",
+                    label = "在线 API 主地址（Wi‑Fi 下优先局域网）",
                     value = draft.musicBaseUrl,
                     onValueChange = { draft.musicBaseUrl = it },
                     keyboardType = KeyboardType.Uri,
                 )
                 SettingsTextField(
-                    label = "备用地址",
+                    label = "备用地址（主地址失败时自动尝试）",
                     value = draft.musicFallbackUrl,
                     onValueChange = { draft.musicFallbackUrl = it },
                     keyboardType = KeyboardType.Uri,
@@ -1484,11 +1427,10 @@ private fun SandboxSettingsPage(vm: AgentViewModel, draft: SettingsDraft) {
                 description = "沙箱进程闲置后自动回收内存，下次使用会自动重启。",
             ) {
                 SettingsTextField(
-                    label = "空闲回收时间",
+                    label = "空闲回收时间（分钟；0 表示不自动回收）",
                     value = draft.sandboxIdleMinutes,
                     onValueChange = { draft.sandboxIdleMinutes = it },
                     keyboardType = KeyboardType.Number,
-                    helper = "分钟；0 表示不自动回收",
                 )
             }
         }
@@ -1580,11 +1522,11 @@ private fun SettingsPageList(content: androidx.compose.foundation.lazy.LazyListS
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(
             start = 16.dp,
-            top = 14.dp,
+            top = 10.dp,
             end = 16.dp,
-            bottom = 28.dp,
+            bottom = 24.dp,
         ),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
         content = content,
     )
 }
@@ -1604,13 +1546,13 @@ private fun SettingsSectionCard(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text(
                     title,
-                    fontSize = 14.sp,
+                    fontSize = 13.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = colors.onSurface,
                 )
@@ -1618,7 +1560,7 @@ private fun SettingsSectionCard(
                     Text(
                         description,
                         fontSize = 10.sp,
-                        lineHeight = 15.sp,
+                        lineHeight = 13.sp,
                         color = SettingsMuted,
                     )
                 }
@@ -1635,33 +1577,16 @@ private fun SettingsTextField(
     onValueChange: (String) -> Unit,
     modifier: Modifier = Modifier,
     placeholder: String = "",
-    helper: String? = null,
     keyboardType: KeyboardType = KeyboardType.Text,
 ) {
-    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Text(label, fontSize = 10.sp, color = SettingsMuted)
-        OutlinedTextField(
+        CompactTextField(
             value = value,
             onValueChange = onValueChange,
-            singleLine = true,
-            placeholder = {
-                if (placeholder.isNotBlank()) {
-                    Text(placeholder, fontSize = 12.sp, color = SettingsMuted.copy(alpha = 0.55f))
-                }
-            },
-            textStyle = androidx.compose.ui.text.TextStyle(
-                fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.onSurface,
-            ),
-            keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
-            shape = RoundedCornerShape(12.dp),
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(50.dp),
+            placeholder = placeholder,
+            keyboardType = keyboardType,
         )
-        if (helper != null) {
-            Text(helper, fontSize = 9.sp, color = SettingsMuted.copy(alpha = 0.85f))
-        }
     }
 }
 
@@ -1672,23 +1597,22 @@ private fun SettingsSecretField(
     onValueChange: (String) -> Unit,
 ) {
     var revealed by remember { mutableStateOf(false) }
-    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Text(label, fontSize = 10.sp, color = SettingsMuted)
-        OutlinedTextField(
+        CompactTextField(
             value = value,
             onValueChange = onValueChange,
-            singleLine = true,
-            textStyle = androidx.compose.ui.text.TextStyle(
-                fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.onSurface,
-            ),
             visualTransformation = if (revealed) {
                 VisualTransformation.None
             } else {
                 PasswordVisualTransformation()
             },
-            trailingIcon = {
-                TextButton(onClick = { revealed = !revealed }) {
+            trailing = {
+                TextButton(
+                    onClick = { revealed = !revealed },
+                    modifier = Modifier.height(26.dp),
+                    contentPadding = PaddingValues(horizontal = 6.dp),
+                ) {
                     Text(
                         if (revealed) "隐藏" else "显示",
                         fontSize = 9.sp,
@@ -1696,11 +1620,67 @@ private fun SettingsSecretField(
                     )
                 }
             },
-            shape = RoundedCornerShape(12.dp),
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(50.dp),
         )
+    }
+}
+
+@Composable
+private fun CompactTextField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    modifier: Modifier = Modifier,
+    placeholder: String = "",
+    keyboardType: KeyboardType = KeyboardType.Text,
+    visualTransformation: VisualTransformation = VisualTransformation.None,
+    trailing: (@Composable () -> Unit)? = null,
+) {
+    var focused by remember { mutableStateOf(false) }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = modifier
+            .fillMaxWidth()
+            .height(40.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(SettingsCardRaised.copy(alpha = 0.55f))
+            .border(
+                1.dp,
+                if (focused) SettingsBlue.copy(alpha = 0.85f) else SettingsLine,
+                RoundedCornerShape(10.dp),
+            )
+            .padding(horizontal = 12.dp),
+    ) {
+        BasicTextField(
+            value = value,
+            onValueChange = onValueChange,
+            singleLine = true,
+            textStyle = androidx.compose.ui.text.TextStyle(
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurface,
+            ),
+            keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
+            visualTransformation = visualTransformation,
+            cursorBrush = SolidColor(SettingsBlue),
+            modifier = Modifier
+                .weight(1f)
+                .onFocusChanged { focused = it.isFocused },
+            decorationBox = { innerTextField ->
+                Box(contentAlignment = Alignment.CenterStart) {
+                    if (value.isEmpty() && placeholder.isNotBlank()) {
+                        Text(
+                            placeholder,
+                            fontSize = 12.sp,
+                            color = SettingsMuted.copy(alpha = 0.55f),
+                            maxLines = 1,
+                        )
+                    }
+                    innerTextField()
+                }
+            },
+        )
+        if (trailing != null) {
+            Spacer(Modifier.width(6.dp))
+            trailing()
+        }
     }
 }
 
@@ -1711,7 +1691,10 @@ private fun SettingsToggleRow(
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit,
 ) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.heightIn(min = 32.dp),
+    ) {
         Column(Modifier.weight(1f)) {
             Text(
                 title,
@@ -1719,10 +1702,17 @@ private fun SettingsToggleRow(
                 fontWeight = FontWeight.Medium,
                 color = MaterialTheme.colorScheme.onSurface,
             )
-            Text(subtitle, fontSize = 9.sp, lineHeight = 13.sp, color = SettingsMuted)
+            Text(subtitle, fontSize = 9.sp, lineHeight = 11.sp, color = SettingsMuted)
         }
-        Spacer(Modifier.width(10.dp))
-        Switch(checked = checked, onCheckedChange = onCheckedChange)
+        Spacer(Modifier.width(8.dp))
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            modifier = Modifier
+                .width(46.dp)
+                .height(30.dp)
+                .scale(0.78f),
+        )
     }
 }
 
@@ -1748,7 +1738,7 @@ private fun SegmentChoice(
                     .clip(RoundedCornerShape(10.dp))
                     .background(if (active) SettingsBlue else Color.Transparent)
                     .clickable { onSelect(key) }
-                    .padding(horizontal = 7.dp, vertical = 9.dp),
+                    .padding(horizontal = 7.dp, vertical = 6.dp),
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
@@ -1782,7 +1772,7 @@ private fun DropdownSetting(
             .background(SettingsCardRaised)
             .border(1.dp, SettingsLine, RoundedCornerShape(12.dp))
             .clickable { expanded = true }
-            .padding(horizontal = 12.dp, vertical = 12.dp),
+            .padding(horizontal = 10.dp, vertical = 8.dp),
     ) {
         Text(label, fontSize = 10.sp, color = SettingsMuted, modifier = Modifier.weight(1f))
         Text(
@@ -1896,7 +1886,11 @@ private fun PermissionActionRow(
                 color = if (active) Color(0xFF59D6A8) else SettingsMuted,
             )
         }
-        TextButton(onClick = onAction) {
+        TextButton(
+            onClick = onAction,
+            modifier = Modifier.height(30.dp),
+            contentPadding = PaddingValues(horizontal = 8.dp),
+        ) {
             Text(action, fontSize = 10.sp, color = SettingsBlue)
         }
     }
@@ -1919,7 +1913,11 @@ private fun StatusActionRow(
             )
             Text(value, fontSize = 9.sp, color = SettingsMuted, lineHeight = 13.sp)
         }
-        TextButton(onClick = onAction) {
+        TextButton(
+            onClick = onAction,
+            modifier = Modifier.height(30.dp),
+            contentPadding = PaddingValues(horizontal = 8.dp),
+        ) {
             Text(action, fontSize = 10.sp, color = SettingsBlue)
         }
     }
@@ -1933,8 +1931,8 @@ private fun FilledAction(
 ) {
     Button(
         onClick = onClick,
-        modifier = modifier.height(42.dp),
-        shape = RoundedCornerShape(12.dp),
+        modifier = modifier.height(36.dp),
+        shape = RoundedCornerShape(10.dp),
         colors = ButtonDefaults.buttonColors(
             containerColor = SettingsBlue,
             contentColor = Color(0xFF06111F),
@@ -1954,9 +1952,9 @@ private fun OutlineAction(
     TextButton(
         onClick = onClick,
         modifier = modifier
-            .height(42.dp)
-            .border(1.dp, SettingsLine, RoundedCornerShape(12.dp)),
-        shape = RoundedCornerShape(12.dp),
+            .height(36.dp)
+            .border(1.dp, SettingsLine, RoundedCornerShape(10.dp)),
+        shape = RoundedCornerShape(10.dp),
     ) {
         Text(text, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface)
     }
@@ -2017,14 +2015,14 @@ private fun SettingsSaveBar(onSave: () -> Unit) {
         modifier = Modifier
             .fillMaxWidth()
             .background(SettingsBlack.copy(alpha = 0.98f))
-            .padding(horizontal = 18.dp, vertical = 12.dp),
+            .padding(horizontal = 16.dp, vertical = 8.dp),
     ) {
         Button(
             onClick = onSave,
             modifier = Modifier
                 .fillMaxWidth()
-                .height(50.dp),
-            shape = RoundedCornerShape(15.dp),
+                .height(44.dp),
+            shape = RoundedCornerShape(13.dp),
             colors = ButtonDefaults.buttonColors(
                 containerColor = SettingsBlue,
                 contentColor = Color(0xFF06111F),
