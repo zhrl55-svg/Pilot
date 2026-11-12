@@ -45,6 +45,11 @@ class LocationProvider(private val context: Context) {
     var city: String? = null
         private set
 
+    /** 当前朝向（度，正北 = 0，顺时针）。没有方向数据时保留上一次的值。 */
+    @Volatile
+    var bearing: Float = 0f
+        private set
+
     /** 是否已经拿到过有效坐标。 */
     @Volatile
     var ready = false
@@ -63,6 +68,10 @@ class LocationProvider(private val context: Context) {
     /** 已经用过系统兜底坐标（防止系统的粗坐标覆盖高德的准坐标）。 */
     @Volatile
     private var usedSystemFallback = false
+
+    /** 高德通道是否已经给过坐标（有的话系统坐标只做兜底，不覆盖）。 */
+    @Volatile
+    private var hasAmapFix = false
 
     // ------------------------------------------------------------ 生命周期
 
@@ -100,9 +109,11 @@ class LocationProvider(private val context: Context) {
                         val l = location ?: return
                         if (l.latitude == 0.0 || l.longitude == 0.0) return
                         // 高德坐标更准，**无条件覆盖**（包括系统兜底的值）
+                        hasAmapFix = true
                         usedSystemFallback = false
                         lat = l.latitude
                         lon = l.longitude
+                        if (l.hasBearing()) bearing = l.bearing
                         l.city?.takeIf { it.isNotBlank() }?.let { city = it }
                         if (!ready) {
                             ready = true
@@ -129,14 +140,19 @@ class LocationProvider(private val context: Context) {
             val listener = object : android.location.LocationListener {
                 override fun onLocationChanged(loc: android.location.Location) {
                     if (loc.latitude == 0.0 || loc.longitude == 0.0) return
-                    // 高德已经给过准坐标的话，系统坐标不覆盖（精度差）
+                    // 高德已经给过准坐标：系统这条只保留兜底职能，不覆盖
+                    if (hasAmapFix) return
                     if (usedSystemFallback) {
+                        lat = loc.latitude
+                        lon = loc.longitude
+                        if (loc.hasBearing()) bearing = loc.bearing
                         onLocation?.invoke(loc.latitude, loc.longitude)
                         return
                     }
                     usedSystemFallback = true
                     lat = loc.latitude
                     lon = loc.longitude
+                    if (loc.hasBearing()) bearing = loc.bearing
                     ready = true
                     NLog.i(TAG, "系统定位兜底就绪 $lat,$lon")
                     onLocation?.invoke(loc.latitude, loc.longitude)
@@ -169,6 +185,7 @@ class LocationProvider(private val context: Context) {
                     usedSystemFallback = true
                     lat = cached.latitude
                     lon = cached.longitude
+                    if (cached.hasBearing()) bearing = cached.bearing
                     ready = true
                     NLog.i(TAG, "系统定位缓存 $lat,$lon")
                     onLocation?.invoke(lat, lon)

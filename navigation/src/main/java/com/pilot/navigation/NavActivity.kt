@@ -3,7 +3,11 @@ package com.pilot.navigation
 import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.util.TypedValue
@@ -19,9 +23,14 @@ import android.widget.Switch
 import android.widget.TextView
 import com.amap.api.maps.CameraUpdateFactory
 import com.amap.api.maps.MapsInitializer
+import com.amap.api.maps.model.BitmapDescriptorFactory
+import com.amap.api.maps.model.LatLng
+import com.amap.api.maps.model.Marker
+import com.amap.api.maps.model.MarkerOptions
 import com.amap.api.navi.AMapNaviView
 import com.amap.api.navi.AMapNaviViewListener
 import com.amap.api.navi.AmapPageType
+import com.amap.api.navi.enums.MapStyle
 import com.pilot.navigation.NavigationSettings.Companion.LEVEL_BRIEF
 import com.pilot.navigation.NavigationSettings.Companion.LEVEL_DETAILED
 import com.pilot.navigation.NavigationSettings.Companion.LEVEL_NORMAL
@@ -51,13 +60,16 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
          *
          *   17f = 车道级（导航跟随时）
          *   15f = 街道级（能看清路口和小区名）
-         *   **14f = 街区级（周边几个街区，看路况够用）**
-         *   13f = 太大了（实测只剩一条主干道，四周空白，老板反馈「比例太大」）
+         *   14f = 街区级（周边几个街区）
+         *   13f = 街道片区（能看到相邻几条路）
+         *   **12f = 城区级（周边多个街区和备选道路，老板要的「初始页」）**
          *   11f = 城区级
          *
-         * 试过 13f 想看得更广，结果太太空——地图上没有参照物反而不知道该往哪走。
+         * 老板反馈「初始页显示比例过大，只能看到一条路」：
+         * 14f 在城区只能看到当前街道，周边没有参照物。降到 12f 后
+         * 一次能看到几个街区，用户更容易判断朝向和周边路网。
          */
-        private const val INITIAL_ZOOM = 14f
+        private const val INITIAL_ZOOM = 12f
 
         const val EXTRA_DEST = "dest"
         const val EXTRA_SIMULATE = "simulate"
@@ -100,6 +112,36 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
 
     /** 设置面板的 ComposeView（关闭时移除）。 */
     private var settingsComposeView: androidx.compose.ui.platform.ComposeView? = null
+
+    /** 当前已应用的地图日夜模式（null = 还没设置过）。 */
+    private var appliedNightMode: Boolean? = null
+
+    /** 空闲地图上的当前位置蓝色箭头。 */
+    private var locationMarker: Marker? = null
+
+    /** 蓝色箭头图标（只画一次，之后复用）。 */
+    private val locationArrowIcon by lazy { buildLocationArrowIcon() }
+
+    /** 日夜模式定时检查（一分钟一次，跨过日出/日落时自动切换）。 */
+    private val dayNightHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val dayNightTick = object : Runnable {
+        override fun run() {
+            applyDayNightMode()
+            dayNightHandler.postDelayed(this, 60_000L)
+        }
+    }
+
+    /** 上一次看到的导航状态（用来在开始/结束导航时切换搜索面板）。 */
+    private var lastNavState: NavigationService.State? = null
+
+    /** 导航状态轮询（搜索框只在没有路线时显示）。 */
+    private val navStateHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val navStateTick = object : Runnable {
+        override fun run() {
+            syncSearchPanelWithNavState()
+            navStateHandler.postDelayed(this, 500L)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -159,16 +201,20 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
                 opts.isAutoChangeZoom = true
                 opts.isTrafficBarEnabled = true   // 右侧路况条
                 opts.isSettingMenuEnabled = true  // 高德自己的设置菜单
+                opts.zoom = INITIAL_ZOOM.toInt()  // 初始页先给城区视角
 
-                // ★ 地图日夜：用高德的 **auto 模式**（老板指定）。
-                //
-                //   auto 会按「定位所在地的日出日落」判断，比按小时硬判更准
-                //   （夏天 19 点天还亮、冬天 17 点就黑）。
-                //   注意：开了 auto 就不要同时设 `isNaviNight` 和 `setMapStyle`——
-                //   那两个是手动模式，会跟 auto 打架（实测手动值会被 auto 覆盖，
-                //   表现为「设了夜间但还是白底」）。
-                opts.isAutoNaviViewNightMode = true
+                // ★ 地图日夜：不用 SDK 的 auto 模式。
+                //   auto 在真机上不可靠：刚进界面定位没就绪时先判白天，
+                //   之后不纠正（20:10 实测还是白底）。改由 [applyDayNightMode]
+                //   按定位的日出日落自己切，见 [NavDayNight]。
+                opts.isAutoNaviViewNightMode = false
             }.onFailure { NLog.w(TAG, "viewOptions 设置失败 ${it.message}") }
+
+            // 地图渲染完成后再套一次日夜（创建时 map 对象可能还没准备好）
+            runCatching {
+                v.setOnMapLoadedListener { applyDayNightMode(force = true) }
+            }.onFailure { NLog.w(TAG, "设置地图加载回调失败 ${it.message}") }
+            applyDayNightMode(force = true)
 
             NLog.i(TAG, "AMapNaviView 创建完成")
         }.onFailure {
@@ -186,15 +232,27 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
                     startNaviWithRetry(c.name, attempt = 0)
                 },
                 onSpeak = { text -> announceLocal(text) },
+                onEndNavi = {
+                    // 语音说「结束导航」= 停导航保留地图（和点确认框「结束导航」一致）
+                    NLog.i(TAG, "语音结束导航，保留地图界面")
+                    endNaviKeepMap()
+                    finish()
+                },
             )
             searchPanel = panel
             root.addView(panel.root)
-            // 5 秒后开始轮询语音输入（等界面稳定）
-            root.postDelayed({ startAsrPolling() }, 5000)
+            // 有路线时先把搜索框收起来，等导航结束或用户点语音再显示
+            syncSearchPanelWithNavState(force = true)
+            navStateHandler.post(navStateTick)
+            // 界面上屏后很快开始轮询语音输入（点麦克风就能用，不用等 5 秒）
+            root.postDelayed({ startAsrPolling() }, 500)
         }.onFailure { NLog.e(TAG, "创建搜索面板失败", it) }
 
         // Pilot 自己的按钮栏
         root.addView(buildPilotBar())
+
+        // 日夜模式：先立即判一次，之后每分钟检查是否跨过日出/日落
+        dayNightHandler.post(dayNightTick)
 
         // 显式设备测试入口：adb am start --es dest ... --ez simulate true
         val testDestination = intent.getStringExtra(EXTRA_DEST).orEmpty().trim()
@@ -226,7 +284,12 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
 
     /** 把镜头挪到指定坐标（只挪一次）。 */
     private fun centerOnMe(lat: Double, lon: Double) {
-        if (cameraMoved || lat == 0.0 || lon == 0.0) return
+        if (lat == 0.0 || lon == 0.0) return
+        // 每次定位都更新蓝色箭头；镜头只挪第一次
+        updateLocationMarker(lat, lon, NavigationService.peekLocationProvider()?.bearing ?: 0f)
+        // 定位一到位就按当地日出日落重新判日夜（之前可能用的是 18:00 兜底）
+        applyDayNightMode()
+        if (cameraMoved) return
         cameraMoved = true
         runCatching {
             naviView?.map?.moveCamera(
@@ -263,15 +326,141 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
         }, 500)
     }
 
+    // ------------------------------------------------------------ 当前位置箭头
+
+    /**
+     * 在没有路线的空闲地图上，用蓝色箭头标出当前位置。
+     *
+     * 高德只有进入导航后才会画车标；初始页之前只有地图本身，
+     * 老板不知道车/人在哪。这里自己放一个 Marker，按定位朝向旋转。
+     * 进入导航后隐藏，交给高德自己的车标。
+     */
+    private fun updateLocationMarker(lat: Double, lon: Double, bearing: Float) {
+        if (lat == 0.0 || lon == 0.0) return
+        val map = naviView?.map ?: return
+        runCatching {
+            val pos = LatLng(lat, lon)
+            val marker = locationMarker ?: map.addMarker(
+                MarkerOptions()
+                    .position(pos)
+                    .icon(BitmapDescriptorFactory.fromBitmap(locationArrowIcon))
+                    .anchor(0.5f, 0.55f)
+                    .setFlat(true)
+                    .zIndex(100f),
+            )?.also { locationMarker = it } ?: return
+            marker.setPosition(pos)
+            marker.setRotateAngle(bearing)
+            marker.setVisible(!isRouteActive())
+        }.onFailure { NLog.w(TAG, "更新当前位置箭头失败 ${it.message}") }
+    }
+
+    /** 是否正在算路/导航（此时用高德自己的车标）。 */
+    private fun isRouteActive(): Boolean {
+        val state = NavigationService.peek()?.currentState ?: return false
+        return state == NavigationService.State.ROUTING ||
+            state == NavigationService.State.NAVIGATING
+    }
+
+    /** 画一个带白边的蓝色箭头（朝上，正北）。 */
+    private fun buildLocationArrowIcon(): Bitmap {
+        val density = resources.displayMetrics.density
+        val size = (30 * density).toInt().coerceAtLeast(48)
+        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val w = size.toFloat()
+        val h = size.toFloat()
+        val arrow = Path().apply {
+            moveTo(w * 0.50f, h * 0.06f)
+            lineTo(w * 0.90f, h * 0.93f)
+            lineTo(w * 0.50f, h * 0.72f)
+            lineTo(w * 0.10f, h * 0.93f)
+            close()
+        }
+        canvas.drawPath(
+            arrow,
+            Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                style = Paint.Style.FILL
+                color = Color.parseColor("#2F7BFF")
+            },
+        )
+        canvas.drawPath(
+            arrow,
+            Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                style = Paint.Style.STROKE
+                strokeWidth = 3f * density
+                strokeJoin = Paint.Join.ROUND
+                color = Color.WHITE
+            },
+        )
+        return bitmap
+    }
+
+    // ------------------------------------------------------------ 日夜 / 搜索框
+
+    /**
+     * 按定位所在地的日出日落切换底图和导航引导层。
+     *
+     * @param force true = 不管缓存，强制重新套一遍（地图加载完成时用）
+     */
+    private fun applyDayNightMode(force: Boolean = false) {
+        val night = runCatching {
+            val loc = NavigationService.peekLocationProvider()
+            NavDayNight.isNight(loc?.lat ?: 0.0, loc?.lon ?: 0.0)
+        }.getOrDefault(false)
+        val v = naviView ?: return
+        val target = if (night) MapStyle.NIGHT else MapStyle.DAY
+        // 高德在开始导航时会自己重建渲染层，可能把样式改回白天；
+        // 所以不仅看缓存，还看 SDK 当前的实际样式。
+        val alreadyApplied = v.viewOptions.mapStyle == target && v.viewOptions.isNaviNight == night
+        if (!force && appliedNightMode == night && alreadyApplied) return
+        runCatching {
+            val opts = v.viewOptions
+            // 手动模式：auto 会和 setMapStyle 打架，必须关掉
+            opts.isAutoNaviViewNightMode = false
+            opts.isNaviNight = night
+            opts.setMapStyle(target, "")
+            v.setViewOptions(opts)
+            appliedNightMode = night
+            NLog.i(TAG, "地图日夜模式 → ${if (night) "夜间" else "白天"}")
+        }.onFailure { NLog.w(TAG, "切换日夜模式失败 ${it.message}") }
+    }
+
+    /**
+     * 搜索框只在「没有路线」时显示。
+     *
+     * 老板反馈「开始导航后还显示搜索框」——它会挡住路线和转向提示。
+     * 导航中用户点右下角语音按钮时，[onVoiceButton] 会单独把它叫出来。
+     */
+    private fun syncSearchPanelWithNavState(force: Boolean = false) {
+        val state = NavigationService.peek()?.currentState ?: return
+        if (!force && state == lastNavState) return
+        lastNavState = state
+        // 开始导航时 SDK 会重建渲染层，顺手把日夜样式再套一次
+        applyDayNightMode(force = true)
+        val show = state == NavigationService.State.IDLE ||
+            state == NavigationService.State.FAILED ||
+            state == NavigationService.State.ARRIVED
+        searchPanel?.setVisible(show)
+        // 空闲时显示自己的蓝色箭头；导航中隐藏，用高德车标
+        locationMarker?.setVisible(show)
+        if (show) {
+            NavigationService.peekLocationProvider()?.let { loc ->
+                updateLocationMarker(loc.lat, loc.lon, loc.bearing)
+            }
+        }
+        NLog.i(TAG, "导航状态 $state → 搜索框${if (show) "显示" else "隐藏"}")
+    }
+
     // ------------------------------------------------------------ Pilot 按钮栏
 
     /**
      * Pilot 自定义按钮栏（浮在高德 UI 上方，避开底部导航信息区）。
      *
-     * 三个按钮：
+     * 五个按钮：
      * - **语音**：回到主界面开语音识别（开车时手不能离开方向盘，语音是主交互）
+     * - **路线 / 历史**：切换候选路线、查看历史
      * - **主页**：回到 Pilot 主界面（导航继续在后台跑）
-     * - **退出**：退出整个 Pilot（含导航）
+     * - **收起**：退到后台（导航继续跑），不关闭 App
      */
     /**
      * Pilot 自定义按钮。
@@ -285,7 +474,7 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
      *
      * 所以我们的按钮只能放在**中间偏下的空白区**：
      * - 语音按钮：**左下**（单手拇指最容易够到，开车时盲按也不容易错）
-     * - 主页 / 退出：**右侧竖排**（低频操作，放边上）
+     * - 主页 / 收起：**右侧竖排**（低频操作，放边上）
      */
     private fun buildPilotBar(): View {
         val wrap = FrameLayout(this).apply {
@@ -297,7 +486,7 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
         }
 
         // ★ 右侧竖排四个按钮（老板要求：语音移到最上，四个统一底色和圆边框）
-        //   顺序：语音 / 历史 / 主页 / 退出
+        //   顺序：语音 / 路线 / 历史 / 主页 / 收起
         //   全部用同一个 FLOATING_BTN 底色 + 同一个圆角，视觉是一组。
         val side = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -307,7 +496,7 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
         side.addView(roundButton("🛣") { showRouteChoices() })
         side.addView(roundButton("🕘") { showHistoryDialog() })
         side.addView(roundButton("🏠") { onHomeButton() })
-        side.addView(roundButton("✕") { onExitApp() })
+        side.addView(roundButton("✕") { onMinimizeApp() })
 
         wrap.addView(side, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT,
@@ -348,14 +537,15 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
         val radius = dp(NavColors.FLOATING_BTN_RADIUS_DP).toFloat()
         return Button(this).apply {
             text = icon
-            setTextColor(NavColors.ON_SURFACE)
+            // 底色换成中灰后，浅色字看不清；图标改深色
+            setTextColor(Color.parseColor("#212121"))
             textSize = 18f
             isAllCaps = false
             setPadding(0, 0, 0, 0)
             background = GradientDrawable().apply {
                 setColor(NavColors.FLOATING_BTN)
                 cornerRadius = radius
-                setStroke(dp(1), NavColors.OUTLINE)
+                setStroke(dp(1), Color.parseColor("#66FFFFFF"))
             }
             layoutParams = LinearLayout.LayoutParams(size, size).apply {
                 bottomMargin = dp(10)
@@ -482,6 +672,8 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
      *   重试 3 次、每次 300ms，覆盖服务冷启动。
      */
     private fun startNaviWithRetry(destination: String, attempt: Int, simulated: Boolean = false) {
+        // 一开始规划路线就把搜索框收起，别挡住转向提示
+        searchPanel?.setVisible(false)
         val svc = NavigationService.peek()
         if (svc != null) {
             val jobId = runCatching {
@@ -539,6 +731,10 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
      */
     private fun onVoiceButton() {
         NLog.i(TAG, "点击语音按钮，开始识别")
+        // 导航中搜索框默认收起；点语音时临时叫出来，方便看识别结果和候选
+        val active = NavigationService.peek()?.currentState in
+            setOf(NavigationService.State.ROUTING, NavigationService.State.NAVIGATING)
+        if (active) searchPanel?.setVisible(true)
         runCatching { AgentBridge.startVoice(this) }
         toast("请说地点名，或说「第几个」")
     }
@@ -555,11 +751,13 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
         }.onFailure { NLog.w(TAG, "回桌面失败 ${it.message}") }
     }
 
-    /** 退出 App：停导航 + 关界面 + 退整个进程（其他进程也会跟着退）。 */
-    private fun onExitApp() {
-        NLog.i(TAG, "点击退出 App")
-        runCatching { NavigationService.peek()?.requestStop() }
-        finishAffinity()
+    /** 收起 App：退到后台，导航继续跑（老板要求 ✕ 不再是「杀进程」）。 */
+    private fun onMinimizeApp() {
+        NLog.i(TAG, "点击 ✕ → 退到后台（导航继续）")
+        // 不调 requestStop：用户只是想把界面收起来，
+        // 后台服务还在导航，转向播报不能断。
+        runCatching { moveTaskToBack(true) }
+            .onFailure { NLog.w(TAG, "退到后台失败 ${it.message}") }
     }
 
     // ------------------------------------------------------------ 高德界面回调
@@ -571,7 +769,15 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
      *   高德的按钮只负责「通知宿主」，具体做什么由我们自己决定。
      */
     override fun onNaviCancel() {
-        requestEndNaviConfirmation()
+        // 高德自己的「退出」回调：导航中弹确认（结束导航、保留地图），
+        // 没在导航时直接彻底退出（关界面 + 释放 SDK）
+        if (isNaviActive()) requestEndNaviConfirmation() else onAMapNaviViewExit()
+    }
+
+    /** 当前是否真的在导航/算路（决定「退出」是结束导航还是彻底退出）。 */
+    private fun isNaviActive(): Boolean {
+        val st = NavigationService.peek()?.currentState
+        return st == NavigationService.State.ROUTING || st == NavigationService.State.NAVIGATING
     }
 
     private fun requestEndNaviConfirmation() {
@@ -594,6 +800,7 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
             .setPositiveButton("结束导航") { _, _ ->
                 NLog.i(TAG, "用户确认结束导航")
                 exitConfirmationPending = false
+                // 导航中的退出 = 结束导航、地图保留（重建空地图界面）
                 endNaviKeepMap()
                 finish()
             }
@@ -643,7 +850,7 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
     }
 
     override fun onNaviBackClick(): Boolean {
-        // 返回键：结束导航但不退出地图（和底部「退出」一致）
+        // 返回键：结束导航但保留地图（和语音「结束导航」一致）
         endNaviKeepMap()
         finish()
         return true
@@ -656,6 +863,7 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
     override fun onLockMap(isLock: Boolean) = Unit
     override fun onNaviViewLoaded() {
         NLog.i(TAG, "AMapNaviView 加载完成")
+        applyDayNightMode(force = true)
     }
     override fun onMapTypeChanged(type: Int) = Unit
     override fun onNaviViewShowMode(mode: Int) = Unit
@@ -681,15 +889,6 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
      * 和设置面板里的历史列表是同一份数据（NavigationSettings.history）。
      */
     private fun showHistoryDialog() {
-        val hist = NavigationSettings.load(this).history
-        if (hist.isEmpty()) {
-            AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                .setTitle("导航历史")
-                .setMessage("还没有导航记录")
-                .setPositiveButton("知道了", null)
-                .show()
-            return
-        }
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(NavColors.SURFACE)
@@ -699,44 +898,69 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
             setBackgroundColor(NavColors.SURFACE)
         }
         scroll.addView(box)
-        for (h in hist.take(15)) {
-            val title = if (h.alias.isNotBlank()) "${h.alias}（${h.name}）" else h.name
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(12), dp(12), dp(12), dp(12))
-                background = GradientDrawable().apply {
-                    setColor(NavColors.SURFACE_VARIANT)
-                    cornerRadius = dp(10).toFloat()
-                }
-                isClickable = true
-                setOnClickListener {
-                    NLog.i(TAG, "历史点选：$title")
-                    startNaviWithRetry(h.alias.ifBlank { h.name }, 0)
-                }
+
+        /**
+         * 整块列表重画。
+         *
+         * 之前删除只改了设置文件，弹窗里的 view 是建的时候就定死的，
+         * 点「删除」会 toast「已删除」但那一行还在。每次操作后按最新设置重建。
+         */
+        fun renderBox() {
+            box.removeAllViews()
+            val hist = NavigationSettings.load(this@NavActivity).history
+            if (hist.isEmpty()) {
+                box.addView(TextView(this@NavActivity).apply {
+                    text = "还没有导航记录"
+                    setTextColor(NavColors.ON_SURFACE)
+                    textSize = 14f
+                    setPadding(dp(12), dp(16), dp(12), dp(16))
+                })
+                return
             }
-            row.addView(TextView(this).apply {
-                text = title
-                setTextColor(NavColors.ON_SURFACE)
-                textSize = 15f
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            })
-            row.addView(TextView(this).apply {
-                text = "删除"
-                setTextColor(NavColors.ERROR)
-                textSize = 13f
-                setPadding(dp(10), 0, dp(4), 0)
-                setOnClickListener {
-                    val cur = NavigationSettings.load(this@NavActivity)
-                    NavigationSettings.save(this@NavActivity, cur.copy(history = cur.history - h))
-                    NLog.i(TAG, "删除历史：${h.name}")
-                    toast("已删除")
+            for (h in hist.take(15)) {
+                val title = if (h.alias.isNotBlank()) "${h.alias}（${h.name}）" else h.name
+                val row = LinearLayout(this@NavActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(12), dp(12), dp(12), dp(12))
+                    background = GradientDrawable().apply {
+                        setColor(NavColors.SURFACE_VARIANT)
+                        cornerRadius = dp(10).toFloat()
+                    }
+                    isClickable = true
+                    setOnClickListener {
+                        NLog.i(TAG, "历史点选：$title")
+                        startNaviWithRetry(h.alias.ifBlank { h.name }, 0)
+                    }
                 }
-            })
-            box.addView(row, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { bottomMargin = dp(6) })
+                row.addView(TextView(this@NavActivity).apply {
+                    text = title
+                    setTextColor(NavColors.ON_SURFACE)
+                    textSize = 15f
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                })
+                row.addView(TextView(this@NavActivity).apply {
+                    text = "删除"
+                    setTextColor(NavColors.ERROR)
+                    textSize = 13f
+                    setPadding(dp(10), 0, dp(4), 0)
+                    isClickable = true
+                    setOnClickListener {
+                        // 只处理删除，别让点击冒泡到整行（那会直接开始导航）
+                        val cur = NavigationSettings.load(this@NavActivity)
+                        NavigationSettings.save(this@NavActivity, cur.copy(history = cur.history - h))
+                        NLog.i(TAG, "删除历史：${h.name}")
+                        toast("已删除")
+                        renderBox()
+                    }
+                })
+                box.addView(row, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).apply { bottomMargin = dp(6) })
+            }
         }
+
+        renderBox()
         AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("导航历史")
             .setView(scroll)
@@ -1399,14 +1623,28 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
     @Volatile
     private var keepMapAfterExit = false
 
+    /** 标记：本次结束要彻底退出界面并释放 SDK，onDestroy 里执行。 */
+    @Volatile
+    private var releaseSdkOnExit = false
+
+    /** finish() 可能被高德回调重复触发，只处理一次。 */
+    @Volatile
+    private var exiting = false
+
     private fun stopNaviAndFinish() {
+        // keepMapAfterExit = 已经决定走「结束导航保留地图」，别被高德的退出回调截胡
+        if (exiting || keepMapAfterExit) return
+        exiting = true
         runCatching { NavigationService.peek()?.requestStop() }
+        releaseSdkOnExit = true
         finish()
     }
 
     override fun onResume() {
         super.onResume()
         runCatching { naviView?.onResume() }
+        // 从后台回来可能已经跨过日落/日出
+        applyDayNightMode(force = true)
     }
 
     override fun onPause() {
@@ -1415,11 +1653,21 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
     }
 
     override fun onDestroy() {
+        dayNightHandler.removeCallbacks(dayNightTick)
+        navStateHandler.removeCallbacks(navStateTick)
+        runCatching { locationMarker?.remove() }
+        locationMarker = null
         runCatching { naviView?.onDestroy() }
         naviView = null
         if (current === this) current = null
         super.onDestroy()
-        NLog.i(TAG, "NavActivity onDestroy（keepMap=$keepMapAfterExit）")
+        NLog.i(TAG, "NavActivity onDestroy（keepMap=$keepMapAfterExit releaseSdk=$releaseSdkOnExit）")
+        // ★ 必须在 AMapNaviView.onDestroy() 之后释放，顺序反了会崩
+        if (releaseSdkOnExit) {
+            releaseSdkOnExit = false
+            runCatching { NavigationService.peek()?.releaseEngine() }
+                .onFailure { NLog.w(TAG, "释放导航引擎失败 ${it.message}") }
+        }
         // 用户是「结束导航」而不是退出界面 → 立刻重建一个空的地图界面。
         // 用 applicationContext 启动（this 已经不合法了）。
         if (keepMapAfterExit) {

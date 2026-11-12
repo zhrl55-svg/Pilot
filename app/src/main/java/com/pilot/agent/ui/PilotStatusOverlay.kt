@@ -6,7 +6,6 @@ import android.content.Intent
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
-import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.RectF
 import android.os.Build
@@ -104,7 +103,6 @@ object PilotStatusOverlay {
         status.contains("聆听") -> StatusMode.LISTENING
         status.contains("识别") || status.contains("规划") || status.contains("执行") -> StatusMode.PROCESSING
         status.contains("回答") -> StatusMode.SPEAKING
-        status.contains("导航") -> StatusMode.NAVIGATION
         status.contains("不可用") -> StatusMode.ERROR
         status.contains("休眠") -> StatusMode.SLEEPING
         status.contains("关闭") -> StatusMode.OFF
@@ -116,7 +114,6 @@ object PilotStatusOverlay {
         StatusMode.LISTENING -> Color.rgb(82, 194, 255)
         StatusMode.PROCESSING -> Color.rgb(255, 190, 94)
         StatusMode.SPEAKING -> Color.rgb(192, 151, 255)
-        StatusMode.NAVIGATION -> Color.rgb(72, 218, 220)
         StatusMode.SLEEPING -> Color.rgb(162, 180, 201)
         StatusMode.ERROR -> Color.rgb(255, 112, 122)
         StatusMode.OFF -> Color.rgb(130, 146, 166)
@@ -190,7 +187,7 @@ object PilotStatusOverlay {
 
     private fun dp(value: Int, density: Float): Int = (value * density + 0.5f).toInt()
 
-    private enum class StatusMode { STANDBY, LISTENING, PROCESSING, SPEAKING, NAVIGATION, SLEEPING, ERROR, OFF }
+    private enum class StatusMode { STANDBY, LISTENING, PROCESSING, SPEAKING, SLEEPING, ERROR, OFF }
 
     private class StatusGlyphView(context: Context, private val density: Float) : View(context) {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -217,7 +214,7 @@ object PilotStatusOverlay {
                 invalidate()
                 return
             }
-            val duration = if (mode == StatusMode.STANDBY || mode == StatusMode.NAVIGATION) 1_800L else 950L
+            val duration = if (mode == StatusMode.STANDBY) 1_800L else 950L
             animator = ValueAnimator.ofFloat(0f, 1f).apply {
                 this.duration = duration
                 repeatCount = ValueAnimator.INFINITE
@@ -266,23 +263,6 @@ object PilotStatusOverlay {
                         val x = cx + (i - 1) * 5f * visualScale * density
                         canvas.drawRoundRect(x - barWidth, cy - h / 2f, x + barWidth, cy + h / 2f, barWidth, barWidth, paint)
                     }
-                }
-                StatusMode.NAVIGATION -> {
-                    paint.style = Paint.Style.STROKE
-                    paint.strokeWidth = 1.7f * visualScale * density
-                    canvas.drawCircle(cx, cy, 6.5f * visualScale * density, paint)
-                    paint.style = Paint.Style.FILL
-                    canvas.save()
-                    canvas.rotate(phase * 360f, cx, cy)
-                    val arrow = Path().apply {
-                        moveTo(cx, cy - 7f * visualScale * density)
-                        lineTo(cx + 3f * visualScale * density, cy + 4f * visualScale * density)
-                        lineTo(cx, cy + 2f * visualScale * density)
-                        lineTo(cx - 3f * visualScale * density, cy + 4f * visualScale * density)
-                        close()
-                    }
-                    canvas.drawPath(arrow, paint)
-                    canvas.restore()
                 }
                 StatusMode.STANDBY -> {
                     paint.alpha = (110 + 45 * sin(phase * Math.PI * 2.0)).toInt()

@@ -565,13 +565,16 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
 
     fun statusForOverlay(): String = overlayLabel()
 
-    fun shouldShowStatusOverlay(): Boolean = wakeOn || running || AgentRuntime.speaker.isSpeaking ||
-        navigationNotificationStatus() != null
+    fun shouldShowStatusOverlay(): Boolean = wakeOn || running || AgentRuntime.speaker.isSpeaking
 
-    /** Keep the small overlay useful while avoiding task names or destinations on screen. */
+    /**
+     * 悬浮球只反映语音/任务状态。
+     *
+     * 导航状态（正在规划/正在导航）由导航界面自己显示，不再占用悬浮球——
+     * 否则导航时悬浮球永远停在「正在导航」，看不到真正的语音状态
+     * （正在聆听/正在回答/休眠）。
+     */
     private fun overlayLabel(): String = when {
-        navigationNotificationStatus()?.startsWith("正在规划路线") == true -> "正在规划路线"
-        navigationNotificationStatus() != null -> "正在导航"
         running -> "正在执行任务"
         AgentRuntime.speaker.isSpeaking -> "正在回答"
         voiceState == VoiceInput.State.LISTENING -> "正在聆听"

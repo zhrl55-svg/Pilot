@@ -296,9 +296,17 @@ class AmapNaviEngine(
     }
 
     fun release() {
-        runCatching { navi?.stopNavi() }
+        runCatching {
+            navi?.stopNavi()
+            navi?.removeAMapNaviListener(this)
+        }.onFailure { NLog.w(TAG, "释放导航失败 ${it.message}") }
         navi = null
         started = false
+        // ★ 彻底退出：连 AMapNavi 单例一起销毁，下次导航 getInstance 会重建。
+        //   调用方必须保证在 AMapNaviView.onDestroy() 之后调（NavActivity 负责顺序）。
+        runCatching { AMapNavi.destroy() }
+            .onFailure { NLog.w(TAG, "销毁 AMapNavi 失败 ${it.message}") }
+        NLog.i(TAG, "高德导航 SDK 已释放")
     }
 
     // ------------------------------------------------------------ AMapNaviListener

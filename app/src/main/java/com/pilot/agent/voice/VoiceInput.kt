@@ -149,7 +149,10 @@ class VoiceInput(
         }
         // ★ 打断词和唤醒词一起喂给 KWS：KWS 常驻在跑，顺带就能听见「停一下」，
         //   不用另开一条识别链路（省算力，也避免两条链路抢麦克风）。
-        val allWords = if (st.interruptEnabled) (words + st.interruptWordList()).distinct() else words
+        // ★ 再加上导航候选的序号词：播报候选时麦克风被静音，ASR 听不到，
+        //   只能靠常驻 KWS 听见「第二个」来打断播报、直接选第 2 条。
+        val extra = if (st.interruptEnabled) st.interruptWordList() else emptyList()
+        val allWords = (words + extra + NAV_ORDINAL_WORDS).distinct()
         if (!wake.load(allWords)) {
             onError(wake.lastError ?: "唤醒词加载失败")
             return false
@@ -465,6 +468,21 @@ class VoiceInput(
             Dbg.i(TAG, "注册中，忽略唤醒/打断命中「$word」")
             return
         }
+        // ★ 导航搜索面板的「第N个」：播报中麦克风是静音的（防回声），
+        //   只能靠 KWS 听见序号。命中后立刻停播，并把序号写成识别结果，
+        //   导航面板轮询到就直接选第 N 条开始导航。
+        val ordinal = ordinalOf(word)
+        if (ordinal != null) {
+            val count = runCatching { VoiceState.readNavSearch(context) }.getOrDefault(0)
+            if (AudioGate.isMuted && ordinal <= count) {
+                Dbg.i(TAG, "导航候选打断：$word（候选 $count 个）")
+                runCatching { onInterrupt(word) }
+                runCatching { VoiceState.write(context, VoiceState.IDLE, word) }
+            } else {
+                Dbg.i(TAG, "序号词「$word」当前无效（播报中=${AudioGate.isMuted} 候选=$count），忽略")
+            }
+            return
+        }
         val st = AgentSettings.load()
         val isInterruptWord = st.interruptWordList().any { word.contains(it) || it.contains(word) }
         val isWakeWord = st.wakeWordList().any { word.contains(it) || it.contains(word) }
@@ -494,6 +512,12 @@ class VoiceInput(
             return
         }
         onWakeHit(word)
+    }
+
+    /** 「第二个」→ 2；不是序号词返回 null。 */
+    private fun ordinalOf(word: String): Int? {
+        val i = NAV_ORDINAL_WORDS.indexOfFirst { word.contains(it) }
+        return if (i >= 0) i + 1 else null
     }
 
     /**
@@ -784,6 +808,12 @@ class VoiceInput(
 
     private companion object {
         const val TAG = "PilotVoice"
+
+        /**
+         * 导航候选序号词（和搜索面板最多 5 条对应）。
+         * 常驻在 KWS 词表里，但只有「正在播报 + 导航面板列着候选」时才生效。
+         */
+        val NAV_ORDINAL_WORDS = listOf("第一个", "第二个", "第三个", "第四个", "第五个")
 
         /** 普通指令的断句静音阈值 */
         const val NORMAL_SILENCE_MS = 800

@@ -51,8 +51,12 @@ object NavColors {
      *
      * 老板要求「四个按钮统一底色和圆边框」：都用这一个 + 同一个圆角半径，
      * 视觉上是一组。半透明是为了不挡住地图。
+     *
+     * 老板最新要求「右侧按钮底色改为灰色、透明度 80%」：
+     * `#CC9E9E9E` = 中灰 + 80% 不透明度（alpha 0xCC）。
+     * 比之前的深蓝灰 `#B33A424D` 更浅，压在地图上不会显得那么重。
      */
-    val FLOATING_BTN = Color.parseColor("#B33A424D")
+    val FLOATING_BTN = Color.parseColor("#CC9E9E9E")
 
     /** 悬浮按钮圆角半径（dp）。 */
     const val FLOATING_BTN_RADIUS_DP = 24

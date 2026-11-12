@@ -97,7 +97,9 @@ class WakeWordDetector(private val context: Context) {
                     provider = "cpu",
                     modelType = "zipformer2",
                 ),
-                maxActivePaths = 8,
+                // 词表里除了唤醒词/打断词，还常驻了导航候选的 5 个序号词；
+                // 8 条路径会挤掉一部分词，直接给到 16。
+                maxActivePaths = 16,
                 keywordsFile = "$ASSET_DIR/keywords.txt",
                 keywordsScore = KEYWORD_SCORE,
                 keywordsThreshold = KEYWORD_THRESHOLD,

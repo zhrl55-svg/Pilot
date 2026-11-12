@@ -539,6 +539,19 @@ class NavigationService : Service() {
         emit(0, "state", "已退出导航", priority = 0, stateName = currentState.toString())
     }
 
+    /**
+     * 彻底释放高德 SDK（左下角「退出」用）。
+     *
+     * 必须在 NavActivity 的 AMapNaviView.onDestroy() 之后调，
+     * 否则地图渲染层还活着的时候销毁单例会崩。
+     * 下次导航 [engine] 会懒创建，重新 getInstance。
+     */
+    fun releaseEngine() {
+        NLog.i(TAG, "releaseEngine 释放导航引擎")
+        runCatching { engine?.release() }
+        engine = null
+    }
+
     /** 回推事件给主进程。 */
     private fun emit(jobId: Long, event: String, text: String, priority: Int, stateName: String) {
         val b = Bundle().apply {

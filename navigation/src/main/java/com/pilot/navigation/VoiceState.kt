@@ -29,6 +29,14 @@ object VoiceState {
     private const val TAG = "PilotNavVoiceState"
     private const val FILE = "voice_state.json"
 
+    /**
+     * 导航搜索面板的候选状态（跨进程）。
+     *
+     * 主进程的 KWS 要判断「现在说第几个有效吗」——只有导航搜索面板
+     * 正列着候选时才把「第二个」当选择指令。内容：`候选数|时间戳`。
+     */
+    private const val NAV_FILE = "nav_search_state.txt"
+
     /** 空闲（没播报也没录音）。 */
     const val IDLE = "idle"
 
@@ -86,5 +94,37 @@ object VoiceState {
                 tmp.delete()
             }
         }.onFailure { NLog.w(TAG, "写语音状态失败 ${it.message}") }
+    }
+
+    // ---------------------------------------------------- 导航候选（选择指令）状态
+
+    /** 导航搜索面板列出候选时登记数量；主进程据此决定「第N个」是否有意义。 */
+    fun writeNavSearch(context: Context, count: Int) {
+        runCatching {
+            File(context.filesDir, NAV_FILE).writeText("$count|${System.currentTimeMillis()}")
+        }.onFailure { NLog.w(TAG, "写导航候选状态失败 ${it.message}") }
+    }
+
+    /** 面板收起/选完/自动清除时调用。 */
+    fun clearNavSearch(context: Context) {
+        runCatching { File(context.filesDir, NAV_FILE).delete() }
+    }
+
+    /**
+     * 读当前候选数量；过期（60 秒）或没写过返回 0。
+     * 时间戳兜底：万一面板进程被杀没来得及清，也不会长期误判。
+     */
+    fun readNavSearch(context: Context): Int {
+        return runCatching {
+            val f = File(context.filesDir, NAV_FILE)
+            if (!f.isFile) {
+                0
+            } else {
+                val parts = f.readText().trim().split('|')
+                val count = parts.getOrNull(0)?.toIntOrNull() ?: 0
+                val ts = parts.getOrNull(1)?.toLongOrNull() ?: 0L
+                if (System.currentTimeMillis() - ts > 60_000L) 0 else count
+            }
+        }.getOrDefault(0)
     }
 }

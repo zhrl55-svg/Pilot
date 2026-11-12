@@ -50,7 +50,12 @@ class TriggerActivity : Activity() {
         // 开始一次语音识别（导航界面点了麦克风）
         if (i.getBooleanExtra("start_voice", false)) {
             Dbg.i(TAG, "请求开始语音识别")
-            runCatching { com.pilot.agent.runtime.AgentRuntime.voiceInput?.startListening() }
+            // ★ 不能只取 voiceInput：主界面没创建过语音实例时它是 null，
+            //   点击导航界面的麦克风会静默失败（表现为「没录音」）。
+            //   ensureVoiceInput 会创建单例；识别结果仍写 VoiceState 给导航搜索框。
+            runCatching {
+                com.pilot.agent.runtime.AgentRuntime.ensureVoiceInput().startListening()
+            }.onFailure { Dbg.e(TAG, "开始语音识别失败", it) }
             return
         }
 
