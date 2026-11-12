@@ -101,6 +101,10 @@ class VoiceInput(
     @Volatile
     private var activeUntil: Long = 0L
 
+    /** 这次 LISTEN 是什么时候开始的（看门狗算真实时长用） */
+    @Volatile
+    private var listenStartedAt: Long = 0L
+
     /**
      * 这次休眠是不是用户主动要求的（说了"你休息一会"）。
      *
@@ -220,23 +224,76 @@ class VoiceInput(
      * 或者 AudioRecord 悄悄挂了，VAD 永远切不出一句话，mode 就会一直停在
      * LISTEN——界面表现为麦克风/悬浮球一直「正在聆听」，再说也没反应。
      * 20 秒还没有结果就强制收状态。
+     *
+     * ★ 唤醒进入的 LISTEN 也必须走这里（原来只有 startListening 才 arm）：
+     *   误唤醒后用户一句话没说，VAD 永远切不出句子，就永远没人收回状态
+     *   ——界面一直「正在聆听」、也不休眠（11-12 真机日志：23:32:19 唤醒后
+     *   停在 LISTEN 直到日志结束，中间没有任何"进入活跃期/休眠"）。
      */
     private val listenWatchdog: Runnable = Runnable {
         if (mode != Mode.LISTEN) return@Runnable
         // 声纹注册有自己的超时（enrollWatchdog），别抢它的会话
         if (enrolling) return@Runnable
+
+        val elapsed = SystemClock.uptimeMillis() - listenStartedAt
+        // ★ 硬上限：**不看** VAD 怎么说，到点必收。
+        //   原来只看"没在说话"才超时，可环境噪声（路噪/风扇）会让 VAD 长期
+        //   inSpeech=true，看门狗每 5 秒无条件续期 → 永不超时、永不休眠。
+        if (elapsed >= LISTEN_HARD_CAP_MS) {
+            Dbg.w(TAG, "聆听硬上限（${elapsed}ms）到了，强制回待命")
+            vad?.reset()
+            runCatching { VoiceState.write(context, VoiceState.IDLE) }
+            // ★ skipActive：整段聆听**一句话都没说**，说明多半是误唤醒，
+            //   不该再给"免唤醒活跃期"，直接回只等唤醒词的休眠态。
+            backToIdleOrWake(skipActive = true)
+            return@Runnable
+        }
         if (busy.get() || vad?.isInSpeech == true) {
             main.postDelayed(listenWatchdog, 5_000L)
             return@Runnable
         }
-        Dbg.w(TAG, "聆听超时（${LISTEN_TIMEOUT_MS}ms）没识别到一句话，自动回待命")
+        Dbg.w(TAG, "聆听 ${elapsed}ms 没识别到一句话，自动回待命（不进活跃期）")
         runCatching { VoiceState.write(context, VoiceState.IDLE) }
-        backToIdleOrWake()
+        backToIdleOrWake(skipActive = true)
     }
 
     private fun armListenWatchdog() {
+        listenStartedAt = SystemClock.uptimeMillis()
         main.removeCallbacks(listenWatchdog)
         main.postDelayed(listenWatchdog, LISTEN_TIMEOUT_MS)
+    }
+
+    /**
+     * 唤醒后声纹不通过 → 若用户其实没说话，把这次聆听收回来。
+     *
+     * ★ 为什么要"延迟 + 有条件"：
+     *   声纹是**乐观放行、事后否决**的——唤醒瞬间用户可能已经在说指令。
+     *   验声纹只要 ~90ms，这时候立刻退出聆听会把那半句吞掉。
+     *   所以先等一小会儿：如果 VAD 已经开口 / 正在识别，就交给原来的
+     *   「结果出来再丢弃」路径；只有**一直没人说话**才收回状态。
+     *
+     * ★ 为什么必须有这一步：原来只在 `recognize()` 里丢结果，
+     *   可用户被误唤醒后压根没说话 → 没有结果可丢 → 状态永远停在
+     *   LISTENING，界面一直「正在聆听」也不休眠（11-12 真机日志：
+     *   「声纹 0.21 → 拒绝」后面既没回待命也没进活跃期）。
+     */
+    private fun rejectWakeIfSilent() {
+        if (enrolling) return
+        // 主线程上状态可能已经往前走（用户已经说完一句在识别），别误伤
+        if (mode != Mode.LISTEN || state != State.LISTENING) {
+            Dbg.i(TAG, "声纹拒绝，但状态已离开聆听（mode=$mode state=$state），不收回")
+            return
+        }
+        if (busy.get() || vad?.isInSpeech == true) {
+            Dbg.i(TAG, "声纹拒绝，但用户已经开口，交给识别结果丢弃")
+            return
+        }
+        Dbg.i(TAG, "声纹拒绝且没人说话，收回这次聆听")
+        main.removeCallbacks(listenWatchdog)
+        vad?.reset()
+        // ★ skipActive=true：这次唤醒已判定不是主人，回只等唤醒词的休眠态，
+        //   不给"免唤醒活跃期"（否则环境音会被当成对话继续喂 ASR）。
+        backToIdleOrWake(skipActive = true)
     }
 
     /**
@@ -588,6 +645,7 @@ class VoiceInput(
             mode = Mode.LISTEN
             vad?.reset()
             wakeAuthorized = true
+            armListenWatchdog()
             emitState(State.LISTENING)
             resetActiveWindow()
         }
@@ -626,6 +684,10 @@ class VoiceInput(
         dndRequested = false
         vad?.reset()
         wakeAuthorized = true
+        // ★ 唤醒进来的聆听同样要看门狗。原来只有点按钮才 arm，
+        //   唤醒后一句话没说（误唤醒最常见的情况）就永远停在 LISTEN：
+        //   界面一直「正在聆听」，也不进活跃期、不休眠（11-12 真机反馈）。
+        armListenWatchdog()
         emitState(State.LISTENING)
         main.post { onWake(word) }
         playBeep()
@@ -664,7 +726,12 @@ class VoiceInput(
                 "声纹 ${"%.2f".format(score)} 阈值 ${s.voiceprintThreshold} → ${if (pass) "通过" else "拒绝"}",
             )
             main.post { onVoiceprint(score, pass) }
-            if (!pass) wakeAuthorized = false
+            if (!pass) {
+                wakeAuthorized = false
+                // 给"用户已经在说指令"留出时间（声纹只要 ~90ms，
+                // 但唤醒词后半句可能还在路上），再判断要不要收回聆听。
+                main.postDelayed({ rejectWakeIfSilent() }, VOICEPRINT_REJECT_GRACE_MS)
+            }
         }
     }
 
@@ -773,7 +840,7 @@ class VoiceInput(
         return t.length <= 2 && t.all { it in chars }
     }
 
-    private fun backToIdleOrWake() {
+    private fun backToIdleOrWake(skipActive: Boolean = false) {
         main.removeCallbacks(listenWatchdog)
         // 任何收尾路径都要把「正在录音」清掉，否则导航麦克风图标会一直转
         runCatching { VoiceState.write(context, VoiceState.IDLE) }
@@ -790,7 +857,10 @@ class VoiceInput(
         AudioFocusManager.resumeMusicAfterVoice()
         if (resumeToWake) {
             val sec = AgentSettings.load().idleSleepSeconds
-            if (sec > 0) {
+            // ★ skipActive：这次聆听一句话都没说（误唤醒 / 点错了），
+            //   直接回休眠，别给 25 秒免唤醒活跃期——否则环境音会被当成
+            //   对话继续喂给 ASR，用户感觉"它自己醒着不睡"。
+            if (sec > 0 && !skipActive) {
                 // 活跃期：不用再喊唤醒词，直接说话；超时自动休眠
                 mode = Mode.ACTIVE
                 wake.reset()
@@ -799,10 +869,14 @@ class VoiceInput(
                 emitState(State.ACTIVE)
                 Dbg.i(TAG, "进入活跃期 ${sec}s")
             } else {
+                main.removeCallbacks(sleepTick)
+                activeUntil = 0L
                 mode = Mode.WAKE
                 wake.reset()
+                vad?.reset()
                 ring.clear()
-                emitState(State.WAKE_WAIT)
+                emitState(if (sec > 0) State.ASLEEP else State.WAKE_WAIT)
+                if (skipActive && sec > 0) Dbg.i(TAG, "空聆听结束，直接休眠（不进活跃期）")
             }
         } else {
             mode = Mode.OFF
@@ -868,6 +942,18 @@ class VoiceInput(
 
         /** 点按钮后最长等多久还切不出一句（防止永远停在「正在聆听」）。 */
         const val LISTEN_TIMEOUT_MS = 20_000L
+
+        /**
+         * 聆听的硬上限：到点**无条件**收状态。
+         *
+         * 为什么不用 [LISTEN_TIMEOUT_MS] 一个数：那个会被 VAD 的 inSpeech 续期，
+         * 而环境噪声会让 VAD 长期认为"正在说话"，于是永不超时。留一个更大的
+         * 绝对上限兜底——正常一句话 15 秒也切出来了（MAX_SEGMENT_MS）。
+         */
+        const val LISTEN_HARD_CAP_MS = 30_000L
+
+        /** 声纹否决后等多久再判断"用户其实没说话"（毫秒） */
+        const val VOICEPRINT_REJECT_GRACE_MS = 1_200L
 
         /** 声纹注册的断句静音阈值（口令里有逗号停顿，要切得慢） */
         const val ENROLL_SILENCE_MS = 2500

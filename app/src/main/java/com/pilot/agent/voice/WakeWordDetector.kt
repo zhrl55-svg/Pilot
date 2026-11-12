@@ -100,6 +100,14 @@ class WakeWordDetector(private val context: Context) {
                 // 词表里除了唤醒词/打断词，还常驻了导航候选的 5 个序号词；
                 // 8 条路径会挤掉一部分词，直接给到 16。
                 maxActivePaths = 16,
+                // ★ 这个文件必须留空，不能是模型自带的示例词表。
+                //   assets 里原本那份是模型自带的示例（你好问问 / 小爱同学 / 小艺小艺 …），
+                //   一旦传进来它就真的在监听：用户从没配过「你好问问」，环境音却反复命中，
+                //   表现就是"没人说话它自己醒了"（11-12 真机日志：唤醒「你好问问」→
+                //   声纹 0.21 拒绝 → 仍进聆听，随后一直「正在聆听」不休眠）。
+                //   坑：**不能写注释行**——native 用 stof 解析每行，遇到 "# …" 直接
+                //   SIGABRT（实测崩溃 7 次）；也不能传空串（要求 file / buf 至少给一个）。
+                //   所以文件留成 0 字节，词表统一由下面的 createStream(keywordLines) 给。
                 keywordsFile = "$ASSET_DIR/keywords.txt",
                 keywordsScore = KEYWORD_SCORE,
                 keywordsThreshold = KEYWORD_THRESHOLD,
@@ -152,14 +160,25 @@ class WakeWordDetector(private val context: Context) {
             }
 
             var hit: String? = null
+            var rejected: String? = null
             while (kws.isReady(input)) {
                 kws.decode(input)
                 val keyword = kws.getResult(input).keyword
                 if (keyword.isBlank()) continue
                 val label = labels.firstOrNull { keyword.contains(it) } ?: keyword
+                // ★ 只认自己词表里的词。native 侧如果还残留了模型自带的示例词
+                //   （你好问问 / 小爱同学 …），这里直接滤掉，不让它唤醒。
+                if (labels.none { keyword.contains(it) }) {
+                    rejected = label
+                    break
+                }
                 Dbg.i(TAG, "KWS 命中「$label」")
                 hit = label
                 break
+            }
+            if (rejected != null) {
+                Dbg.w(TAG, "KWS 命中词表外的「$rejected」，忽略（示例词表残留）")
+                kws.reset(input)
             }
             if (hit != null) kws.reset(input)
             hit
