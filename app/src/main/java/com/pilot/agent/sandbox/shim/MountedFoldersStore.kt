@@ -2,6 +2,7 @@ package com.pilot.agent.sandbox.shim
 
 import android.content.Context
 import android.net.Uri
+import com.pilot.agent.sandbox.SandboxMountPaths
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -62,17 +63,7 @@ class MountedFoldersStore(private val appContext: Context) {
         val list = ArrayList<Entry>(arr.length())
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
-            list += Entry(
-                id = o.optString("id", UUID.randomUUID().toString()),
-                name = o.optString("name"),
-                sourceDisplayName = o.optString("sourceDisplayName"),
-                treeUri = o.optString("treeUri"),
-                createdAt = o.optLong("createdAt", System.currentTimeMillis()),
-                isWritable = o.optBoolean("isWritable", true),
-                userAllowWrite = o.optBoolean("userAllowWrite", true),
-                resolvedHostPath = o.optString("resolvedHostPath").takeIf { it.isNotEmpty() }
-                    ?: resolveHostPathFromUri(o.optString("treeUri")),
-            )
+            list += entryFromJson(o)
         }
         _entries.value = list
     }
@@ -107,22 +98,33 @@ class MountedFoldersStore(private val appContext: Context) {
             val list = ArrayList<Entry>(arr.length())
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONObject(i) ?: continue
-                list += Entry(
-                    id = o.optString("id", UUID.randomUUID().toString()),
-                    name = o.optString("name"),
-                    sourceDisplayName = o.optString("sourceDisplayName"),
-                    treeUri = o.optString("treeUri"),
-                    createdAt = o.optLong("createdAt", System.currentTimeMillis()),
-                    isWritable = o.optBoolean("isWritable", true),
-                    userAllowWrite = o.optBoolean("userAllowWrite", true),
-                    resolvedHostPath = o.optString("resolvedHostPath").takeIf { it.isNotEmpty() }
-                        ?: resolveHostPathFromUri(o.optString("treeUri")),
-                )
+                list += entryFromJson(o)
             }
             if (list != _entries.value) {
                 _entries.value = list
             }
         }.onFailure { /* 读不到就沿用内存里的 */ }
+    }
+
+    private fun entryFromJson(o: JSONObject): Entry {
+        val treeUri = o.optString("treeUri")
+        val savedHostPath = o.optString("resolvedHostPath").takeIf { it.isNotEmpty() }
+        val resolvedHostPath = runCatching {
+            SandboxMountPaths.resolveTreeUri(appContext, Uri.parse(treeUri))
+        }.getOrNull().hostPath()
+            ?: savedHostPath?.let {
+                SandboxMountPaths.validateHostPath(appContext, it).hostPath()
+            }
+        return Entry(
+            id = o.optString("id", UUID.randomUUID().toString()),
+            name = o.optString("name"),
+            sourceDisplayName = o.optString("sourceDisplayName"),
+            treeUri = treeUri,
+            createdAt = o.optLong("createdAt", System.currentTimeMillis()),
+            isWritable = o.optBoolean("isWritable", true),
+            userAllowWrite = o.optBoolean("userAllowWrite", true),
+            resolvedHostPath = resolvedHostPath,
+        )
     }
 
     /** 挂载表文件（两进程共享，沙箱专属目录）。 */
@@ -170,12 +172,18 @@ class MountedFoldersStore(private val appContext: Context) {
      */
     var onChange: (() -> Unit)? = null
 
-    /** 挂一个目录（name 决定 guest 里的 /var/minis/mounts/<name>）。 */
-    fun add(name: String, hostPath: String, writable: Boolean = true): Entry {
+    /** 挂载一个已经完成校验的目录（name 决定 guest 里的挂载路径）。 */
+    private fun add(
+        name: String,
+        sourceDisplayName: String,
+        treeUri: String,
+        hostPath: String,
+        writable: Boolean = true,
+    ): Entry {
         val entry = Entry(
             name = name,
-            sourceDisplayName = name,
-            treeUri = Uri.fromFile(java.io.File(hostPath)).toString(),
+            sourceDisplayName = sourceDisplayName,
+            treeUri = treeUri,
             isWritable = writable,
             resolvedHostPath = hostPath,
         )
@@ -191,22 +199,42 @@ class MountedFoldersStore(private val appContext: Context) {
      * proot bind mount 只认宿主 POSIX 路径，所以非 externalstorage 的 uri
      * （解析不出 /storage/... ）直接拒绝并说明原因，别让 guest 挂半截。
      */
-    fun addFromTreeUri(displayName: String, uri: Uri): Result<Boolean> {
-        val hostPath = resolveHostPathFromUri(uri.toString())
-            ?: return Result.failure(
-                IllegalStateException("这个目录不在共享存储上（$uri），proot 挂不了，请选「手机存储」下的文件夹"),
-            )
+    fun addFromTreeUri(displayName: String, uri: Uri): Result<Entry> {
+        val hostPath = when (val resolution = SandboxMountPaths.resolveTreeUri(appContext, uri)) {
+            is SandboxMountPaths.Resolution.Success -> resolution.hostPath
+            is SandboxMountPaths.Resolution.Failure ->
+                return Result.failure(IllegalStateException(resolution.userMessage()))
+        }
         runCatching {
             appContext.contentResolver.takePersistableUriPermission(
                 uri,
-                android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
-                    android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
             )
-        } // 授权失败不致命：POSIX 路径本来就直接可读
-        val name = displayName.ifBlank { hostPath.trimEnd('/').substringAfterLast('/') }
-            .sanitizeMountName()
-        add(name, hostPath)
-        return Result.success(true)
+        }
+        // 写入授权单独申请；只读授权不应因 ROM 拒绝写权限而一起丢失。
+        runCatching {
+            appContext.contentResolver.takePersistableUriPermission(
+                uri,
+                android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+            )
+        } // 授权失败不致命：MANAGE_EXTERNAL_STORAGE 下 POSIX 路径本来就直接可读
+        val sourceName = displayName.ifBlank { hostPath.trimEnd('/').substringAfterLast('/') }
+        val name = sourceName.sanitizeMountName()
+        return Result.success(add(name, sourceName, uri.toString(), hostPath))
+    }
+
+    /** 手动填写 POSIX 路径。所有检查通过后才写入挂载表。 */
+    fun addFromHostPath(displayName: String, rawPath: String): Result<Entry> {
+        val hostPath = when (val resolution = SandboxMountPaths.validateHostPath(appContext, rawPath)) {
+            is SandboxMountPaths.Resolution.Success -> resolution.hostPath
+            is SandboxMountPaths.Resolution.Failure ->
+                return Result.failure(IllegalStateException(resolution.userMessage()))
+        }
+        val sourceName = displayName.ifBlank { hostPath.trimEnd('/').substringAfterLast('/') }
+        val name = sourceName.sanitizeMountName()
+        return Result.success(
+            add(name, sourceName, Uri.fromFile(java.io.File(hostPath)).toString(), hostPath),
+        )
     }
 
     private fun String.sanitizeMountName(): String =
@@ -232,21 +260,6 @@ class MountedFoldersStore(private val appContext: Context) {
         runCatching { onChange?.invoke() }
     }
 
-    /** SAF tree uri → POSIX 路径（只支持 /storage/... 型 external storage，与 minis 同规则）。 */
-    private fun resolveHostPathFromUri(treeUri: String): String? {
-        if (!treeUri.startsWith("content://") && treeUri.startsWith("file://")) {
-            return treeUri.removePrefix("file://")
-        }
-        val parsed = runCatching { Uri.parse(treeUri).path }.getOrNull() ?: return null
-        val marker = "/document/"
-        val idx = parsed.indexOf(marker)
-        if (idx < 0) return null
-        val docId = Uri.decode(parsed.substring(idx + marker.length))
-        // primary/External → /storage/emulated/0
-        if (docId.startsWith("primary")) {
-            val sub = docId.removePrefix("primary").removePrefix(":")
-            return ("/storage/emulated/0" + if (sub.isEmpty()) "" else "/$sub")
-        }
-        return docId.takeIf { it.startsWith("/") }
-    }
+    private fun SandboxMountPaths.Resolution?.hostPath(): String? =
+        (this as? SandboxMountPaths.Resolution.Success)?.hostPath
 }

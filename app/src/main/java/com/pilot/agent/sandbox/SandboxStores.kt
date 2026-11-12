@@ -18,6 +18,11 @@ object SandboxStores {
         return synchronized(this) {
             store ?: MountedFoldersStore(context.applicationContext).also { s ->
                 store = s
+                // 设置页可能先于 SandboxTerminal 创建 store。内核必须在第一次
+                // onChange 前拿到同一实例，否则 apply 会把挂载集合当成空表。
+                if (PRootKernel.mountedFoldersStore == null) {
+                    PRootKernel.mountedFoldersStore = s
+                }
                 // ★ 热挂载（minis 原版 T219-5 同款）：
                 //   proot 的 `-b` 在 spawn 时冻结，改快照对活着的热壳无效，
                 //   必须 apply 快照 + 杀掉热壳，下条命令重建时带上新 bind。

@@ -5,8 +5,6 @@ import android.net.ConnectivityManager
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
-import android.os.storage.StorageManager
-import android.provider.DocumentsContract
 import android.util.Log
 import kotlinx.coroutines.sync.withLock
 import com.pilot.agent.sandbox.shim.FileMentionIndex
@@ -475,55 +473,23 @@ object PRootKernel {
      * cache field on `MountedFoldersStore.Entry`. Kept inline here so
      * T219-3 can ship before A finishes.
      */
-    private fun resolveTreeUriToHostPath(treeUriString: String, context: Context): String? = try {
-        val treeUri = Uri.parse(treeUriString)
-        if (treeUri.authority != "com.android.externalstorage.documents") {
-            null
-        } else {
-            val docId = DocumentsContract.getTreeDocumentId(treeUri)
-            val parts = docId.split(':', limit = 2)
-            val volumeId = parts.getOrNull(0).orEmpty()
-            val relPath = parts.getOrNull(1).orEmpty()
-            val volumeRoot = resolveVolumeRoot(volumeId, context)
-            if (volumeRoot == null) {
-                Log.w(TAG, "resolveTreeUriToHostPath: unknown volume '$volumeId' for $treeUriString")
+    private fun resolveTreeUriToHostPath(treeUriString: String, context: Context): String? =
+        when (
+            val resolution = SandboxMountPaths.resolveTreeUri(
+                context,
+                Uri.parse(treeUriString),
+            )
+        ) {
+            is SandboxMountPaths.Resolution.Success -> resolution.hostPath
+            is SandboxMountPaths.Resolution.Failure -> {
+                Log.w(
+                    TAG,
+                    "resolveTreeUriToHostPath: ${resolution.reason} ${resolution.detail} " +
+                        "uri=$treeUriString ${storageAccessDiag(context)}",
+                )
                 null
-            } else {
-                val candidate = if (relPath.isEmpty()) File(volumeRoot) else File(volumeRoot, relPath)
-                // Diagnose the common "mounted folder reads empty" failure: the
-                // resolved host dir exists but the app process (raw POSIX, via
-                // proot) can't readdir it because the ROM only grants the
-                // /mnt/runtime/default FUSE view. list() returning null == EACCES.
-                if (candidate.exists() && candidate.canRead()) {
-                    val childCount = candidate.list()?.size
-                    if (childCount == null) {
-                        Log.w(
-                            TAG,
-                            "resolveTreeUriToHostPath: host=${candidate.absolutePath} canRead=true " +
-                                "but list() returned null (readdir EACCES / scoped-storage filtered) — " +
-                                "mount will appear empty. ${storageAccessDiag(context)}",
-                        )
-                    } else {
-                        Log.i(
-                            TAG,
-                            "resolveTreeUriToHostPath: host=${candidate.absolutePath} readable childCount=$childCount",
-                        )
-                    }
-                    candidate.absolutePath
-                } else {
-                    Log.w(
-                        TAG,
-                        "resolveTreeUriToHostPath: host=${candidate.absolutePath} " +
-                            "exists=${candidate.exists()} canRead=${candidate.canRead()} — bind skipped",
-                    )
-                    null
-                }
             }
         }
-    } catch (t: Throwable) {
-        Log.w(TAG, "resolveTreeUriToHostPath failed for $treeUriString: ${t.message}")
-        null
-    }
 
     /**
      * One-line summary of the app's effective external-storage access, for the
@@ -555,23 +521,6 @@ object PRootKernel {
                 "sdk=$sdk legacyStorageGranted=$granted legacyExtStorageOptIn=$legacyOptIn"
             }
         }
-    }
-
-    private fun resolveVolumeRoot(volumeId: String, context: Context): String? {
-        if (volumeId.equals("primary", ignoreCase = true) || volumeId.isEmpty()) {
-            return Environment.getExternalStorageDirectory()?.absolutePath
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            val sm = context.getSystemService(Context.STORAGE_SERVICE) as? StorageManager ?: return null
-            for (volume in sm.storageVolumes) {
-                if (volume.uuid?.equals(volumeId, ignoreCase = true) == true) {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                        return volume.directory?.absolutePath
-                    }
-                }
-            }
-        }
-        return null
     }
 
     /**

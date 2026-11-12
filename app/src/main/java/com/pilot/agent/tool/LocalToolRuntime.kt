@@ -23,6 +23,7 @@ class LocalToolRuntime(
     private val audit = ToolAuditLog(appContext)
     private val files = FileTools(appContext, readerProvider)
     private val devices = DeviceTools(appContext)
+    private val ssh = SshTool()
     val memory = MemoryStore(appContext)
 
     fun match(text: String): ToolInvocation? {
@@ -33,7 +34,11 @@ class LocalToolRuntime(
             ?: matchScreenshot(t)
             ?: matchDevice(t)
             ?: matchFiles(t)
+            ?: ssh.match(t)
     }
+
+    fun displayTextFor(text: String, invocation: ToolInvocation?): String =
+        ssh.displayTextFor(text, invocation)
 
     fun policyFor(group: ToolGroup): ToolPolicy = permissions.policyFor(group)
 
@@ -65,6 +70,10 @@ class LocalToolRuntime(
 
     suspend fun execute(text: String, confirmer: ToolConfirmer): ToolResult? {
         val invocation = match(text) ?: return null
+        return execute(invocation, confirmer)
+    }
+
+    suspend fun execute(invocation: ToolInvocation, confirmer: ToolConfirmer): ToolResult {
         val policy = permissions.policyFor(invocation.group)
         return when (policy) {
             ToolPolicy.DENY -> {

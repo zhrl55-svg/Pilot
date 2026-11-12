@@ -120,6 +120,7 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.okhttp)
+      implementation(libs.jsch)
     implementation(libs.androidx.media3.exoplayer)
 
     // 端侧语音识别：sherpa-onnx（SenseVoice-Small）

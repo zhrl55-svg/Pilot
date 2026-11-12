@@ -174,7 +174,8 @@ class LocalAsr(private val context: Context) {
                 val dt = System.currentTimeMillis() - t0
                 lastLatencyMs = dt
                 recordLatency(dt)
-                Dbg.i(TAG, "本地ASR ${dt}ms ${"%.2f".format(pcm.size.toDouble() / sampleRate)}s → 「$text」")
+                // 识别正文可能包含用户随后提供的密码或验证码；日志只记录长度。
+                Dbg.i(TAG, "本地ASR ${dt}ms ${"%.2f".format(pcm.size.toDouble() / sampleRate)}s → ${text.length} 字符（正文不写日志）")
                 return text
             } catch (t: Throwable) {
                 Dbg.e(TAG, "本地ASR 解码异常 ${t.javaClass.simpleName}: ${t.message}")

@@ -17,6 +17,7 @@ import com.pilot.agent.agent.IntentGate
 import com.pilot.agent.agent.Risk
 import com.pilot.agent.runtime.AgentRuntime
 import com.pilot.agent.tool.ToolGroup
+import com.pilot.agent.tool.ToolInvocation
 import com.pilot.agent.tool.ToolPolicy
 import com.pilot.agent.tool.ToolStatus
 import com.pilot.agent.voice.VoiceInput
@@ -589,6 +590,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             // 单例复用：把回调换成当前 ViewModel 的
             v.onState = { voiceState = it }
             v.onText = { text ->
+                val matchedTool = AgentRuntime.localTools.match(text)
                 // ★ 去重：同一条内容短时间内重复到达只显示一次。
                 //   长按录音松手时，VAD 会 flush 出一句；麦克风还在录，
                 //   紧接着又切出一段内容相近的 → 用户看到"显示了两遍"（实测）。
@@ -599,7 +601,9 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 } else {
                     lastUserText = text.trim()
                     lastUserTextAt = now
-                    add(LogEntry.Kind.USER, text)
+                    addUserMessageIfNeeded(
+                        AgentRuntime.localTools.displayTextFor(text, matchedTool),
+                    )
                 }
                 if (!dup) {
                     // ★ 「你休息一会 / 我先忙一会 / 别打扰我」→ 进免打扰：
@@ -613,9 +617,9 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                         AgentRuntime.speaker.speak(DND_REPLY)
                     } else {
                         when (IntentGate.classify(text)) {
-                            IntentGate.Kind.TASK -> run(text)
-                            IntentGate.Kind.QUERY -> query(text)
-                            IntentGate.Kind.CHAT -> chat(text)
+                            IntentGate.Kind.TASK -> run(text, matchedTool)
+                            IntentGate.Kind.QUERY -> query(text, matchedTool)
+                            IntentGate.Kind.CHAT -> chat(text, matchedTool)
                         }
                     }
                 }
@@ -644,12 +648,15 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             gate = AgentRuntime.voiceprint,
             onState = { voiceState = it },
             onText = { text ->
-                add(LogEntry.Kind.USER, text)
+                val matchedTool = AgentRuntime.localTools.match(text)
+                addUserMessageIfNeeded(
+                    AgentRuntime.localTools.displayTextFor(text, matchedTool),
+                )
                 // 意图三分类：操作 / 查询 / 闲聊，走三条完全不同的链路
                 when (IntentGate.classify(text)) {
-                    IntentGate.Kind.TASK -> run(text)
-                    IntentGate.Kind.QUERY -> query(text)
-                    IntentGate.Kind.CHAT -> chat(text)
+                    IntentGate.Kind.TASK -> run(text, matchedTool)
+                    IntentGate.Kind.QUERY -> query(text, matchedTool)
+                    IntentGate.Kind.CHAT -> chat(text, matchedTool)
                 }
             },
             onError = { msg -> add(LogEntry.Kind.ERROR, msg) },
@@ -867,15 +874,16 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         com.pilot.agent.sandbox.SandboxStores.mountedFolders(getApplication())
             .entries.value.map { it.name to (it.resolvedHostPath ?: "(路径未解析)") }
 
-    /**
-     * 挂一个 SAF 目录。**重启沙箱进程后生效**——proot 的 bind mount 表在
-     * boot 时快照，运行中热挂载要动 ExecutionCoordinator（minis 原版支持，
-     * Pilot 的 v2 UI 先走冷生效，够用且稳）。
-     */
+    /** 挂一个 SAF 目录；挂载表更新后会重建后续 shell 的 PRoot bind 参数。 */
     fun mountSandboxFolder(treeUri: android.net.Uri, displayName: String) {
         val store = com.pilot.agent.sandbox.SandboxStores.mountedFolders(getApplication())
         store.addFromTreeUri(displayName, treeUri)
-            .onSuccess { add(LogEntry.Kind.OBSERVE, "已挂载「$displayName」→ /var/minis/mounts/，重启沙箱进程后生效") }
+            .onSuccess { entry ->
+                add(
+                    LogEntry.Kind.OBSERVE,
+                    "已挂载「${entry.name}」→ /var/minis/mounts/${entry.name}，热壳已自动重启",
+                )
+            }
             .onFailure { add(LogEntry.Kind.ERROR, "挂载失败：${it.message}") }
     }
 
@@ -894,15 +902,11 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         val store = com.pilot.agent.sandbox.SandboxStores.mountedFolders(getApplication())
-        val name = displayName.ifBlank { p.trimEnd('/').substringAfterLast('/') }
-        runCatching {
-            store.add(name, p)
-            // 确认路径真的存在，别挂了个空目录进去
-            if (!java.io.File(p).isDirectory) {
-                throw IllegalStateException("目录不存在：$p")
-            }
-        }.onSuccess {
-            add(LogEntry.Kind.OBSERVE, "已挂载「$name」→ $p，重启沙箱进程后生效")
+        store.addFromHostPath(displayName, p).onSuccess { entry ->
+            add(
+                LogEntry.Kind.OBSERVE,
+                "已挂载「${entry.name}」→ ${entry.resolvedHostPath}，热壳已自动重启",
+            )
         }.onFailure {
             add(LogEntry.Kind.ERROR, "挂载失败：${it.message}")
         }
@@ -994,8 +998,8 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
      * 查询类：行情、天气、火车余票这类要信息的需求。走 QueryEngine，不碰屏幕。
      * 查不到就退回端侧模型答（哪怕答得不好，也比一声不吭强）。
      */
-    private fun query(text: String) {
-        if (tryRunLocalTool(text, allowConfirmation = true)) return
+    private fun query(text: String, matchedTool: ToolInvocation? = null) {
+        if (tryRunLocalTool(text, allowConfirmation = true, matchedTool = matchedTool)) return
         viewModelScope.launch {
             add(LogEntry.Kind.THINK, "查一下…")
             val answer = withContext(Dispatchers.IO) {
@@ -1023,8 +1027,8 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
      * 端侧小模型不知道当前时间，prompt 里必须注入，否则问「今天几号」
      * 会答成占位符。
      */
-    private fun chat(text: String) {
-        if (tryRunLocalTool(text, allowConfirmation = true)) return
+    private fun chat(text: String, matchedTool: ToolInvocation? = null) {
+        if (tryRunLocalTool(text, allowConfirmation = true, matchedTool = matchedTool)) return
         viewModelScope.launch {
             add(LogEntry.Kind.THINK, "这句不是操作指令，交给模型回答")
             val reply = withContext(Dispatchers.IO) {
@@ -1137,11 +1141,13 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
      *
      * @return true when the local tool layer owns this request.
      */
-    private fun tryRunLocalTool(text: String, allowConfirmation: Boolean): Boolean {
-        if (AgentRuntime.localTools.match(text) == null) return false
-        if (logs.lastOrNull()?.let { it.kind == LogEntry.Kind.USER && it.text == text } != true) {
-            add(LogEntry.Kind.USER, text)
-        }
+    private fun tryRunLocalTool(
+        text: String,
+        allowConfirmation: Boolean,
+        matchedTool: ToolInvocation? = null,
+    ): Boolean {
+        val invocation = matchedTool ?: AgentRuntime.localTools.match(text) ?: return false
+        addUserMessageIfNeeded(AgentRuntime.localTools.displayTextFor(text, invocation))
         add(LogEntry.Kind.THINK, "调用本机工具…")
         running = true
         justSent = true
@@ -1149,7 +1155,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         publishNotificationStatus()
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) {
-                AgentRuntime.localTools.execute(text) { question, risk ->
+                AgentRuntime.localTools.execute(invocation) { question, risk ->
                     if (allowConfirmation) askToolConfirmation(question, risk)
                     else false
                 }
@@ -1158,14 +1164,10 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             justSent = false
             activeTaskLabel = ""
             publishNotificationStatus()
-            if (result == null) {
-                add(LogEntry.Kind.ERROR, "没有找到可执行的本地工具。")
-            } else {
-                val kind = if (result.status == ToolStatus.SUCCESS) LogEntry.Kind.DONE
-                else LogEntry.Kind.ERROR
-                add(kind, result.message)
-                AgentRuntime.speaker.speak(result.spoken)
-            }
+            val kind = if (result.status == ToolStatus.SUCCESS) LogEntry.Kind.DONE
+            else LogEntry.Kind.ERROR
+            add(kind, result.message)
+            AgentRuntime.speaker.speak(result.spoken)
             refreshStatus()
         }
         return true
@@ -1188,13 +1190,16 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         return answer
     }
 
-    fun run(goal: String) {
+    fun run(goal: String, matchedTool: ToolInvocation? = null) {
         val g = goal.trim()
         if (g.isEmpty() || running) return
-        if (tryRunLocalTool(g, allowConfirmation = true)) return
+        val invocation = matchedTool ?: AgentRuntime.localTools.match(g)
+        // 语音回调、文字发送和本地工具都从这里进入。统一在同一处追加，
+        // 避免操作指令被上游和 run() 各写一次而在聊天框显示两遍。
+        addUserMessageIfNeeded(AgentRuntime.localTools.displayTextFor(g, invocation))
+        if (tryRunLocalTool(g, allowConfirmation = true, matchedTool = invocation)) return
         // 文本输入同样过意图门：不是操作指令就不碰屏幕
         if (!IntentGate.isTask(g)) {
-            add(LogEntry.Kind.USER, g)
             add(LogEntry.Kind.OBSERVE, "这句不是操作指令（${IntentGate.reason(g)}），不执行。")
             return
         }
@@ -1203,9 +1208,6 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             // Android 不允许普通 App 静默勾选无障碍开关，但可以把用户直接带到
             // Pilot 的服务详情页，并同时用聊天文字和语音说明下一步。
             Dbg.w(TAG, "操作权限未开启，已提示并打开设置：goalChars=${g.length}")
-            if (logs.lastOrNull()?.let { it.kind == LogEntry.Kind.USER && it.text == g } != true) {
-                add(LogEntry.Kind.USER, g)
-            }
             val prompt = "需要先开启 Pilot 的操作权限。我已打开设置页，请找到 Pilot 并开启，然后再说一次。"
             add(LogEntry.Kind.DONE, prompt)
             val now = System.currentTimeMillis()
@@ -1217,7 +1219,6 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             refreshStatus()
             return
         }
-        add(LogEntry.Kind.USER, g)
         running = true
         activeTaskLabel = g
         publishNotificationStatus()
@@ -1467,5 +1468,19 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     private fun add(kind: LogEntry.Kind, text: String) {
         logs += LogEntry(seq++, kind, text)
         if (logs.size > 200) logs.removeAt(0)
+    }
+
+    /**
+     * 用户发言只保留一条。
+     *
+     * 语音识别会先把结果交给界面，意图分流后 [run] 又负责执行同一个目标；
+     * 两处都直接调用 [add] 时，操作类指令就会在聊天里出现两次。
+     */
+    private fun addUserMessageIfNeeded(text: String) {
+        val normalized = text.trim()
+        if (normalized.isEmpty()) return
+        val last = logs.lastOrNull()
+        if (last?.kind == LogEntry.Kind.USER && last.text.trim() == normalized) return
+        add(LogEntry.Kind.USER, normalized)
     }
 }

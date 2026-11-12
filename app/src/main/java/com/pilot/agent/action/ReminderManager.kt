@@ -124,28 +124,35 @@ object ReminderManager {
     }
 
     private fun parse(raw: String): Pair<String, Long>? {
-        val text = raw.trim().replace("半小时", "30分钟")
+        val text = raw.trim()
+            .replace("半小时", "30分钟")
+            .replace("半个钟头", "30分钟")
+        val number = "[0-9零〇一二两三四五六七八九十百]+"
+        val relative = "($number)\\s*(个?小时|钟头|分钟|分|天|日)\\s*(?:后|以后|之后)"
         val patterns = listOf(
-            Regex("(?:(\\d+)\\s*分钟后|(?:(\\d+)\\s*小时后)|(?:(\\d+)\\s*天后))\\s*提醒我\\s*(.+)"),
-            Regex("提醒我\\s*(.+?)\\s*(?:(\\d+)\\s*分钟后|(\\d+)\\s*小时后|(\\d+)\\s*天后)"),
+            Regex("$relative\\s*提醒我\\s*(.+)"),
+            Regex("提醒我\\s*$relative\\s*(.+)"),
+            Regex("提醒我\\s*(.+?)\\s*$relative"),
         )
         patterns.forEachIndexed { index, regex ->
             val m = regex.find(text) ?: return@forEachIndexed
-            val title: String
-            val amount: Long
-            val unit: Long
-            if (index == 0) {
-                amount = (1..3).firstNotNullOfOrNull { m.groupValues[it].toLongOrNull() } ?: return@forEachIndexed
-                val group = (1..3).first { m.groupValues[it].isNotBlank() }
-                unit = when (group) { 1 -> 60_000L; 2 -> 3_600_000L; else -> 86_400_000L }
-                title = m.groupValues[4]
-            } else {
-                title = m.groupValues[1]
-                val group = (2..4).firstOrNull { m.groupValues[it].isNotBlank() } ?: return@forEachIndexed
-                amount = m.groupValues[group].toLongOrNull() ?: return@forEachIndexed
-                unit = when (group) { 2 -> 60_000L; 3 -> 3_600_000L; else -> 86_400_000L }
+            val amountGroup = if (index == 2) 2 else 1
+            val unitGroup = if (index == 2) 3 else 2
+            val titleGroup = when (index) {
+                0 -> 3
+                1 -> 3
+                else -> 1
             }
-            val clean = title.trim(' ', '，', ',', '。', '.', '！', '!')
+            val amount = parseChineseNumber(m.groupValues[amountGroup]) ?: return@forEachIndexed
+            val unit = when (m.groupValues[unitGroup]) {
+                "小时", "个小时", "钟头" -> 3_600_000L
+                "分钟", "分" -> 60_000L
+                else -> 86_400_000L
+            }
+            val clean = m.groupValues[titleGroup]
+                .trim(' ', '，', ',', '。', '.', '！', '!')
+                .removePrefix("一下")
+                .trim()
             if (clean.isNotBlank() && amount in 1..720) return clean to (System.currentTimeMillis() + amount * unit)
         }
         val dateOffset = when {
@@ -177,6 +184,43 @@ object ReminderManager {
             }
         }
         return null
+    }
+
+    /** Parses the small Chinese number forms naturally used in spoken reminders. */
+    private fun parseChineseNumber(raw: String): Long? {
+        raw.trim().toLongOrNull()?.let { return it }
+        if (raw.isBlank()) return null
+        var total = 0L
+        var current = 0L
+        for (char in raw) {
+            when (char) {
+                '十' -> {
+                    total += (if (current == 0L) 1L else current) * 10L
+                    current = 0L
+                }
+                '百' -> {
+                    total += (if (current == 0L) 1L else current) * 100L
+                    current = 0L
+                }
+                else -> {
+                    val digit = when (char) {
+                        '零', '〇' -> 0L
+                        '一' -> 1L
+                        '二', '两' -> 2L
+                        '三' -> 3L
+                        '四' -> 4L
+                        '五' -> 5L
+                        '六' -> 6L
+                        '七' -> 7L
+                        '八' -> 8L
+                        '九' -> 9L
+                        else -> return null
+                    }
+                    current = current * 10L + digit
+                }
+            }
+        }
+        return total + current
     }
 
     private fun load(context: Context): List<Reminder> = runCatching {
