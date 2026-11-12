@@ -214,11 +214,15 @@ class NavigationService : Service() {
 
         override fun getNavState(): String = buildString {
             append("{\"state\":\"").append(currentState.toString()).append("\"")
-            append(",\"destination\":\"").append(currentDestination ?: "").append("\"")
+            append(",\"destination\":").append(org.json.JSONObject.quote(currentDestination ?: ""))
             // 剩余距离/时间给「还有多远」查询用
             guide()?.let { g ->
                 g.remainingMeters()?.let { append(",\"remainMeters\":").append(it) }
                 g.remainingSeconds()?.let { append(",\"remainSeconds\":").append(it) }
+                g.nextManeuver()?.let { (instruction, meters) ->
+                    append(",\"nextInstruction\":").append(org.json.JSONObject.quote(instruction))
+                    append(",\"nextManeuverMeters\":").append(meters)
+                }
             }
             append("}")
         }

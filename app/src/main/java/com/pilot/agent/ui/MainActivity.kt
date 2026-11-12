@@ -11,6 +11,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import android.os.SystemClock
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -36,6 +37,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
@@ -48,9 +51,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.animation.Crossfade
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -146,7 +151,17 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        PilotStatusOverlay.onAppForeground(this)
         vm.refreshStatus()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        if (!isFinishing && vm.shouldShowStatusOverlay()) {
+            PilotStatusOverlay.show(this, vm.statusForOverlay())
+        } else {
+            PilotStatusOverlay.hide(this)
+        }
     }
 
     /**
@@ -225,13 +240,8 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
 
         // ★ 音乐播放条：在聊天区上部显示歌名 + 暂停/继续 + 停止
         vm.nowPlaying?.let { title ->
-            MusicBar(
-                title = title,
-                paused = vm.musicPaused,
-                onToggle = { vm.toggleMusic() },
-                onStop = { vm.stopMusic() },
-            )
-            Spacer(Modifier.height(12.dp))
+            MusicBar(vm)
+            Spacer(Modifier.height(8.dp))
         }
 
         Box(
@@ -463,44 +473,477 @@ private fun PlayingBars(playing: Boolean, tint: androidx.compose.ui.graphics.Col
     }
 }
 
-/** 音乐播放条：歌名 + 暂停/继续 + 停止。 */
+/** 紧凑播放器：用一行同步歌词和一行控制键尽量节省纵向空间。 */
 @Composable
-private fun MusicBar(
-    title: String,
-    paused: Boolean,
-    onToggle: () -> Unit,
-    onStop: () -> Unit,
-) {
+private fun MusicBar(vm: AgentViewModel) {
     val colors = MaterialTheme.colorScheme
-    Surface(
-        // 浅灰半透明：跟内容区一个调子，不抢视线
-        color = androidx.compose.ui.graphics.Color(0x66FFFFFF).copy(alpha = 0.28f),
-        shape = RoundedCornerShape(12.dp),
-        modifier = Modifier.fillMaxWidth(),
+    val ctx = LocalContext.current
+    var showRecommendations by remember { mutableStateOf(false) }
+    var showQueue by remember { mutableStateOf(false) }
+    val playing = !vm.musicPaused
+    val progress = if (vm.musicDurationMs > 0L) {
+        (vm.musicPositionMs.toFloat() / vm.musicDurationMs.toFloat()).coerceIn(0f, 1f)
+    } else 0f
+    val repeatLabel = when (vm.musicPlaybackMode) {
+        com.pilot.agent.music.MusicPlayer.PlaybackMode.SEQUENCE -> "顺序"
+        com.pilot.agent.music.MusicPlayer.PlaybackMode.REPEAT_ALL -> "列表循环"
+        com.pilot.agent.music.MusicPlayer.PlaybackMode.REPEAT_ONE -> "单曲循环"
+    }
+    val lyric = vm.musicLyric.ifBlank {
+        when {
+            !vm.musicLyricsReady -> "正在加载歌词…"
+            vm.musicPositionMs < 1_000L -> "正在准备播放…"
+            else -> "♪ 前奏"
+        }
+    }
+    val trackLine = buildString {
+        append(vm.nowPlaying.orEmpty())
+        if (vm.musicArtist.isNotBlank()) append("  ·  ${vm.musicArtist}")
+    }
+    val cardShape = RoundedCornerShape(18.dp)
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(cardShape)
+            .background(
+                Brush.linearGradient(
+                    listOf(
+                        colors.primary.copy(alpha = 0.28f),
+                        colors.surfaceVariant.copy(alpha = 0.92f),
+                        colors.surface.copy(alpha = 0.98f),
+                    ),
+                ),
+            )
+            .border(1.dp, colors.primary.copy(alpha = 0.20f), cardShape)
+            .padding(horizontal = 12.dp, vertical = 7.dp),
     ) {
         Row(
+            modifier = Modifier.height(21.dp),
             verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(start = 12.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
         ) {
-            // ★ 动态音柱：播放时跳动的竖条（没有 material-icons 依赖，自己画）
-            PlayingBars(playing = !paused, tint = colors.onSecondaryContainer)
-            Spacer(Modifier.width(8.dp))
+            PlayingBars(playing = playing, tint = colors.primary)
+            Spacer(Modifier.width(7.dp))
             Text(
-                title,
+                trackLine,
+                modifier = Modifier.weight(1f),
                 fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
                 color = colors.onSurface,
                 maxLines = 1,
                 overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f),
             )
-            TextButton(onClick = onToggle) {
-                Text(if (paused) "继续" else "暂停", fontSize = 12.sp)
+            Box {
+                Row(
+                    modifier = Modifier
+                        .height(22.dp)
+                        .clip(RoundedCornerShape(50))
+                        .background(colors.primary.copy(alpha = 0.10f))
+                        .border(
+                            1.dp,
+                            colors.primary.copy(alpha = 0.22f),
+                            RoundedCornerShape(50),
+                        )
+                        .clickable {
+                            showQueue = false
+                            showRecommendations = true
+                        }
+                        .padding(horizontal = 7.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "推荐",
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = colors.primary,
+                    )
+                    Spacer(Modifier.width(2.dp))
+                    Text(
+                        "▾",
+                        fontSize = 8.sp,
+                        color = colors.primary.copy(alpha = 0.80f),
+                    )
+                }
+                DropdownMenu(
+                    expanded = showRecommendations,
+                    onDismissRequest = { showRecommendations = false },
+                ) {
+                    MusicListMenuItem("最近播放", "播放最近", vm) { showRecommendations = false }
+                    MusicListMenuItem("热歌榜", "播放热门歌曲", vm) { showRecommendations = false }
+                    MusicListMenuItem("本地音乐", "播放本地音乐", vm) { showRecommendations = false }
+                    MusicListMenuItem("每日推荐", "播放每日推荐", vm) { showRecommendations = false }
+                    MusicListMenuItem("我喜欢的", "播放我喜欢的音乐", vm) { showRecommendations = false }
+                    MusicListMenuItem("新歌榜", "播放新歌", vm) { showRecommendations = false }
+                    MusicListMenuItem("飙升榜", "播放飙升榜", vm) { showRecommendations = false }
+                }
             }
-            TextButton(onClick = onStop) {
-                Text("停止", fontSize = 12.sp, color = colors.error)
+            Spacer(Modifier.width(2.dp))
+            Box(
+                Modifier
+                    .size(26.dp)
+                    .clip(CircleShape)
+                    .clickable { vm.stopMusic() },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("×", fontSize = 20.sp, color = colors.onSurfaceVariant)
+            }
+        }
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(27.dp),
+            contentAlignment = Alignment.CenterStart,
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(
+                    Modifier
+                        .width(2.dp)
+                        .height(16.dp)
+                        .clip(CircleShape)
+                        .background(colors.primary.copy(alpha = if (playing) 1f else 0.45f)),
+                )
+                Spacer(Modifier.width(8.dp))
+                Crossfade(
+                    targetState = lyric,
+                    animationSpec = tween(durationMillis = 220),
+                    label = "music-lyric",
+                    modifier = Modifier.weight(1f),
+                ) { line ->
+                    Text(
+                        line,
+                        fontSize = if (vm.musicLyric.isNotBlank()) 15.sp else 12.sp,
+                        fontWeight = if (vm.musicLyric.isNotBlank()) {
+                            FontWeight.Medium
+                        } else {
+                            FontWeight.Normal
+                        },
+                        color = if (vm.musicLyric.isNotBlank()) {
+                            colors.primary
+                        } else {
+                            colors.onSurfaceVariant
+                        },
+                        maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                    )
+                }
+                Spacer(Modifier.width(7.dp))
+                Text(
+                    "${formatMusicTime(vm.musicPositionMs)} / ${formatMusicTime(vm.musicDurationMs)}",
+                    fontSize = 9.sp,
+                    color = colors.onSurfaceVariant,
+                    maxLines = 1,
+                )
+            }
+        }
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(2.dp)
+                .clip(CircleShape)
+                .background(colors.onSurface.copy(alpha = 0.12f)),
+        ) {
+            Box(
+                Modifier
+                    .fillMaxWidth(progress)
+                    .height(2.dp)
+                    .clip(CircleShape)
+                    .background(colors.primary),
+            )
+        }
+        Spacer(Modifier.height(3.dp))
+        Row(
+            modifier = Modifier.height(36.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
+            MusicModeChip(
+                text = "随机",
+                active = vm.musicShuffle,
+                onClick = { vm.toggleMusicShuffle() },
+            )
+            MusicSkipButton(next = false, onClick = { vm.previousMusic() })
+            MusicPlayButton(playing = playing, onClick = { vm.toggleMusic() })
+            MusicSkipButton(next = true, onClick = { vm.nextMusic() })
+            MusicModeChip(
+                text = repeatLabel,
+                // 随机是左侧主状态；开启随机时右侧播放模式只作为待恢复设置，
+                // 不能同时高亮，否则用户会误以为两套模式正在叠加生效。
+                active = !vm.musicShuffle,
+                onClick = {
+                    val turningOffShuffle = vm.musicShuffle
+                    if (turningOffShuffle) {
+                        vm.toggleMusicShuffle()
+                    } else {
+                        vm.cycleMusicPlaybackMode()
+                    }
+                    val message = buildString {
+                        if (turningOffShuffle) append("已关闭随机 · ")
+                        append(when (vm.musicPlaybackMode) {
+                            com.pilot.agent.music.MusicPlayer.PlaybackMode.SEQUENCE -> "顺序播放"
+                            com.pilot.agent.music.MusicPlayer.PlaybackMode.REPEAT_ALL -> "列表循环"
+                            com.pilot.agent.music.MusicPlayer.PlaybackMode.REPEAT_ONE -> "单曲循环"
+                        })
+                    }
+                    android.widget.Toast.makeText(ctx, message, android.widget.Toast.LENGTH_SHORT).show()
+                },
+            )
+            Box(
+                modifier = Modifier.weight(1f),
+                contentAlignment = Alignment.CenterEnd,
+            ) {
+                Row(
+                    modifier = Modifier
+                        .height(24.dp)
+                        .clip(RoundedCornerShape(50))
+                        .background(colors.primary.copy(alpha = 0.10f))
+                        .border(
+                            1.dp,
+                            colors.primary.copy(alpha = 0.22f),
+                            RoundedCornerShape(50),
+                        )
+                        .clickable {
+                            showRecommendations = false
+                            showQueue = true
+                        }
+                        .padding(horizontal = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "候选 ${vm.musicTrackIndex}/${vm.musicQueueSize}",
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = colors.primary,
+                        maxLines = 1,
+                    )
+                    Spacer(Modifier.width(2.dp))
+                    Text(
+                        "▾",
+                        fontSize = 8.sp,
+                        color = colors.primary.copy(alpha = 0.75f),
+                    )
+                }
+                DropdownMenu(
+                    expanded = showQueue,
+                    onDismissRequest = { showQueue = false },
+                ) {
+                    vm.musicQueue.forEachIndexed { index, entry ->
+                        MusicQueueMenuItem(
+                            index = index,
+                            title = entry.title,
+                            artist = entry.artist,
+                            active = index + 1 == vm.musicTrackIndex,
+                            vm = vm,
+                        ) { showQueue = false }
+                    }
+                }
             }
         }
     }
+}
+
+@Composable
+private fun MusicListMenuItem(
+    label: String,
+    command: String,
+    vm: AgentViewModel,
+    onSelected: () -> Unit,
+) {
+    val colors = MaterialTheme.colorScheme
+    DropdownMenuItem(
+        text = {
+            Row(
+                modifier = Modifier.width(112.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(
+                    Modifier
+                        .size(5.dp)
+                        .clip(CircleShape)
+                        .background(colors.primary.copy(alpha = 0.72f)),
+                )
+                Spacer(Modifier.width(9.dp))
+                Text(
+                    label,
+                    fontSize = 13.sp,
+                    color = colors.onSurface,
+                )
+            }
+        },
+        onClick = {
+            onSelected()
+            vm.run(command)
+        },
+    )
+}
+
+@Composable
+private fun MusicQueueMenuItem(
+    index: Int,
+    title: String,
+    artist: String,
+    active: Boolean,
+    vm: AgentViewModel,
+    onSelected: () -> Unit,
+) {
+    val colors = MaterialTheme.colorScheme
+    DropdownMenuItem(
+        text = {
+            Row(
+                modifier = Modifier.width(218.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "%02d".format(index + 1),
+                    modifier = Modifier.width(24.dp),
+                    fontSize = 10.sp,
+                    color = if (active) colors.primary else colors.onSurfaceVariant.copy(alpha = 0.72f),
+                )
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        title,
+                        fontSize = 13.sp,
+                        fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                        color = if (active) colors.primary else colors.onSurface,
+                        maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                    )
+                    if (artist.isNotBlank()) {
+                        Text(
+                            artist,
+                            fontSize = 10.sp,
+                            color = colors.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+                if (active) {
+                    Spacer(Modifier.width(6.dp))
+                    Box(
+                        Modifier
+                            .size(5.dp)
+                            .clip(CircleShape)
+                            .background(colors.primary),
+                    )
+                }
+            }
+        },
+        onClick = {
+            onSelected()
+            vm.playMusicAt(index)
+        },
+    )
+}
+
+@Composable
+private fun MusicModeChip(text: String, active: Boolean, onClick: () -> Unit) {
+    val colors = MaterialTheme.colorScheme
+    Box(
+        Modifier
+            .clip(RoundedCornerShape(50))
+            .background(if (active) colors.primary.copy(alpha = 0.20f) else colors.onSurface.copy(alpha = 0.06f))
+            .border(
+                1.dp,
+                if (active) colors.primary.copy(alpha = 0.55f) else colors.onSurface.copy(alpha = 0.10f),
+                RoundedCornerShape(50),
+            )
+            .clickable(onClick = onClick)
+            .padding(horizontal = 6.dp, vertical = 4.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text,
+            fontSize = 10.sp,
+            fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+            color = if (active) colors.primary else colors.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
+private fun MusicPlayButton(playing: Boolean, onClick: () -> Unit) {
+    val colors = MaterialTheme.colorScheme
+    Box(
+        Modifier
+            .size(36.dp)
+            .clip(CircleShape)
+            .background(colors.primary)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Canvas(Modifier.size(17.dp)) {
+            if (playing) {
+                val barWidth = size.width * 0.24f
+                val barHeight = size.height * 0.72f
+                val top = (size.height - barHeight) / 2f
+                drawRoundRect(
+                    color = Color.White,
+                    topLeft = Offset(size.width * 0.22f, top),
+                    size = Size(barWidth, barHeight),
+                    cornerRadius = CornerRadius(2.dp.toPx()),
+                )
+                drawRoundRect(
+                    color = Color.White,
+                    topLeft = Offset(size.width * 0.54f, top),
+                    size = Size(barWidth, barHeight),
+                    cornerRadius = CornerRadius(2.dp.toPx()),
+                )
+            } else {
+                val path = Path().apply {
+                    moveTo(size.width * 0.28f, size.height * 0.16f)
+                    lineTo(size.width * 0.84f, size.height * 0.5f)
+                    lineTo(size.width * 0.28f, size.height * 0.84f)
+                    close()
+                }
+                drawPath(path, Color.White)
+            }
+        }
+    }
+}
+
+@Composable
+private fun MusicSkipButton(next: Boolean, onClick: () -> Unit) {
+    val colors = MaterialTheme.colorScheme
+    Box(
+        Modifier
+            .size(32.dp)
+            .clip(CircleShape)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Canvas(Modifier.size(width = 15.dp, height = 17.dp)) {
+            val path = Path().apply {
+                if (next) {
+                    moveTo(size.width * 0.12f, size.height * 0.15f)
+                    lineTo(size.width * 0.68f, size.height * 0.5f)
+                    lineTo(size.width * 0.12f, size.height * 0.85f)
+                } else {
+                    moveTo(size.width * 0.88f, size.height * 0.15f)
+                    lineTo(size.width * 0.32f, size.height * 0.5f)
+                    lineTo(size.width * 0.88f, size.height * 0.85f)
+                }
+                close()
+            }
+            drawPath(path, colors.onSurface)
+            val barX = if (next) size.width * 0.77f else size.width * 0.12f
+            drawRoundRect(
+                color = colors.onSurface,
+                topLeft = Offset(barX, size.height * 0.14f),
+                size = Size(size.width * 0.10f, size.height * 0.72f),
+                cornerRadius = CornerRadius(2.dp.toPx()),
+            )
+        }
+    }
+}
+
+private fun formatMusicTime(ms: Long): String {
+    if (ms <= 0L) return "0:00"
+    val totalSeconds = ms / 1000L
+    return "%d:%02d".format(totalSeconds / 60L, totalSeconds % 60L)
 }
 
 @Composable
@@ -1341,6 +1784,8 @@ private fun SettingsDialog(
     var ttsVoiceId by remember { mutableStateOf(vm.settings.ttsVoiceId) }
     var systemVoice by remember { mutableStateOf(vm.settings.systemTtsVoice) }
     var musicPolicy by remember { mutableStateOf(vm.settings.musicPolicy) }
+    var musicBaseUrl by remember { mutableStateOf(vm.settings.musicBaseUrl) }
+    var musicFallbackUrl by remember { mutableStateOf(vm.settings.musicFallbackUrl) }
     var sandboxIdleMin by remember { mutableStateOf(vm.settings.sandboxIdleMinutes.toString()) }
     var wakeWords by remember { mutableStateOf(vm.settings.wakeWords) }
     var wakeTone by remember { mutableStateOf(vm.settings.wakeTone) }
@@ -1541,8 +1986,20 @@ private fun SettingsDialog(
                 // ---------------- 音乐 ----------------
                 SettingsSection(
                     title = "音乐",
-                    hint = "网页端登录不会自动同步到 Pilot；请在这里扫码登录。会员播放需要有效 Cookie，且仅保存在本机。",
+                    hint = "本地曲库优先；在线 API 自动选路：Wi‑Fi 优先局域网，移动网络优先 Tailnet，当前地址失败时尝试备用地址。Tailnet 由 Pilot 按需启动，不需要 Tailscale VPN App。",
                 ) {
+                    SmallField(musicBaseUrl, { musicBaseUrl = it }, "在线 API 主地址")
+                    SmallField(musicFallbackUrl, { musicFallbackUrl = it }, "备用地址（留空可关闭）")
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(vm.tailnetState, fontSize = 12.sp, modifier = Modifier.weight(1f), color = colors.onSurfaceVariant)
+                        TextButton(onClick = { vm.connectTailnet() }) { Text("连接 Tailnet", fontSize = 12.sp) }
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(vm.musicServiceState, fontSize = 12.sp, modifier = Modifier.weight(1f), color = colors.onSurfaceVariant)
+                        TextButton(onClick = { vm.testMusicService(musicBaseUrl, musicFallbackUrl) }) {
+                            Text("测试服务", fontSize = 12.sp)
+                        }
+                    }
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
                             if (vm.neteaseNick.isNotBlank()) "已登录：${vm.neteaseNick}" else "未登录",
@@ -1655,6 +2112,8 @@ private fun SettingsDialog(
                         preferOnDevice = preferOnDevice,
                         ttsEngine = ttsEngine,
                         musicPolicy = musicPolicy,
+                        musicBaseUrl = musicBaseUrl.trim().trimEnd('/'),
+                        musicFallbackUrl = musicFallbackUrl.trim().trimEnd('/'),
                         sandboxIdleMinutes = sandboxIdleMin.toIntOrNull()?.coerceIn(0, 120) ?: 5,
                         wakeWords = wakeWords.trim().ifEmpty { AgentSettings.DEFAULT_WAKE_WORDS },
                         wakeTone = wakeTone,

@@ -92,6 +92,36 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     var musicPaused by mutableStateOf(false)
         private set
 
+    var musicArtist by mutableStateOf("")
+        private set
+
+    var musicLyric by mutableStateOf("")
+        private set
+
+    var musicLyricsReady by mutableStateOf(false)
+        private set
+
+    var musicPositionMs by mutableStateOf(0L)
+        private set
+
+    var musicDurationMs by mutableStateOf(0L)
+        private set
+
+    var musicTrackIndex by mutableStateOf(0)
+        private set
+
+    var musicQueueSize by mutableStateOf(0)
+        private set
+
+    var musicQueue by mutableStateOf<List<com.pilot.agent.music.MusicPlayer.QueueEntry>>(emptyList())
+        private set
+
+    var musicShuffle by mutableStateOf(false)
+        private set
+
+    var musicPlaybackMode by mutableStateOf(com.pilot.agent.music.MusicPlayer.PlaybackMode.REPEAT_ALL)
+        private set
+
     /**
      * 系统 TTS 可用音色（运行时向引擎枚举）。
      *
@@ -216,12 +246,76 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var loginTip by mutableStateOf("")
         private set
+
+    var tailnetState by mutableStateOf("尚未连接")
+        private set
+
+    var musicServiceState by mutableStateOf("服务未检测")
+        private set
+
+    fun testMusicService(baseUrl: String = settings.musicBaseUrl, fallbackUrl: String = settings.musicFallbackUrl) {
+        viewModelScope.launch {
+            musicServiceState = "正在检查音乐服务…"
+            val key = withContext(Dispatchers.IO) {
+                com.pilot.agent.music.NeteaseApi.qrKey(baseUrl.trim(), fallbackUrl.trim())
+            }
+            musicServiceState = if (key.isNullOrBlank()) "未连通：检查主/备用地址和网络"
+                else "API 可用：扫码登录接口正常"
+        }
+    }
+
+    fun connectTailnet() {
+        viewModelScope.launch {
+            tailnetState = "正在启动嵌入式 Tailnet…"
+            val app = getApplication<Application>()
+            val first = withContext(Dispatchers.IO) { com.pilot.agent.music.TailscaleGateway.start(app) }
+            if (!first.optBoolean("ok")) {
+                tailnetState = "启动失败：${first.optString("error", "未知错误")}"
+                return@launch
+            }
+            var status = first.optJSONObject("status")
+            var authUrl = status?.optString("authUrl").orEmpty()
+            if (!authUrl.isNullOrBlank() && authUrl != "null") {
+                tailnetState = "请在浏览器完成 Tailnet 授权…"
+                runCatching {
+                    app.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(authUrl))
+                        .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+                }.onFailure { tailnetState = "无法打开授权页：${it.message}" }
+            }
+            repeat(90) {
+                val result = withContext(Dispatchers.IO) { com.pilot.agent.music.TailscaleGateway.status(app) }
+                status = result.optJSONObject("status")
+                if (status?.optBoolean("running") == true) {
+                    tailnetState = "已连接：${status?.optJSONArray("ips")?.optString(0).orEmpty()}"
+                    return@launch
+                }
+                val nextUrl = status?.optString("authUrl").orEmpty()
+                if (authUrl.isBlank() && nextUrl.isNotBlank() && nextUrl != "null") {
+                    authUrl = nextUrl
+                    runCatching {
+                        app.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(authUrl))
+                            .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+                    }
+                }
+                tailnetState = when {
+                    !result.optBoolean("ok") -> "连接中：${result.optString("error", "等待授权")}"
+                    else -> "等待 Tailnet 授权…"
+                }
+                delay(2_000)
+            }
+            tailnetState = "连接超时；可重新点击连接"
+        }
+    }
     var neteaseNick by mutableStateOf("")
         private set
 
     private var loginJob: kotlinx.coroutines.Job? = null
 
     private var voice: VoiceInput? = null
+    private var activeTaskLabel: String = ""
+    private var lastNotificationStatus: String? = null
+    private var lastNavNotificationPollAt = 0L
+    private var cachedNavNotification: String? = null
 
     /** 最近一次用户说的话（用于去重） */
     private var lastUserText: String? = null
@@ -244,6 +338,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                     voiceState = st
                     Dbg.i(TAG, "语音状态 → $st")
                 }
+                if (st == VoiceInput.State.IDLE || st == VoiceInput.State.UNAVAILABLE) wakeOn = false
                 // 免打扰标记（用户主动要求的休眠才显示提示）
                 val dnd = AgentRuntime.voiceInput?.dndRequested == true
                 if (dnd != dndRequested) dndRequested = dnd
@@ -252,6 +347,19 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 val title = mp.nowPlaying()
                 if (title != nowPlaying) nowPlaying = title
                 if (mp.paused != musicPaused) musicPaused = mp.paused
+                if (mp.currentArtist() != musicArtist) musicArtist = mp.currentArtist()
+                val lyric = mp.currentLyric().orEmpty()
+                if (lyric != musicLyric) musicLyric = lyric
+                if (mp.lyricsReady() != musicLyricsReady) musicLyricsReady = mp.lyricsReady()
+                musicPositionMs = mp.positionMs()
+                musicDurationMs = mp.durationMs()
+                if (mp.currentIndex() != musicTrackIndex) musicTrackIndex = mp.currentIndex()
+                if (mp.queueSize() != musicQueueSize) musicQueueSize = mp.queueSize()
+                val queue = mp.queueSnapshot()
+                if (queue != musicQueue) musicQueue = queue
+                if (mp.shuffleEnabled != musicShuffle) musicShuffle = mp.shuffleEnabled
+                if (mp.playbackMode != musicPlaybackMode) musicPlaybackMode = mp.playbackMode
+                publishNotificationStatus()
                 delay(100)
             }
         }
@@ -275,14 +383,18 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             if (!on) return@launch
             ensureVoice()
             val v = voice ?: return@launch
-            if (v.isWakeMode) {
+            if (v.isWakeEnabled) {
                 wakeOn = true
+                com.pilot.agent.service.PilotForegroundService.startForWake(getApplication())
                 return@launch
             }
             // 等 ASR 预热那一步先跑完，避免和模型加载抢线程
-            val ok = withContext(Dispatchers.IO) { v.startWake() }
+            val serviceStarted = com.pilot.agent.service.PilotForegroundService.startForWake(getApplication())
+            val ok = serviceStarted && withContext(Dispatchers.IO) { v.startWake() }
+            if (!ok && serviceStarted) com.pilot.agent.service.PilotForegroundService.stopForWake(getApplication())
             wakeOn = ok
             if (ok) add(LogEntry.Kind.OBSERVE, "麦克风已常驻，喊「${AgentSettings.load().wakeWordList().first()}」唤醒")
+            else if (!serviceStarted) add(LogEntry.Kind.ERROR, "语音待命未启动：请授予麦克风权限后重试")
             refreshStatus()
         }
     }
@@ -294,6 +406,81 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             speaking = s
             Dbg.i(TAG, "播报状态 → $s")
         }
+    }
+
+    /** 由真实语音/任务状态驱动常驻通知，只有内容变化时才更新。 */
+    private fun publishNotificationStatus() {
+        val status = resolvedStatus()
+        com.pilot.agent.ui.PilotStatusOverlay.updateStatus(
+            getApplication(), overlayLabel(), shouldShowStatusOverlay(),
+        )
+        if (status == lastNotificationStatus) return
+        lastNotificationStatus = status
+        com.pilot.agent.service.PilotForegroundService.updateWakeStatus(getApplication(), status)
+    }
+
+    fun statusForOverlay(): String = overlayLabel()
+
+    fun shouldShowStatusOverlay(): Boolean = wakeOn || running || AgentRuntime.speaker.isSpeaking ||
+        navigationNotificationStatus() != null
+
+    /** Keep the small overlay useful while avoiding task names or destinations on screen. */
+    private fun overlayLabel(): String = when {
+        navigationNotificationStatus()?.startsWith("正在规划路线") == true -> "正在规划路线"
+        navigationNotificationStatus() != null -> "正在导航"
+        running -> "正在执行任务"
+        AgentRuntime.speaker.isSpeaking -> "正在回答"
+        voiceState == VoiceInput.State.LISTENING -> "正在聆听"
+        voiceState == VoiceInput.State.RECOGNIZING -> "正在识别"
+        !wakeOn -> if (voiceState == VoiceInput.State.UNAVAILABLE) "语音不可用" else "语音已关闭"
+        voiceState == VoiceInput.State.ASLEEP -> "语音休眠中"
+        else -> "正在待命"
+    }
+
+    private fun resolvedStatus(): String {
+        val navStatus = navigationNotificationStatus()
+        return when {
+            navStatus != null -> navStatus
+            running -> "正在执行：${activeTaskLabel.ifBlank { "任务" }.take(36)}"
+            AgentRuntime.speaker.isSpeaking -> "正在回答"
+            voiceState == VoiceInput.State.LISTENING -> "正在聆听"
+            voiceState == VoiceInput.State.RECOGNIZING -> "正在识别"
+            !wakeOn -> if (voiceState == VoiceInput.State.UNAVAILABLE) "语音入口不可用" else "语音待命已关闭"
+            voiceState == VoiceInput.State.ASLEEP -> "语音休眠中，说唤醒词可恢复"
+            voiceState == VoiceInput.State.IDLE || voiceState == VoiceInput.State.UNAVAILABLE -> "语音入口不可用"
+            else -> "正在待命，说「${AgentSettings.load().wakeWordList().firstOrNull() ?: "小派"}」唤醒"
+        }
+    }
+
+    /** 导航服务状态低频读取，距离按百米取整、ETA 按分钟取整，避免通知随定位抖动刷新。 */
+    private fun navigationNotificationStatus(): String? {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastNavNotificationPollAt < 1_500L) return cachedNavNotification
+        lastNavNotificationPollAt = now
+        cachedNavNotification = runCatching {
+            val state = org.json.JSONObject(com.pilot.agent.navigation.NavigationClient.stateJson())
+            val destination = state.optString("destination").trim()
+            when (state.optString("state")) {
+                "ROUTING" -> "正在规划路线${destination.takeIf { it.isNotBlank() }?.let { "：$it" }.orEmpty()}"
+                "NAVIGATING" -> {
+                    val distance = state.optInt("remainMeters", -1)
+                    val seconds = state.optInt("remainSeconds", -1)
+                    val maneuverMeters = state.optInt("nextManeuverMeters", -1)
+                    val maneuver = state.optString("nextInstruction").trim()
+                    val maneuverText = when {
+                        maneuverMeters < 0 || maneuver.isBlank() -> ""
+                        else -> " · ${maneuverMeters.coerceAtLeast(0)}米后${maneuver.take(20)}"
+                    }
+                    val etaText = if (seconds >= 0) " · 约${((seconds + 59) / 60).coerceAtLeast(1)}分钟到达" else ""
+                    val remainText = if (maneuverText.isBlank() && distance >= 0) " · 剩余约${((distance + 99) / 100) * 100}米" else ""
+                    "导航至${destination.ifBlank { "目的地" }}$maneuverText$remainText$etaText"
+                }
+                "ARRIVED" -> "已到达${destination.takeIf { it.isNotBlank() }?.let { "：$it" }.orEmpty()}"
+                "FAILED" -> "导航未完成，请查看 Pilot"
+                else -> null
+            }
+        }.getOrNull()
+        return cachedNavNotification
     }
 
     fun refreshStatus() {
@@ -456,14 +643,18 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         qrBitmap = null
         loginTip = "正在获取二维码…"
         loginJob = viewModelScope.launch {
-            val base = settings.musicBaseUrl
-            com.pilot.agent.Dbg.i("PilotMusic", "扫码登录：请求 key，base=$base")
-            val key = withContext(Dispatchers.IO) { com.pilot.agent.music.NeteaseApi.qrKey(base) }
-            if (key == null) {
-                loginTip = "拿不到二维码，检查音乐服务是否在运行"
+            val preferredBase = settings.musicBaseUrl
+            com.pilot.agent.Dbg.i("PilotMusic", "扫码登录：创建固定 API 会话，base=$preferredBase")
+            val session = withContext(Dispatchers.IO) {
+                com.pilot.agent.music.NeteaseApi.qrSession(preferredBase, settings.musicFallbackUrl)
+            }
+            if (session == null) {
+                loginTip = "连接不到音乐服务，请检查主/备用地址"
                 com.pilot.agent.Dbg.w("PilotMusic", "扫码登录：qrKey 为空")
                 return@launch
             }
+            val base = session.baseUrl
+            val key = session.key
             val img = withContext(Dispatchers.IO) { com.pilot.agent.music.NeteaseApi.qrImage(base, key) }
             if (img == null) {
                 loginTip = "二维码生成失败"
@@ -488,7 +679,8 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                             loginTip = "登录成功但没拿到 cookie"
                             return@launch
                         }
-                        AgentSettings.save(settings.copy(neteaseCookie = c))
+                        settings = settings.copy(neteaseCookie = c)
+                        AgentSettings.save(settings)
                         val nick = withContext(Dispatchers.IO) {
                             com.pilot.agent.music.NeteaseApi.loginStatus(base, c)
                         }
@@ -507,10 +699,10 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                     }
 
                     com.pilot.agent.music.NeteaseApi.QrState.WAITING_CONFIRM -> loginTip = "已扫描，请在手机上确认"
-                    com.pilot.agent.music.NeteaseApi.QrState.ERROR -> {
-                        loginTip = "登录失败"
-                        return@launch
-                    }
+                    com.pilot.agent.music.NeteaseApi.QrState.NETWORK_ERROR ->
+                        loginTip = "网络短暂中断，正在重试…"
+
+                    com.pilot.agent.music.NeteaseApi.QrState.ERROR -> loginTip = "等待服务响应…"
 
                     else -> Unit // WAITING_SCAN，继续等
                 }
@@ -534,7 +726,8 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 退出网易云登录 */
     fun logoutNetease() {
-        AgentSettings.save(settings.copy(neteaseCookie = ""))
+        settings = settings.copy(neteaseCookie = "")
+        AgentSettings.save(settings)
         neteaseNick = ""
         loginTip = ""
         add(LogEntry.Kind.OBSERVE, "已退出网易云登录")
@@ -545,14 +738,24 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     fun toggleWake() {
         ensureVoice()
         val v = voice ?: return
-        if (v.isWakeMode) {
+        if (v.isWakeEnabled) {
             v.stop()
             wakeOn = false
+            settings = AgentSettings.load().copy(wakeEnabled = false)
+            AgentSettings.save(settings)
+            com.pilot.agent.service.PilotForegroundService.stopForWake(getApplication())
+            lastNotificationStatus = null
             add(LogEntry.Kind.OBSERVE, "已退出待命")
         } else {
-            wakeOn = v.startWake()
+            val serviceStarted = com.pilot.agent.service.PilotForegroundService.startForWake(getApplication())
+            wakeOn = serviceStarted && v.startWake()
+            if (!wakeOn && serviceStarted) com.pilot.agent.service.PilotForegroundService.stopForWake(getApplication())
             if (wakeOn) {
+                settings = AgentSettings.load().copy(wakeEnabled = true)
+                AgentSettings.save(settings)
                 add(LogEntry.Kind.OBSERVE, "已进入待命，说「${settings.wakeWordList().first()}」唤醒")
+            } else if (!serviceStarted) {
+                add(LogEntry.Kind.ERROR, "语音待命未启动：请授予麦克风权限后重试")
             }
         }
         refreshStatus()
@@ -734,7 +937,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * 查询类：行情、天气这类要信息的需求。走 QueryEngine，不碰屏幕。
+     * 查询类：行情、天气、火车余票这类要信息的需求。走 QueryEngine，不碰屏幕。
      * 查不到就退回端侧模型答（哪怕答得不好，也比一声不吭强）。
      */
     private fun query(text: String) {
@@ -806,7 +1009,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                             "content",
                             "你是手机助手 Pilot，运行在这台安卓手机上。现在是 $now。" +
                                 "用一到两句话回答，简短口语化，不要用列表。" +
-                                "你能开关应用、查天气和股票、播音乐、跑 shell 命令、做导航。" +
+                                "你能开关应用、查天气、股票和火车余票、播音乐、跑 shell 命令、做导航。" +
                                 "下面是最近的对话，接住其中的指代和上下文。",
                         )
                     })
@@ -858,7 +1061,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         val noThink = if (llm.wantsNoThink) "/no_think" else ""
         return llm.generate(
             "system\n你是手机助手 Pilot，运行在这台安卓手机上，现在是 $now。" +
-                "能开关应用、查天气股票、播音乐、跑命令、做导航。" +
+                "能开关应用、查天气股票和火车余票、播音乐、跑命令、做导航。" +
                 "回答简短口语化，不超过 25 个字。$noThink\n" +
                 "user\n$text\nassistant\n"
         )
@@ -883,6 +1086,8 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         }
         add(LogEntry.Kind.USER, g)
         running = true
+        activeTaskLabel = g
+        publishNotificationStatus()
         justSent = true
         progress = 0 to settings.maxTurns
         AgentRuntime.loop?.start(AgentRuntime.scope, g)
@@ -911,11 +1116,66 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         musicPaused = mp.paused
     }
 
+    fun previousMusic() {
+        val mp = com.pilot.agent.music.MusicPlayer.get(getApplication())
+        mp.previous()
+        syncMusicState(mp)
+    }
+
+    fun nextMusic() {
+        val mp = com.pilot.agent.music.MusicPlayer.get(getApplication())
+        mp.next()
+        syncMusicState(mp)
+    }
+
+    fun playMusicAt(index: Int) {
+        val mp = com.pilot.agent.music.MusicPlayer.get(getApplication())
+        mp.playAt(index)
+        syncMusicState(mp)
+    }
+
+    fun toggleMusicShuffle() {
+        val mp = com.pilot.agent.music.MusicPlayer.get(getApplication())
+        mp.toggleShuffle()
+        syncMusicState(mp)
+    }
+
+    fun cycleMusicPlaybackMode() {
+        val mp = com.pilot.agent.music.MusicPlayer.get(getApplication())
+        mp.cyclePlaybackMode()
+        syncMusicState(mp)
+    }
+
+    private fun syncMusicState(mp: com.pilot.agent.music.MusicPlayer) {
+        nowPlaying = mp.nowPlaying()
+        musicPaused = mp.paused
+        musicArtist = mp.currentArtist()
+        musicLyric = mp.currentLyric().orEmpty()
+        musicLyricsReady = mp.lyricsReady()
+        musicPositionMs = mp.positionMs()
+        musicDurationMs = mp.durationMs()
+        musicTrackIndex = mp.currentIndex()
+        musicQueueSize = mp.queueSize()
+        musicQueue = mp.queueSnapshot()
+        musicShuffle = mp.shuffleEnabled
+        musicPlaybackMode = mp.playbackMode
+    }
+
     /** 音乐：停止 */
     fun stopMusic() {
         com.pilot.agent.music.MusicPlayer.get(getApplication()).stop()
         nowPlaying = null
         musicPaused = false
+        musicArtist = ""
+        musicLyric = ""
+        musicLyricsReady = false
+        musicPositionMs = 0L
+        musicDurationMs = 0L
+        musicTrackIndex = 0
+        musicQueueSize = 0
+        musicQueue = emptyList()
+        musicShuffle = false
+        musicPlaybackMode = com.pilot.agent.music.MusicPlayer.PlaybackMode.REPEAT_ALL
     }
 
     fun stopSpeaking() {
@@ -930,6 +1190,8 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             justSent = false
             did = true
         }
+        activeTaskLabel = ""
+        publishNotificationStatus()
         speaking = false
         add(LogEntry.Kind.OBSERVE, if (did) "已停止播报与任务" else "已停止")
         refreshStatus()
@@ -988,6 +1250,8 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 add(LogEntry.Kind.DONE, text)
                 running = false
                 justSent = false
+                activeTaskLabel = ""
+                publishNotificationStatus()
                 if (text.startsWith("最近的通知")) AgentRuntime.speaker.speakLocal(text)
                 else AgentRuntime.speaker.speak(text)
                 refreshStatus()
@@ -996,6 +1260,8 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 add(LogEntry.Kind.ERROR, ev.reason)
                 running = false
                 justSent = false
+                activeTaskLabel = ""
+                publishNotificationStatus()
                 confirm = null
             }
             is AgentEvent.Progress -> progress = ev.step to ev.maxSteps

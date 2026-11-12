@@ -524,38 +524,153 @@ class AgentLoop(
             }
 
             "music" -> {
-                // 一句话放歌：搜 → 逐个候选取播放地址 → 直接拉流，全程不开任何 App
-                val s = AgentSettings.load()
-                val songs = com.pilot.agent.music.NeteaseApi.search(s.musicBaseUrl, arg, 5, s.neteaseCookie)
-                if (songs.isEmpty()) {
-                    emit(AgentEvent.Observe("没搜到「$arg」，检查音乐服务或网络"))
-                    return false
-                }
-
-                // ★ 必须遍历候选。搜出来的第一首经常是翻唱/已下架，url 为 null，
-                //   只试第一首会误判成「没登录」或「版权限制」。
-                var picked: com.pilot.agent.music.NeteaseApi.Song? = null
-                var playUrl: String? = null
-                for (song in songs) {
-                    val u = com.pilot.agent.music.NeteaseApi.playUrl(
-                        s.musicBaseUrl, song.id, s.neteaseCookie
-                    )
-                    if (u != null) {
-                        picked = song
-                        playUrl = u
-                        break
-                    }
-                    Dbg.i(TAG, "候选不可播，换下一个：${song.display}")
-                }
-
-                if (picked == null || playUrl == null) {
-                    emit(AgentEvent.Observe("试了 ${songs.size} 首都没有可播地址，可能都没版权"))
-                    return false
-                }
                 val ctx = com.pilot.agent.PilotApp.instance
-                val started = com.pilot.agent.music.MusicPlayer.get(ctx).play(playUrl, picked.display)
-                if (started) emit(AgentEvent.Observe("正在播放 ${picked.display}"))
-                started
+                val s = AgentSettings.load()
+                val query = arg.replace("网易云音乐", "").replace("网易云", "").trim()
+
+                suspend fun startOnline(
+                    songs: List<com.pilot.agent.music.NeteaseApi.Song>,
+                    label: String,
+                ): Boolean {
+                    if (songs.isEmpty()) {
+                        emit(AgentEvent.Observe("${label}为空，检查登录、网络或音乐服务"))
+                        return false
+                    }
+                    com.pilot.agent.music.MusicHistoryStore.remember(songs)
+                    val tracks = songs.map { song ->
+                        com.pilot.agent.music.MusicPlayer.Track(
+                            title = song.name,
+                            artist = song.artist,
+                            resolver = {
+                                com.pilot.agent.music.NeteaseApi.playUrl(
+                                    s.musicBaseUrl, song.id, s.neteaseCookie,
+                                )?.let { com.pilot.agent.music.MusicPlayer.Source.Remote(it) }
+                            },
+                            lyricProvider = {
+                                com.pilot.agent.music.NeteaseApi.lyrics(
+                                    s.musicBaseUrl, song.id, s.neteaseCookie,
+                                )
+                            },
+                        )
+                    }
+                    val started = withContext(Dispatchers.Main.immediate) {
+                        com.pilot.agent.music.MusicPlayer.get(ctx).playQueue(tracks)
+                    }
+                    if (started) {
+                        emit(AgentEvent.Observe("正在播放${label}：${tracks.first().display}，共 ${tracks.size} 首"))
+                    }
+                    return started
+                }
+
+                when {
+                    query.contains("本地") -> {
+                        if (!com.pilot.agent.music.LocalMusicLibrary.hasPermission(ctx)) {
+                            emit(AgentEvent.Observe("播放本地音乐需要读取音频权限，请在系统应用中授权 Pilot"))
+                            return false
+                        }
+                        val songs = withContext(Dispatchers.IO) {
+                            com.pilot.agent.music.LocalMusicLibrary.list(ctx, 30)
+                        }
+                        if (songs.isEmpty()) {
+                            emit(AgentEvent.Observe("手机音乐库里没有找到本地歌曲"))
+                            return false
+                        }
+                        val tracks = songs.map { local ->
+                            com.pilot.agent.music.MusicPlayer.Track(
+                                title = local.title,
+                                artist = local.artist,
+                                source = com.pilot.agent.music.MusicPlayer.Source.Local(local.uri),
+                            )
+                        }
+                        val started = withContext(Dispatchers.Main.immediate) {
+                            com.pilot.agent.music.MusicPlayer.get(ctx).playQueue(tracks)
+                        }
+                        if (started) emit(AgentEvent.Observe("正在播放本地音乐：${tracks.first().display}，共 ${tracks.size} 首"))
+                        return started
+                    }
+
+                    query.contains("最近") -> {
+                        val remote = withContext(Dispatchers.IO) {
+                            com.pilot.agent.music.NeteaseApi.recentSongs(
+                                s.musicBaseUrl, s.neteaseCookie, 20,
+                            )
+                        }
+                        val songs = (remote + com.pilot.agent.music.MusicHistoryStore.recent(20))
+                            .distinctBy { it.id }
+                            .take(20)
+                        return startOnline(songs, "最近播放")
+                    }
+
+                    query.contains("每日推荐") || query == "推荐" -> {
+                        val songs = withContext(Dispatchers.IO) {
+                            com.pilot.agent.music.NeteaseApi.everydayRecommendations(
+                                s.musicBaseUrl, s.neteaseCookie, 20,
+                            )
+                        }
+                        return startOnline(songs, "每日推荐")
+                    }
+
+                    query.contains("我喜欢") || query.contains("收藏") -> {
+                        val songs = withContext(Dispatchers.IO) {
+                            com.pilot.agent.music.NeteaseApi.likedSongs(
+                                s.musicBaseUrl, s.neteaseCookie, 20,
+                            )
+                        }
+                        return startOnline(songs, "我喜欢的音乐")
+                    }
+
+                    query.contains("新歌") -> {
+                        val songs = withContext(Dispatchers.IO) {
+                            com.pilot.agent.music.NeteaseApi.chartSongs(
+                                s.musicBaseUrl, 3779629L, s.neteaseCookie, 20,
+                            )
+                        }
+                        return startOnline(songs, "网易云新歌榜")
+                    }
+
+                    query.contains("飙升") -> {
+                        val songs = withContext(Dispatchers.IO) {
+                            com.pilot.agent.music.NeteaseApi.chartSongs(
+                                s.musicBaseUrl, 19723756L, s.neteaseCookie, 20,
+                            )
+                        }
+                        return startOnline(songs, "网易云飙升榜")
+                    }
+
+                    query.isBlank() || query.contains("热门") || query.contains("热歌") -> {
+                        val songs = withContext(Dispatchers.IO) {
+                            com.pilot.agent.music.NeteaseApi.chartSongs(
+                                s.musicBaseUrl, 3778678L, s.neteaseCookie, 20,
+                            )
+                        }
+                        return startOnline(songs, "网易云热歌榜")
+                    }
+                }
+
+                // 普通关键词：本地优先，再从网易云搜索。
+                val local = withContext(Dispatchers.IO) {
+                    com.pilot.agent.music.LocalMusicLibrary.find(ctx, arg)
+                }
+                if (local != null) {
+                    val track = com.pilot.agent.music.MusicPlayer.Track(
+                        title = local.title,
+                        artist = local.artist,
+                        source = com.pilot.agent.music.MusicPlayer.Source.Local(local.uri),
+                    )
+                    val started = withContext(Dispatchers.Main.immediate) {
+                        com.pilot.agent.music.MusicPlayer.get(ctx).playQueue(listOf(track))
+                    }
+                    if (started) emit(AgentEvent.Observe("正在播放本地音乐 ${local.display}"))
+                    return started
+                }
+
+                val songs = withContext(Dispatchers.IO) {
+                    com.pilot.agent.music.NeteaseApi.search(
+                        s.musicBaseUrl, arg, 5, s.neteaseCookie,
+                    )
+                }
+                if (songs.isEmpty()) emit(AgentEvent.Observe("没搜到「$arg」，检查音乐服务或网络"))
+                startOnline(songs, "搜索「$arg」")
             }
 
             "terminal" -> {

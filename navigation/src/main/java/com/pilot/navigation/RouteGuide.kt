@@ -65,6 +65,7 @@ class RouteGuide(
 
     private var lastLat = 0.0
     private var lastLon = 0.0
+    @Volatile private var currentTravelled = 0.0
     private val simulationHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private var simulationRunnable: Runnable? = null
 
@@ -80,6 +81,7 @@ class RouteGuide(
         arrivedAnnounced = false
         lastLat = 0.0
         lastLon = 0.0
+        currentTravelled = 0.0
 
         val km = (r.totalDistance / 1000.0).toInt()
         val minutes = (r.totalDuration / 60.0).toInt().coerceAtLeast(1)
@@ -103,6 +105,7 @@ class RouteGuide(
         val progress = projectOntoRoute(lat, lon)
         if (progress == null) return
         val (stepIndex, travelled) = progress
+        currentTravelled = travelled
 
         // 到了最后一步之后 → 到达
         if (stepIndex >= r.steps.size) {
@@ -186,10 +189,11 @@ class RouteGuide(
         arrivedAnnounced = false
         lastLat = 0.0
         lastLon = 0.0
+        currentTravelled = 0.0
     }
 
     /** 当前进度（米），给 UI 显示用。 */
-    fun travelledMeters(): Double = lastAnnounceAt.coerceAtLeast(0.0)
+    fun travelledMeters(): Double = currentTravelled.coerceAtLeast(0.0)
 
     /** 当前在第几步（0 起），给 UI 显示用。 */
     fun currentStep(): Int = announcedStep.coerceAtLeast(0)
@@ -199,7 +203,18 @@ class RouteGuide(
         val r = route ?: return null
         if (points.isEmpty()) return null
         val total = cumDistance.lastOrNull() ?: return null
-        return (total - lastAnnounceAt.coerceAtLeast(0.0)).toInt().coerceAtLeast(0)
+        return (total - currentTravelled.coerceAtLeast(0.0)).toInt().coerceAtLeast(0)
+    }
+
+    /** 下一条路线指令及到该指令的距离，供锁屏导航摘要使用。 */
+    fun nextManeuver(): Pair<String, Int>? {
+        val r = route ?: return null
+        val index = announcedStep.coerceAtLeast(0)
+        val current = r.steps.getOrNull(index) ?: return null
+        val next = r.steps.getOrNull(index + 1) ?: return null
+        val travelledInStep = (currentTravelled - stepStartDistance(index)).coerceAtLeast(0.0)
+        val distance = (current.distance - travelledInStep).toInt().coerceAtLeast(0)
+        return speakable(next.instruction) to distance
     }
 
     /** 剩余时间（秒）：按路线平均速度折算。 */

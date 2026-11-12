@@ -129,6 +129,9 @@ class VoiceInput(
 
     val isWakeMode: Boolean get() = mode == Mode.WAKE
 
+    /** Wake listening remains enabled while a just-woken conversation is active. */
+    val isWakeEnabled: Boolean get() = resumeToWake && mode != Mode.OFF
+
     fun warmUp() {
         if (!asr.abiSupported()) return
         worker.execute { asr.ensureReady() }
@@ -228,6 +231,10 @@ class VoiceInput(
     fun stop() {
         main.removeCallbacks(sleepTick)
         activeUntil = 0L
+        // A recognition worker may still be finishing. Do not let its finally block
+        // restore WAKE after the user explicitly stopped standby.
+        resumeToWake = false
+        dndRequested = false
         mode = Mode.OFF
         vad?.flush()
         vad = null

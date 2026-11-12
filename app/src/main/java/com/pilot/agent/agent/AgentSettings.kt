@@ -68,6 +68,8 @@ data class AgentSettings(
     val interruptWords: String = "停一下,停下来,不说了,别说了,安静",
     // ---------- 音乐（自建网易云 API 代理） ----------
     val musicBaseUrl: String = DEFAULT_MUSIC_URL,
+    /** 备用地址；Wi‑Fi 下优先走局域网，移动网络下优先走 Tailnet。空值关闭回退。 */
+    val musicFallbackUrl: String = DEFAULT_MUSIC_FALLBACK_URL,
     /** 扫码登录后拿到的 cookie，存本地不落服务器 */
     val neteaseCookie: String = "",
 ) {
@@ -103,7 +105,8 @@ data class AgentSettings(
         const val DEFAULT_WAKE_WORDS = "小派,小派小派,你好小派"
 
         /** 自建 NeteaseCloudMusicApi 地址（部署在 buntu:3001） */
-        const val DEFAULT_MUSIC_URL = "http://192.168.2.102:3001"
+        const val DEFAULT_MUSIC_URL = "http://100.95.180.77:3001"
+        const val DEFAULT_MUSIC_FALLBACK_URL = "http://192.168.2.102:3001"
 
         private const val K_URL = "base_url"
         private const val K_KEY = "api_key"
@@ -132,6 +135,7 @@ data class AgentSettings(
         private const val K_INTERRUPT_WORDS = "interrupt_words"
         private const val K_VOICE_MIGRATED = "voice_auto_v2"
         private const val K_MUSIC_URL = "music_base_url"
+        private const val K_MUSIC_FALLBACK_URL = "music_fallback_url"
         private const val K_NETEASE_COOKIE = "netease_cookie"
 
         /**
@@ -179,7 +183,11 @@ data class AgentSettings(
                 interruptEnabled = p.getBoolean(K_INTERRUPT, true),
                 interruptWords = p.getString(K_INTERRUPT_WORDS, null)
                     ?: "停一下,停下来,不说了,别说了,安静",
-                musicBaseUrl = p.getString(K_MUSIC_URL, null) ?: DEFAULT_MUSIC_URL,
+                musicBaseUrl = p.getString(K_MUSIC_URL, null)
+                    ?.takeUnless { it.trimEnd('/') == "http://192.168.2.102:3001" }
+                    ?: DEFAULT_MUSIC_URL,
+                musicFallbackUrl = p.getString(K_MUSIC_FALLBACK_URL, null)
+                    ?: DEFAULT_MUSIC_FALLBACK_URL,
                 neteaseCookie = p.getString(K_NETEASE_COOKIE, null) ?: "",
             )
         }
@@ -211,6 +219,7 @@ data class AgentSettings(
                 .putBoolean(K_INTERRUPT, s.interruptEnabled)
                 .putString(K_INTERRUPT_WORDS, s.interruptWords)
                 .putString(K_MUSIC_URL, s.musicBaseUrl)
+                .putString(K_MUSIC_FALLBACK_URL, s.musicFallbackUrl)
                 .putString(K_NETEASE_COOKIE, s.neteaseCookie)
                 .apply()
             runCatching { SecretVault.put(K_WEB_SEARCH_KEY, s.webSearchApiKey) }

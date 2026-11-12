@@ -1,5 +1,7 @@
 package com.pilot.agent.agent
 
+import com.pilot.agent.query.QueryEngine
+
 /**
  * 意图门：判断一句话是「操作指令」还是「闲聊/提问」。
  *
@@ -59,6 +61,7 @@ object IntentGate {
         "查一下", "查查", "查询", "搜一下", "看看", "多少", "几号", "几点",
         "怎么样", "怎么走", "是什么", "是谁", "为什么", "行情", "股价", "指数",
         "涨了", "跌了", "天气", "新闻", "快递", "汇率", "油价", "限行",
+        "12306", "火车票", "高铁票", "动车票", "余票", "车次", "列车",
         "财经", "娱乐", "明星", "影视", "ai动态", "大模型", "人工智能",
         "科技动态", "最新消息", "最新动态", "头条", "热点", "读通知", "最新通知",
         "通知摘要", "有什么通知", "读一下消息通知",
@@ -142,6 +145,8 @@ object IntentGate {
         val t = text.trim()
         if (t.isEmpty()) return Kind.CHAT
 
+        if (QueryEngine.looksLikePendingReply(t)) return Kind.QUERY
+
         val startsWithChat = CHAT_PREFIX.any { t.startsWith(it) }
         val hasVerb = TASK_VERBS.any { t.contains(it) }
         val hasQuery = QUERY_HINTS.any { t.contains(it) }
@@ -154,6 +159,7 @@ object IntentGate {
         // 在问自己 → 交流（模型回答）。放最前面，避免「是谁」这种
         // 泛化查询词把它误判成数据查询。
         if (selfAsk) return Kind.CHAT
+        if (looksLikeTrainQuery(t)) return Kind.QUERY
         if (LIVE_INFO_HINTS.any(t::contains) && DEVICE_ACTION_HINTS.none(t::contains)) return Kind.QUERY
         if (t.contains("https://", ignoreCase = true) && listOf("网页", "链接", "文章", "总结", "阅读", "读一下", "浏览").any(t::contains)) return Kind.QUERY
         if (WEB_SEARCH_HINTS.any(t::contains) && DEVICE_ACTION_HINTS.none(t::contains)) return Kind.QUERY
@@ -165,6 +171,22 @@ object IntentGate {
         if (hasQuery) return Kind.QUERY
         return Kind.CHAT
     }
+
+    private fun looksLikeTrainQuery(text: String): Boolean {
+        if (listOf("导航", "路线", "带我去", "打开", "关闭", "播放", "暂停").any(text::contains)) {
+            return false
+        }
+        val trainHint = listOf(
+            "12306", "火车票", "高铁票", "动车票", "余票", "车次", "列车",
+            "铁路票",
+        ).any(text::contains)
+        val routeAndTrain = ROUTE_AND_TRAIN_MARKERS.any(text::contains) &&
+            listOf("高铁", "动车", "城际", "火车", "车票", "余票", "车次")
+                .any(text::contains)
+        return trainHint || routeAndTrain
+    }
+
+    private val ROUTE_AND_TRAIN_MARKERS = listOf("到", "至", "去", "从")
 
     /** 给用户看的解释 */
     fun reason(text: String): String = when {

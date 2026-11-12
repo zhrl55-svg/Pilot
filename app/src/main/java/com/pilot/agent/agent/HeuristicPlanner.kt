@@ -221,9 +221,10 @@ class HeuristicPlanner(
             }
         }
         // 播放音乐：走自建网易云 API，直接拉流播放，不打开任何 App
-        if (goal.contains("播放") || goal.contains("放首") || goal.contains("来首")) {
+        if (goal.contains("播放") || goal.contains("放首") || goal.contains("来首") ||
+            goal.contains("放歌") || goal.contains("听歌")) {
             val raw = goal
-                .replace(Regex("^(帮我|给我|请)?(播放|放首|放一下|来首|来一首)"), "")
+                .replace(Regex("^(帮我|给我|请)?(播放|放首|放一下|来首|来一首|放歌|听歌)"), "")
                 .replace(Regex("(这首歌|的歌|歌曲|音乐|吧|呗)$"), "")
                 .trim()
             // 纯"播放歌曲"这种没有具体歌名，用"热门"兜底
