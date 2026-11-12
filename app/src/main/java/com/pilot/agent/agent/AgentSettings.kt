@@ -9,7 +9,10 @@ data class AgentSettings(
     val apiKey: String = "",
     val webSearchApiKey: String = "",
     val model: String = DEFAULT_MODEL,
-    val maxTurns: Int = 25,
+    val mode: AssistantMode = AssistantMode.ASSISTANT,
+    val maxTurns: Int = DEFAULT_MAX_TURNS,
+    /** Agent 云端模型的思考强度：low / medium / high / xhigh / max。 */
+    val reasoningEffort: String = DEFAULT_REASONING_EFFORT,
     val preferOnDevice: Boolean = true,
     val enableLocalModel: Boolean = true,
     @Deprecated("高风险确认现在始终强制开启")
@@ -92,6 +95,11 @@ data class AgentSettings(
     companion object {
         const val DEFAULT_BASE_URL = "https://api.minimax.cn/v1"
         const val DEFAULT_MODEL = "minimax-m3.1-flash"
+        const val MIN_AGENT_TURNS = 15
+        const val MAX_AGENT_TURNS = 25
+        const val DEFAULT_MAX_TURNS = 20
+        const val DEFAULT_REASONING_EFFORT = "medium"
+        val REASONING_EFFORTS = listOf("low", "medium", "high", "xhigh", "max")
 
         const val TTS_SYSTEM = "system"
         const val TTS_MINIMAX = "minimax"
@@ -112,7 +120,9 @@ data class AgentSettings(
         private const val K_KEY = "api_key"
         private const val K_WEB_SEARCH_KEY = "brave_search_api_key"
         private const val K_MODEL = "model"
+        private const val K_MODE = "assistant_mode"
         private const val K_TURNS = "max_turns"
+        private const val K_REASONING_EFFORT = "agent_reasoning_effort"
         private const val K_ONDEVICE = "prefer_ondevice"
         private const val K_LOCAL_MODEL = "enable_local_model"
         private const val K_CONFIRM = "confirm_money"
@@ -161,7 +171,12 @@ data class AgentSettings(
                 apiKey = p.getString(K_KEY, null) ?: "",
                 webSearchApiKey = SecretVault.get(K_WEB_SEARCH_KEY),
                 model = p.getString(K_MODEL, null) ?: DEFAULT_MODEL,
-                maxTurns = p.getInt(K_TURNS, 25),
+                mode = AssistantMode.fromStorage(p.getString(K_MODE, null)),
+                maxTurns = p.getInt(K_TURNS, DEFAULT_MAX_TURNS)
+                    .coerceIn(MIN_AGENT_TURNS, MAX_AGENT_TURNS),
+                reasoningEffort = p.getString(K_REASONING_EFFORT, null)
+                    ?.takeIf { it in REASONING_EFFORTS }
+                    ?: DEFAULT_REASONING_EFFORT,
                 preferOnDevice = p.getBoolean(K_ONDEVICE, true),
                 enableLocalModel = p.getBoolean(K_LOCAL_MODEL, true),
                 confirmMoneyActions = p.getBoolean(K_CONFIRM, true),
@@ -197,7 +212,13 @@ data class AgentSettings(
                 .putString(K_URL, s.baseUrl)
                 .putString(K_KEY, s.apiKey)
                 .putString(K_MODEL, s.model)
-                .putInt(K_TURNS, s.maxTurns)
+                .putString(K_MODE, s.mode.storageValue)
+                .putInt(K_TURNS, s.maxTurns.coerceIn(MIN_AGENT_TURNS, MAX_AGENT_TURNS))
+                .putString(
+                    K_REASONING_EFFORT,
+                    s.reasoningEffort.takeIf { it in REASONING_EFFORTS }
+                        ?: DEFAULT_REASONING_EFFORT,
+                )
                 .putBoolean(K_ONDEVICE, s.preferOnDevice)
                 .putBoolean(K_LOCAL_MODEL, s.enableLocalModel)
                 .putBoolean(K_CONFIRM, s.confirmMoneyActions)

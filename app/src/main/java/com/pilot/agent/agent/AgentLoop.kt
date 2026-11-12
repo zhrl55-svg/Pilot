@@ -2,6 +2,9 @@ package com.pilot.agent.agent
 
 import com.pilot.agent.Dbg
 import com.pilot.agent.action.DeviceActions
+import com.pilot.agent.browser.BrowserSessionManager
+import com.pilot.agent.extension.UserScript
+import com.pilot.agent.extension.UserScriptStep
 import com.pilot.agent.perception.ScreenReader
 import com.pilot.agent.perception.ScreenSnapshot
 import java.util.concurrent.ConcurrentHashMap
@@ -21,6 +24,12 @@ private const val TAG = "Pilot"
 
 /** 会自己跳的文本：时钟、倒计时、电量百分比。判界面变化时要忽略它们。 */
 private val clockLike = Regex("""^(\d{1,2}[:：]\d{2}([:：]\d{2})?|\d{1,3}%|\d{1,2}/\d{1,2})$""")
+
+private val agentOnlyActions = setOf(
+    "browser_open", "browser_read", "browser_click", "browser_type",
+    "browser_scroll", "browser_back", "browser_close",
+    "mcp_list", "mcp_tools", "mcp_call", "script_list", "script_run",
+)
 
 /**
  * Agent 主循环：观察 → 决策 → 护栏 → 执行 → 记录 → 再观察。
@@ -59,13 +68,22 @@ class AgentLoop(
     @Volatile
     private var lastSystemMessage: String? = null
 
+    /** Result text from browser/MCP so the next planner turn can use it. */
+    @Volatile
+    private var lastActionResult: String? = null
+
     val isRunning: Boolean get() = job?.isActive == true
 
     /**
      * @param ui 是否有界面在等结果。后台触发（语音、广播）时传 false——
      *           没人能点确认按钮，遇到确认请求应该立刻放弃，而不是干等 3 分钟把队列堵死。
      */
-    fun start(scope: CoroutineScope, goal: String, ui: Boolean = true) {
+    fun start(
+        scope: CoroutineScope,
+        goal: String,
+        ui: Boolean = true,
+        executionMode: AssistantMode? = null,
+    ) {
         if (goal.isBlank()) return
         // 新任务顶掉旧任务：旧任务可能正卡在等用户确认，不顶掉的话后面所有请求都会被 isRunning 挡回去
         if (isRunning) {
@@ -77,7 +95,7 @@ class AgentLoop(
         // 循环里的 job?.isActive 读到的是上一轮的旧 Job，直接判定"已取消"静默退出。
         val newJob = scope.launch(start = CoroutineStart.LAZY) {
             try {
-                run(goal.trim())
+                run(goal.trim(), executionMode)
             } catch (t: Throwable) {
                 if (t is kotlinx.coroutines.CancellationException) throw t
                 Dbg.e(TAG, "run failed: ${t.message}", t)
@@ -99,9 +117,15 @@ class AgentLoop(
         pendingConfirms.remove(requestId)?.complete(approved)
     }
 
-    private suspend fun run(goal: String) {
-        val settings = settingsProvider()
-        Dbg.i(TAG, "run start goalChars=${goal.length} maxTurns=${settings.maxTurns} cloudReady=${settings.cloudReady}")
+    private suspend fun run(goal: String, executionMode: AssistantMode?) {
+        val configured = settingsProvider()
+        val settings = if (executionMode != null) configured.copy(mode = executionMode) else configured
+        Dbg.i(
+            TAG,
+            "run start goalChars=${goal.length} mode=${settings.mode.storageValue} " +
+                "maxTurns=${settings.maxTurns} reasoning=${settings.reasoningEffort} " +
+                "cloudReady=${settings.cloudReady}",
+        )
 
         // 记下任务开始前用户在看什么，结束时要切回去。
         // 这是「任务栈隔离」的轻量版：纯 App 层建不了可交互虚拟屏（需要 CAPTURE_VIDEO_OUTPUT），
@@ -159,17 +183,37 @@ class AgentLoop(
             return
         }
 
+        // User scripts are explicit local extensions. Their narrow DSL can only
+        // call the browser and MCP layers, never arbitrary JavaScript or shell.
+        if (settings.mode == AssistantMode.AGENT) {
+            com.pilot.agent.runtime.AgentRuntime.userScripts.match(goal)?.let { script ->
+                val completed = runUserScript(script)
+                if (completed) {
+                    emit(AgentEvent.Finished("已运行用户脚本「${script.name}」"))
+                    return
+                }
+                emit(AgentEvent.Observe("用户脚本「${script.name}」未完成，已回到 Agent 重新规划"))
+            }
+        }
+
         // 意图分流：操作 → 进循环；查询 → 直接出答案；闲聊 → 不碰屏幕
         when (IntentGate.classify(goal)) {
             IntentGate.Kind.QUERY -> {
-                val answer = com.pilot.agent.query.QueryEngine.handle(goal)
-                if (answer != null) {
-                    Dbg.i(TAG, "查询完成：${answer.take(60)}")
-                    emit(AgentEvent.Finished(answer))
-                } else {
-                    emit(AgentEvent.Finished("没查到「$goal」的结果"))
+                val explicitAgentExtension =
+                    com.pilot.agent.runtime.AgentRuntime.localTools.prefersAgentExtension(goal)
+                if (!explicitAgentExtension) {
+                    val answer = com.pilot.agent.query.QueryEngine.handle(goal)
+                    if (answer != null) {
+                        Dbg.i(TAG, "查询完成：${answer.take(60)}")
+                        emit(AgentEvent.Finished(answer))
+                        return
+                    }
                 }
-                return
+                if (settings.mode != AssistantMode.AGENT) {
+                    emit(AgentEvent.Finished("没查到「$goal」的结果"))
+                    return
+                }
+                emit(AgentEvent.Observe("内置查询没有结果，Agent 将使用浏览器或 MCP 继续查找"))
             }
 
             IntentGate.Kind.CHAT -> {
@@ -253,7 +297,11 @@ class AgentLoop(
 
             emit(AgentEvent.Thinking("[$plannerId] ${decision.thought}"))
             val action = decision.action
-            Dbg.i(TAG, "step=$step/${settings.maxTurns} planner=$plannerId action=${action.describe()} thought=${decision.thought}")
+            Dbg.i(
+                TAG,
+                "step=$step/${settings.maxTurns} planner=$plannerId " +
+                    "actionId=${action.action} action=${action.describe()} thought=${decision.thought}",
+            )
 
             when (action.action) {
                 "done" -> {
@@ -287,6 +335,11 @@ class AgentLoop(
                     emit(AgentEvent.Failed("这个请求当前无法处理：${action.summary}"))
                     return
                 }
+            }
+
+            if (settings.mode != AssistantMode.AGENT && action.action in agentOnlyActions) {
+                emit(AgentEvent.Finished("浏览器会话、MCP 和用户脚本需要切换到 Agent 模式"))
+                return
             }
 
             // ★ 未知动作名：执行层只会默默返回 false，不拦的话会一路"失败"到 maxTurns。
@@ -353,10 +406,15 @@ class AgentLoop(
             if (countsAsProgress) {
                 if (invalidStreak > 0) Dbg.i(TAG, "step=$step 界面有变化，无效动作计数清零")
                 invalidStreak = 0
-                history += "${action.describe()} -> ${if (ok) "ok" else "fail"}"
+                appendHistory(history, action, ok)
             } else {
                 invalidStreak++
-                history += "${action.describe()} -> 执行成功但界面没有变化（无效动作），换一种方式"
+                appendHistory(
+                    history,
+                    action,
+                    ok,
+                    suffix = "界面没有变化（无效动作），换一种方式",
+                )
                 Dbg.w(
                     TAG,
                     "step=$step 无效动作 streak=$invalidStreak action=${action.action} pkg=${snap.pkg} nodes=${snap.nodes.size}",
@@ -394,7 +452,100 @@ class AgentLoop(
         emit(AgentEvent.Failed("超过 ${settings.maxTurns} 步仍未完成，已停在当前界面。"))
     }
 
+    private fun appendHistory(
+        history: MutableList<String>,
+        action: AgentAction,
+        ok: Boolean,
+        suffix: String? = null,
+    ) {
+        val builder = StringBuilder(action.describe())
+            .append(" -> ")
+            .append(if (ok) "ok" else "fail")
+        if (!suffix.isNullOrBlank()) builder.append("：").append(suffix)
+        lastActionResult?.takeIf { it.isNotBlank() }?.let {
+            builder.append("\n工具结果：").append(it.take(16_000))
+        }
+        history += builder.toString()
+    }
+
+    private fun mcpMessage(label: String, result: com.pilot.agent.extension.McpExecution): String {
+        val body = result.output.ifBlank { "(无输出)" }.take(10_000)
+        return buildString {
+            append(label)
+            append(if (result.ok) "：\n" else "失败（exit=${result.exitCode}）：\n")
+            append(body)
+            append("\n耗时 ").append(result.durationMs).append("ms")
+        }
+    }
+
+    private suspend fun runUserScript(script: UserScript): Boolean {
+        if (script.hasSideEffects) {
+            val approved = askUser(
+                "运行用户脚本「${script.name}」？其中点击网页、填写内容或调用 MCP 可能改变外部状态。",
+                Risk.EXTERNAL,
+            )
+            if (!approved) {
+                emit(AgentEvent.Observe("已取消用户脚本「${script.name}」"))
+                return false
+            }
+        }
+        emit(AgentEvent.Observe("运行用户脚本「${script.name}」，共 ${script.steps.size} 步"))
+        for ((index, step) in script.steps.withIndex()) {
+            val action = scriptStepToAction(step)
+            if (action == null) {
+                lastActionResult = "用户脚本第 ${index + 1} 步不受支持"
+                emit(AgentEvent.Observe(lastActionResult.orEmpty()))
+                return false
+            }
+            emit(AgentEvent.Acting("脚本 ${index + 1}/${script.steps.size}：${action.describe()}"))
+            val ok = execute(action)
+            if (!ok) {
+                emit(
+                    AgentEvent.Observe(
+                        "用户脚本第 ${index + 1} 步失败" +
+                            lastActionResult?.takeIf { it.isNotBlank() }?.let { "：$it" }.orEmpty(),
+                    ),
+                )
+                return false
+            }
+            delay(180)
+        }
+        return true
+    }
+
+    private fun scriptStepToAction(step: UserScriptStep): AgentAction? = when (step.action) {
+        "browser_open" -> AgentAction(
+            action = "browser_open",
+            url = step.url.ifBlank { step.target },
+        )
+        "browser_read" -> AgentAction(action = "browser_read", maxChars = step.max)
+        "browser_click" -> AgentAction(
+            action = "browser_click",
+            target = step.target.ifBlank { step.text },
+        )
+        "browser_type" -> AgentAction(
+            action = "browser_type",
+            target = step.target,
+            text = step.text,
+        )
+        "browser_scroll" -> AgentAction(
+            action = "browser_scroll",
+            target = step.target.ifBlank { "forward" },
+        )
+        "browser_back" -> AgentAction(action = "browser_back")
+        "mcp_list" -> AgentAction(action = "mcp_list")
+        "mcp_tools" -> AgentAction(action = "mcp_tools", server = step.server)
+        "mcp_call" -> AgentAction(
+            action = "mcp_call",
+            server = step.server,
+            tool = step.tool,
+            arguments = step.arguments.ifBlank { "{}" },
+        )
+        else -> null
+    }
+
     private suspend fun execute(a: AgentAction): Boolean {
+        lastActionResult = null
         val x = a.x
         val y = a.y
         val x2 = a.x2
@@ -432,6 +583,88 @@ class AgentLoop(
                     ) ?: return false
                     emit(AgentEvent.Observe(result))
                     true
+                }
+                "browser_open", "browser_read", "browser_click", "browser_type",
+                "browser_scroll", "browser_back", "browser_close" -> {
+                    val result = BrowserSessionManager.execute(
+                        context = com.pilot.agent.PilotApp.instance,
+                        action = a.action,
+                        target = a.url ?: a.target,
+                        text = a.text,
+                        maxChars = a.maxChars,
+                    )
+                    lastActionResult = buildString {
+                        append(result.message)
+                        if (result.title.isNotBlank()) append("\n标题：").append(result.title)
+                        if (result.url.isNotBlank()) append("\n网址：").append(result.url)
+                        if (result.text.isNotBlank()) append("\n正文：").append(result.text.take(16_000))
+                    }
+                    emit(AgentEvent.Observe(lastActionResult.orEmpty()))
+                    result.ok
+                }
+                "mcp_list" -> {
+                    val result = com.pilot.agent.runtime.AgentRuntime.mcp.listServers()
+                    lastActionResult = mcpMessage("MCP 服务器", result)
+                    emit(AgentEvent.Observe(lastActionResult.orEmpty()))
+                    result.ok
+                }
+                "mcp_tools" -> {
+                    val server = a.server ?: target ?: run {
+                        lastActionResult = "缺少 MCP server"
+                        emit(AgentEvent.Observe(lastActionResult.orEmpty()))
+                        return false
+                    }
+                    val result = com.pilot.agent.runtime.AgentRuntime.mcp.listTools(server)
+                    lastActionResult = mcpMessage("MCP「$server」工具", result)
+                    emit(AgentEvent.Observe(lastActionResult.orEmpty()))
+                    result.ok
+                }
+                "mcp_call" -> {
+                    val server = a.server ?: run {
+                        lastActionResult = "缺少 MCP server"
+                        emit(AgentEvent.Observe(lastActionResult.orEmpty()))
+                        return false
+                    }
+                    val tool = a.tool ?: run {
+                        lastActionResult = "缺少 MCP tool"
+                        emit(AgentEvent.Observe(lastActionResult.orEmpty()))
+                        return false
+                    }
+                    val result = com.pilot.agent.runtime.AgentRuntime.mcp.call(
+                        server,
+                        tool,
+                        a.arguments ?: "{}",
+                    )
+                    lastActionResult = mcpMessage("MCP $server/$tool", result)
+                    emit(AgentEvent.Observe(lastActionResult.orEmpty()))
+                    result.ok
+                }
+                "script_list" -> {
+                    val scripts = com.pilot.agent.runtime.AgentRuntime.userScripts.all()
+                    lastActionResult = if (scripts.isEmpty()) {
+                        "还没有安装用户脚本。"
+                    } else {
+                        scripts.joinToString("\n") { script ->
+                            "${script.id} · ${script.name} · ${script.triggers.joinToString(" / ")}"
+                        }
+                    }
+                    emit(AgentEvent.Observe(lastActionResult.orEmpty()))
+                    true
+                }
+                "script_run" -> {
+                    val query = target.orEmpty().ifBlank { text.orEmpty() }
+                    val script = com.pilot.agent.runtime.AgentRuntime.userScripts.all()
+                        .firstOrNull {
+                            it.id.equals(query, ignoreCase = true) ||
+                                it.name.equals(query, ignoreCase = true)
+                        }
+                    if (script == null) {
+                        lastActionResult = "没有找到用户脚本「$query」"
+                        emit(AgentEvent.Observe(lastActionResult.orEmpty()))
+                        false
+                    } else {
+                        runUserScript(script)
+                    }
                 }
                 else -> false
             }

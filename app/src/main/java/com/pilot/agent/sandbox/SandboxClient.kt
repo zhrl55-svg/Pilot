@@ -7,9 +7,9 @@ import android.content.ServiceConnection
 import android.os.Bundle
 import android.os.IBinder
 import com.pilot.agent.Dbg
+import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
-import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.resume
 
 /**
@@ -31,15 +31,29 @@ object SandboxClient {
     /** Application context（bind/unbind 必须用它，Receiver 的 context 不行）。 */
     @Volatile private var appContext: Context? = null
 
-    private val pending = ConcurrentHashMap<Long, kotlinx.coroutines.CancellableContinuation<SandboxTerminal.Result>>()
+    private data class CompletedResult(
+        val result: SandboxTerminal.Result,
+        val completedAt: Long,
+    )
+
+    /**
+     * `startCommand()` 是异步 AIDL 调用：服务可能在它返回 jobId 之前就已经
+     * 执行完并回调。旧实现只在拿到 jobId 后才登记 continuation，快速失败的
+     * 命令（例如 exit 127）会丢掉回调，界面一直停在“执行中”。
+     *
+     * pending 和 completed 必须在同一把锁下迁移：回调先到时暂存结果，等待方
+     * 登记时立即取走；等待方先登记时，回调直接唤醒。
+     */
+    private val resultLock = Any()
+    private val pending = mutableMapOf<Long, CancellableContinuation<SandboxTerminal.Result>>()
+    private val completed = mutableMapOf<Long, CompletedResult>()
 
     private val callback = object : ResultCallback.Stub() {
         override fun onResult(jobId: Long, data: Bundle?) {
-            val cont = pending.remove(jobId) ?: return
             val out = data?.getString("out").orEmpty()
             val exit = data?.getInt("exit") ?: -1
             val ms = data?.getLong("ms") ?: 0L
-            runCatching { cont.resume(SandboxTerminal.Result(out, exit, ms)) }
+            deliver(jobId, SandboxTerminal.Result(out, exit, ms))
         }
     }
 
@@ -59,11 +73,7 @@ object SandboxClient {
             service = null
             binding = false
             // 服务进程死了：所有在途 job 立即失败（让上层降级）
-            pending.keys.toList().forEach { id ->
-                pending.remove(id)?.let { c ->
-                    runCatching { c.resume(SandboxTerminal.Result("沙箱进程崩溃", -3, 0)) }
-                }
-            }
+            failPending("沙箱进程崩溃")
             Dbg.w(TAG, ":sandbox 进程断开（guest 崩溃或系统回收）")
         }
     }
@@ -83,11 +93,7 @@ object SandboxClient {
         if (ctx != null) runCatching { ctx.unbindService(connection) }
         service = null
         binding = false
-        pending.keys.toList().forEach { id ->
-            pending.remove(id)?.let { c ->
-                runCatching { c.resume(SandboxTerminal.Result("沙箱已回收", -3, 0)) }
-            }
-        }
+        failPending("沙箱已回收")
         Dbg.i(TAG, "已解除 :sandbox 绑定（空闲回收）")
     }
 
@@ -111,10 +117,7 @@ object SandboxClient {
         return try {
             val jobId = svc.startCommand(SandboxTerminal.SESSION, command, timeoutMs)
             val result = withTimeoutOrNull(timeoutMs + 15_000) {
-                suspendCancellableCoroutine { cont ->
-                    pending[jobId] = cont
-                    cont.invokeOnCancellation { pending.remove(jobId) }
-                }
+                awaitResult(jobId)
             }
             deadCount = 0
             if (result == null) {
@@ -126,6 +129,55 @@ object SandboxClient {
             service = null
             Dbg.w(TAG, "远端调用异常(${t.javaClass.simpleName})，降级进程内: ${t.message}")
             null
+        }
+    }
+
+    private suspend fun awaitResult(jobId: Long): SandboxTerminal.Result =
+        suspendCancellableCoroutine { cont ->
+            val early = synchronized(resultLock) {
+                completed.remove(jobId)?.result.also { result ->
+                    if (result == null) pending[jobId] = cont
+                }
+            }
+            if (early != null) {
+                cont.resume(early)
+            } else {
+                cont.invokeOnCancellation {
+                    synchronized(resultLock) { pending.remove(jobId) }
+                }
+            }
+        }
+
+    private fun deliver(jobId: Long, result: SandboxTerminal.Result) {
+        val cont = synchronized(resultLock) {
+            val waiting = pending.remove(jobId)
+            if (waiting == null) {
+                completed[jobId] = CompletedResult(result, System.currentTimeMillis())
+                pruneCompletedLocked()
+            }
+            waiting
+        }
+        if (cont != null) runCatching { cont.resume(result) }
+    }
+
+    private fun failPending(message: String) {
+        val waiting = synchronized(resultLock) {
+            val snapshot = pending.values.toList()
+            pending.clear()
+            completed.clear()
+            snapshot
+        }
+        waiting.forEach { cont ->
+            runCatching { cont.resume(SandboxTerminal.Result(message, -3, 0)) }
+        }
+    }
+
+    private fun pruneCompletedLocked() {
+        val cutoff = System.currentTimeMillis() - COMPLETED_RESULT_TTL_MS
+        completed.entries.removeAll { it.value.completedAt < cutoff }
+        while (completed.size > COMPLETED_RESULT_LIMIT) {
+            val oldest = completed.minByOrNull { it.value.completedAt } ?: break
+            completed.remove(oldest.key)
         }
     }
 
@@ -161,4 +213,7 @@ object SandboxClient {
 
     /** 供设置页/自检展示：当前走的远端还是本地。 */
     fun mode(): String = if (service != null) "remote(:sandbox)" else "local"
+
+    private const val COMPLETED_RESULT_LIMIT = 64
+    private const val COMPLETED_RESULT_TTL_MS = 5 * 60_000L
 }

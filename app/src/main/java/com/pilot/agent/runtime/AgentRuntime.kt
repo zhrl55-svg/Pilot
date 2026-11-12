@@ -14,6 +14,8 @@ import com.pilot.agent.agent.HeuristicPlanner
 import com.pilot.agent.agent.LocalPlanner
 import com.pilot.agent.agent.PlannerRouter
 import com.pilot.agent.agent.SkillStore
+import com.pilot.agent.extension.McpClient
+import com.pilot.agent.extension.UserScriptStore
 import com.pilot.agent.perception.ScreenReader
 import com.pilot.agent.perception.ScreenSnapshot
 import com.pilot.agent.service.AgentAccessibilityService
@@ -55,6 +57,10 @@ object AgentRuntime {
         private set
 
     val skills: SkillStore by lazy { SkillStore(File(PilotApp.instance.filesDir, "skills")) }
+    val userScripts: UserScriptStore by lazy {
+        UserScriptStore(File(PilotApp.instance.filesDir, "minis-global/skills"))
+    }
+    val mcp: McpClient by lazy { McpClient(PilotApp.instance) }
     val guard: Guard by lazy { Guard(PilotApp.instance) }
 
     /**

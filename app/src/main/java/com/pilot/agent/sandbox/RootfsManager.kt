@@ -389,11 +389,43 @@ class RootfsManager private constructor(private val context: Context) {
         // writable (app-managed). Re-applied on every boot AFTER the copy; the
         // copyAssetDir leaf-copy above re-opens read-only files writable first,
         // so the next app-upgrade overlay still overwrites cleanly.
+        normalizeMcpShellLineEndings()
         val lockedCount = lockMcpCliLibReadOnly()
 
         val elapsedMs = (System.nanoTime() - startNs) / 1_000_000.0
         Log.i(TAG, "[DefaultMount] Done. $fileCount file(s) overlaid, $markerRemoved EXTERNALLY-MANAGED marker(s) removed, $lockedCount minis-mcp-cli lib path(s) locked read-only in %.1fms".format(elapsedMs))
     }
+
+    /**
+     * Android assets can retain CRLF from the source archive. BusyBox ash on
+     * Alpine rejects the resulting `\r` and reports misleading syntax errors
+     * such as `unexpected end of file`. Normalise the tiny launcher after each
+     * overlay, including for existing installations that already have a rootfs.
+     */
+    private fun normalizeMcpShellLineEndings() {
+        val wrapper = File(rootfsDir, "usr/local/bin/minis-mcp-cli")
+        if (!wrapper.isFile) return
+        runCatching {
+            wrapper.setWritable(true, true)
+            val bytes = wrapper.readBytes()
+            val normalized = if (bytes.containsCrlf()) {
+                bytes.toString(Charsets.UTF_8)
+                    .replace("\r\n", "\n")
+                    .replace('\r', '\n')
+                    .toByteArray(Charsets.UTF_8)
+            } else {
+                bytes
+            }
+            if (normalized !== bytes) wrapper.writeBytes(normalized)
+            wrapper.setReadable(true, false)
+            wrapper.setExecutable(true, false)
+        }.onFailure {
+            Log.w(TAG, "[DefaultMount] Failed to normalise minis-mcp-cli launcher: ${it.message}")
+        }
+    }
+
+    private fun ByteArray.containsCrlf(): Boolean =
+        indices.any { i -> this[i] == '\r'.code.toByte() }
 
     /**
      * [T-mcp-cli-readonly-android] Set the `/usr/local/lib/minis-mcp-cli/`

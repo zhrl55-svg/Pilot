@@ -24,6 +24,13 @@ class PlannerRouter(
         val s = settingsProvider()
         val simple = isSingleStep(goal)
         return buildList {
+            if (s.mode == AssistantMode.AGENT) {
+                // Fast rules still get first refusal for atomic system actions.
+                add(onDevice)
+                if (s.cloudReady) add(cloud)
+                if (s.enableLocalModel) add(local)
+                return@buildList
+            }
             add(onDevice)
             if (simple && s.enableLocalModel) add(local)
             if (s.cloudReady) add(cloud)

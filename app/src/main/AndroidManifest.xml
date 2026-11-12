@@ -192,6 +192,22 @@
             android:noHistory="true"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
+        <!-- Agent 的可见浏览器会话：保留 Cookie、登录状态和连续 DOM 操作。 -->
+        <activity
+            android:name=".browser.BrowserActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:theme="@android:style/Theme.Material.NoActionBar" />
+
+        <!-- 主屏菜单里的可见终端：与 Agent 共用同一套沙箱执行内核。 -->
+        <activity
+            android:name=".ui.TerminalActivity"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@android:style/Theme.Material.NoActionBar" />
+
         <!-- 导航界面：高德 AMapNaviView 的载体（引擎必须有 View 才会回调） -->
         <!--
           导航界面：必须在 :navigation 进程！

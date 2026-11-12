@@ -13,6 +13,7 @@ import androidx.lifecycle.viewModelScope
 import com.pilot.agent.Dbg
 import com.pilot.agent.agent.AgentEvent
 import com.pilot.agent.agent.AgentSettings
+import com.pilot.agent.agent.AssistantMode
 import com.pilot.agent.agent.IntentGate
 import com.pilot.agent.agent.Risk
 import com.pilot.agent.runtime.AgentRuntime
@@ -53,6 +54,9 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     var settings by mutableStateOf(AgentSettings.load())
+        private set
+
+    var mode by mutableStateOf(settings.mode)
         private set
 
     val logs = mutableStateListOf<LogEntry>()
@@ -186,6 +190,18 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     var skillCount by mutableStateOf(0)
         private set
 
+    var userScripts by mutableStateOf<List<com.pilot.agent.extension.UserScript>>(emptyList())
+        private set
+
+    var mcpServers by mutableStateOf<List<com.pilot.agent.extension.McpServerSummary>>(emptyList())
+        private set
+
+    var mcpProbeText by mutableStateOf("")
+        private set
+
+    var mcpProbeRunning by mutableStateOf(false)
+        private set
+
     /** 已学技能列表（点设置里"已学技能 N 条"时展示） */
     var skillList by mutableStateOf<List<com.pilot.agent.agent.Skill>>(emptyList())
         private set
@@ -201,6 +217,77 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
 
     fun closeSkillList() {
         showSkillList = false
+    }
+
+    fun reloadSettings() {
+        settings = AgentSettings.load()
+        mode = settings.mode
+    }
+
+    fun selectMode(value: AssistantMode) {
+        if (value == mode) return
+        val next = AgentSettings.load().copy(mode = value)
+        AgentSettings.save(next)
+        settings = next
+        mode = value
+    }
+
+    fun selectReasoningEffort(value: String) {
+        val effort = value.takeIf { it in AgentSettings.REASONING_EFFORTS }
+            ?: AgentSettings.DEFAULT_REASONING_EFFORT
+        if (effort == settings.reasoningEffort) return
+        val next = AgentSettings.load().copy(reasoningEffort = effort)
+        AgentSettings.save(next)
+        settings = next
+    }
+
+    fun refreshExtensions() {
+        userScripts = AgentRuntime.userScripts.all()
+        mcpServers = AgentRuntime.mcp.configuredServers()
+    }
+
+    fun importUserScript(uri: android.net.Uri) {
+        AgentRuntime.userScripts.import(getApplication(), uri)
+            .onSuccess {
+                refreshExtensions()
+                add(LogEntry.Kind.OBSERVE, "已导入用户脚本「${it.name}」")
+            }
+            .onFailure {
+                add(LogEntry.Kind.ERROR, "导入用户脚本失败：${it.message}")
+            }
+    }
+
+    fun deleteUserScript(id: String) {
+        val deleted = AgentRuntime.userScripts.delete(id)
+        refreshExtensions()
+        add(
+            if (deleted) LogEntry.Kind.OBSERVE else LogEntry.Kind.ERROR,
+            if (deleted) "已删除用户脚本" else "没有找到要删除的用户脚本",
+        )
+    }
+
+    fun clearBrowserSession() {
+        viewModelScope.launch {
+            com.pilot.agent.browser.BrowserSessionManager.clearSessionData(getApplication())
+            add(LogEntry.Kind.OBSERVE, "浏览器 Cookie 和登录状态已清除")
+        }
+    }
+
+    fun probeMcp() {
+        if (mcpProbeRunning) return
+        mcpProbeRunning = true
+        mcpProbeText = "正在检查 MCP 运行时…"
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) { AgentRuntime.mcp.listServers() }
+            mcpProbeText = if (result.ok) {
+                result.output.ifBlank { "MCP 运行时正常，当前没有服务器。" }
+                    .take(4_000) + "\n耗时 ${result.durationMs}ms"
+            } else {
+                "MCP 检查失败（exit=${result.exitCode}）：\n" +
+                    result.output.take(4_000)
+            }
+            mcpProbeRunning = false
+        }
     }
 
     var toolPolicies by mutableStateOf(AgentRuntime.localTools.policies())
@@ -546,6 +633,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             android.content.pm.PackageManager.PERMISSION_GRANTED
         if (reminderNotificationsAllowed) com.pilot.agent.action.ReminderManager.rescheduleAll(getApplication())
         skillCount = AgentRuntime.skills.all().size
+        refreshExtensions()
         // ★ cookie 存在但 neteaseNick 为空（App 重启后）时，查一次昵称。
         //   原来昵称只在扫码成功那一刻赋值，重启后设置页就一直显示"未登录"（老板反馈）。
         val cookie = AgentSettings.load().neteaseCookie
@@ -590,7 +678,6 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             // 单例复用：把回调换成当前 ViewModel 的
             v.onState = { voiceState = it }
             v.onText = { text ->
-                val matchedTool = AgentRuntime.localTools.match(text)
                 // ★ 去重：同一条内容短时间内重复到达只显示一次。
                 //   长按录音松手时，VAD 会 flush 出一句；麦克风还在录，
                 //   紧接着又切出一段内容相近的 → 用户看到"显示了两遍"（实测）。
@@ -601,9 +688,6 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 } else {
                     lastUserText = text.trim()
                     lastUserTextAt = now
-                    addUserMessageIfNeeded(
-                        AgentRuntime.localTools.displayTextFor(text, matchedTool),
-                    )
                 }
                 if (!dup) {
                     // ★ 「你休息一会 / 我先忙一会 / 别打扰我」→ 进免打扰：
@@ -616,11 +700,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                         voice?.enterDoNotDisturb()
                         AgentRuntime.speaker.speak(DND_REPLY)
                     } else {
-                        when (IntentGate.classify(text)) {
-                            IntentGate.Kind.TASK -> run(text, matchedTool)
-                            IntentGate.Kind.QUERY -> query(text, matchedTool)
-                            IntentGate.Kind.CHAT -> chat(text, matchedTool)
-                        }
+                        run(text)
                     }
                 }
             }
@@ -648,16 +728,8 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             gate = AgentRuntime.voiceprint,
             onState = { voiceState = it },
             onText = { text ->
-                val matchedTool = AgentRuntime.localTools.match(text)
-                addUserMessageIfNeeded(
-                    AgentRuntime.localTools.displayTextFor(text, matchedTool),
-                )
-                // 意图三分类：操作 / 查询 / 闲聊，走三条完全不同的链路
-                when (IntentGate.classify(text)) {
-                    IntentGate.Kind.TASK -> run(text, matchedTool)
-                    IntentGate.Kind.QUERY -> query(text, matchedTool)
-                    IntentGate.Kind.CHAT -> chat(text, matchedTool)
-                }
+                // 所有入口统一经过 run()，由当前模式决定助理或 Agent 链路。
+                run(text)
             },
             onError = { msg -> add(LogEntry.Kind.ERROR, msg) },
             onWake = { word ->
@@ -998,15 +1070,14 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
      * 查询类：行情、天气、火车余票这类要信息的需求。走 QueryEngine，不碰屏幕。
      * 查不到就退回端侧模型答（哪怕答得不好，也比一声不吭强）。
      */
-    private fun query(text: String, matchedTool: ToolInvocation? = null) {
-        if (tryRunLocalTool(text, allowConfirmation = true, matchedTool = matchedTool)) return
+    private fun query(text: String) {
         viewModelScope.launch {
             add(LogEntry.Kind.THINK, "查一下…")
             val answer = withContext(Dispatchers.IO) {
                 com.pilot.agent.query.QueryEngine.handle(text)
             }
             if (answer.isNullOrBlank()) {
-                add(LogEntry.Kind.OBSERVE, "没有对应的数据源，转给端侧模型")
+                add(LogEntry.Kind.OBSERVE, "没有对应的数据源，交给模型回答")
                 chat(text)
             } else {
                 add(LogEntry.Kind.DONE, answer)
@@ -1027,8 +1098,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
      * 端侧小模型不知道当前时间，prompt 里必须注入，否则问「今天几号」
      * 会答成占位符。
      */
-    private fun chat(text: String, matchedTool: ToolInvocation? = null) {
-        if (tryRunLocalTool(text, allowConfirmation = true, matchedTool = matchedTool)) return
+    private fun chat(text: String) {
         viewModelScope.launch {
             add(LogEntry.Kind.THINK, "这句不是操作指令，交给模型回答")
             val reply = withContext(Dispatchers.IO) {
@@ -1066,6 +1136,13 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             val body = org.json.JSONObject().apply {
                 put("model", s.model)
                 put("stream", false)
+                if (s.mode == AssistantMode.AGENT) {
+                    put(
+                        "reasoning_effort",
+                        s.reasoningEffort.takeIf { it in AgentSettings.REASONING_EFFORTS }
+                            ?: AgentSettings.DEFAULT_REASONING_EFFORT,
+                    )
+                }
                 put("messages", org.json.JSONArray().apply {
                     put(org.json.JSONObject().apply {
                         put("role", "system")
@@ -1193,16 +1270,45 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     fun run(goal: String, matchedTool: ToolInvocation? = null) {
         val g = goal.trim()
         if (g.isEmpty() || running) return
-        val invocation = matchedTool ?: AgentRuntime.localTools.match(g)
+        reloadSettings()
+        val preferExtension = AgentRuntime.localTools.prefersAgentExtension(g)
+        val invocation = if (preferExtension) null else matchedTool ?: AgentRuntime.localTools.match(g)
         // 语音回调、文字发送和本地工具都从这里进入。统一在同一处追加，
         // 避免操作指令被上游和 run() 各写一次而在聊天框显示两遍。
         addUserMessageIfNeeded(AgentRuntime.localTools.displayTextFor(g, invocation))
-        if (tryRunLocalTool(g, allowConfirmation = true, matchedTool = invocation)) return
-        // 文本输入同样过意图门：不是操作指令就不碰屏幕
-        if (!IntentGate.isTask(g)) {
-            add(LogEntry.Kind.OBSERVE, "这句不是操作指令（${IntentGate.reason(g)}），不执行。")
+        if (mode == AssistantMode.ASSISTANT && preferExtension) {
+            val reply = "浏览器会话、MCP 和用户脚本需要切换到 Agent 模式。"
+            add(LogEntry.Kind.DONE, reply)
+            AgentRuntime.speaker.speak(reply)
             return
         }
+        dispatchRequest(g, invocation)
+    }
+
+    private fun dispatchRequest(
+        g: String,
+        invocation: ToolInvocation?,
+    ) {
+        if (tryRunLocalTool(g, allowConfirmation = true, matchedTool = invocation)) return
+
+        val kind = IntentGate.classify(g)
+        when (mode) {
+            AssistantMode.ASSISTANT -> when (kind) {
+                IntentGate.Kind.QUERY -> query(g)
+                IntentGate.Kind.CHAT -> chat(g)
+                IntentGate.Kind.TASK -> startAgent(g, AssistantMode.ASSISTANT)
+            }
+            AssistantMode.AGENT -> when (kind) {
+                IntentGate.Kind.QUERY, IntentGate.Kind.TASK ->
+                    startAgent(g, AssistantMode.AGENT)
+                IntentGate.Kind.CHAT -> chat(g)
+            }
+        }
+    }
+
+    private fun startAgent(g: String, effectiveMode: AssistantMode) {
+        if (running) return
+        reloadSettings()
         refreshStatus()
         if (!accessibilityOn || AgentRuntime.loop == null) {
             // Android 不允许普通 App 静默勾选无障碍开关，但可以把用户直接带到
@@ -1224,7 +1330,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         publishNotificationStatus()
         justSent = true
         progress = 0 to settings.maxTurns
-        AgentRuntime.loop?.start(AgentRuntime.scope, g)
+        AgentRuntime.loop?.start(AgentRuntime.scope, g, executionMode = effectiveMode)
     }
 
     private fun openAccessibilitySettings() {

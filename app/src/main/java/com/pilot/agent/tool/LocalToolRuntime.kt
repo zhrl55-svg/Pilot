@@ -29,12 +29,26 @@ class LocalToolRuntime(
     fun match(text: String): ToolInvocation? {
         val t = text.trim()
         if (t.isEmpty()) return null
-        return matchScheduledTask(t)
+        val builtIn = matchScheduledTask(t)
             ?: matchMemory(t)
             ?: matchScreenshot(t)
             ?: matchDevice(t)
-            ?: matchFiles(t)
-            ?: ssh.match(t)
+        if (builtIn != null) return builtIn
+        if (!prefersAgentExtension(t)) matchFiles(t)?.let { return it }
+        return ssh.match(t)
+    }
+
+    /**
+     * Browser and MCP instructions often contain URLs or the word "读取",
+     * which would otherwise be captured by the file-tool regexes.
+     */
+    fun prefersAgentExtension(text: String): Boolean {
+        val value = text.trim()
+        val hasUrl = Regex("https?://", RegexOption.IGNORE_CASE).containsMatchIn(value)
+        val browserIntent = listOf("浏览器", "网页会话", "网页", "链接", "正文").any(value::contains)
+        val mcpIntent = listOf("MCP", "mcp").any(value::contains)
+        val scriptIntent = listOf("用户脚本", "运行脚本", "调用脚本").any(value::contains)
+        return scriptIntent || mcpIntent || (hasUrl && browserIntent)
     }
 
     fun displayTextFor(text: String, invocation: ToolInvocation?): String =

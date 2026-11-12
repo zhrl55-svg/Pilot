@@ -76,6 +76,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.pilot.agent.agent.AgentSettings
+import com.pilot.agent.agent.AssistantMode
 import com.pilot.agent.tool.ToolGroup
 import com.pilot.agent.tool.ToolPolicy
 import kotlinx.coroutines.delay
@@ -115,6 +116,13 @@ private enum class SettingsPage(
         "对话模型、上下文和联网搜索",
         Color(0xFF9B8CFF),
     ),
+    AGENT(
+        SettingsGlyph.TEXT,
+        "A",
+        "Agent 与扩展",
+        "运行模式、执行预算、浏览器、脚本和 MCP",
+        Color(0xFF68B7FF),
+    ),
     MUSIC(
         SettingsGlyph.TEXT,
         "♪",
@@ -144,7 +152,10 @@ private class SettingsDraft(initial: AgentSettings) {
     var webSearchApiKey by mutableStateOf(initial.webSearchApiKey)
     var model by mutableStateOf(initial.model)
     var maxTurns by mutableStateOf(initial.maxTurns.toString())
+    var mode by mutableStateOf(initial.mode)
+    var reasoningEffort by mutableStateOf(initial.reasoningEffort)
     var preferOnDevice by mutableStateOf(initial.preferOnDevice)
+    var allowSkillReplay by mutableStateOf(initial.allowSkillReplay)
     var maxChatTurns by mutableStateOf(initial.chatContextTurns.toString())
 
     var wakeWords by mutableStateOf(initial.wakeWords)
@@ -170,8 +181,15 @@ private class SettingsDraft(initial: AgentSettings) {
         apiKey = apiKey.trim(),
         webSearchApiKey = webSearchApiKey.trim(),
         model = model.trim(),
-        maxTurns = maxTurns.toIntOrNull()?.coerceIn(3, 60) ?: 25,
+        mode = mode,
+        maxTurns = maxTurns.toIntOrNull()
+            ?.coerceIn(AgentSettings.MIN_AGENT_TURNS, AgentSettings.MAX_AGENT_TURNS)
+            ?: AgentSettings.DEFAULT_MAX_TURNS,
+        reasoningEffort = reasoningEffort.takeIf {
+            it in AgentSettings.REASONING_EFFORTS
+        } ?: AgentSettings.DEFAULT_REASONING_EFFORT,
         preferOnDevice = preferOnDevice,
+        allowSkillReplay = allowSkillReplay,
         chatContextTurns = maxChatTurns.toIntOrNull()?.coerceIn(0, 20) ?: 4,
         wakeWords = wakeWords.trim().ifEmpty { AgentSettings.DEFAULT_WAKE_WORDS },
         wakeTone = wakeTone,
@@ -272,6 +290,7 @@ internal fun PilotSettingsDialog(
                             vm.setToolPolicy(group, policy)
                         }
                         AgentSettings.save(draft.saveFrom(vm.settings))
+                        vm.reloadSettings()
                         vm.refreshStatus()
                         onDismiss()
                     },
@@ -481,6 +500,15 @@ private fun SettingsHome(
                 status = if (draft.apiKey.isBlank()) "模型待配置" else draft.model,
                 statusActive = draft.apiKey.isNotBlank(),
                 onClick = { onOpen(SettingsPage.AI) },
+            )
+        }
+        item {
+            SettingsCategoryCard(
+                page = SettingsPage.AGENT,
+                status = "${draft.mode.label} · ${draft.maxTurns} 步 · " +
+                    "${vm.userScripts.size} 个脚本 · ${vm.mcpServers.size} 个 MCP",
+                statusActive = draft.mode == AssistantMode.AGENT,
+                onClick = { onOpen(SettingsPage.AGENT) },
             )
         }
         item {
@@ -808,6 +836,7 @@ private fun SettingsPageContent(
     when (page) {
         SettingsPage.VOICE -> VoiceSettingsPage(vm, draft)
         SettingsPage.AI -> AiSettingsPage(draft)
+        SettingsPage.AGENT -> AgentSettingsPage(vm, draft)
         SettingsPage.MUSIC -> MusicSettingsPage(vm, draft)
         SettingsPage.PERMISSIONS -> PermissionSettingsPage(
             vm,
@@ -979,22 +1008,13 @@ private fun AiSettingsPage(draft: SettingsDraft) {
                     value = draft.model,
                     onValueChange = { draft.model = it },
                 )
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    SettingsTextField(
-                        label = "最大执行步数",
-                        value = draft.maxTurns,
-                        onValueChange = { draft.maxTurns = it },
-                        keyboardType = KeyboardType.Number,
-                        modifier = Modifier.weight(1f),
-                    )
-                    SettingsTextField(
-                        label = "上下文轮数",
-                        value = draft.maxChatTurns,
-                        onValueChange = { draft.maxChatTurns = it },
-                        keyboardType = KeyboardType.Number,
-                        modifier = Modifier.weight(1f),
-                    )
-                }
+                SettingsTextField(
+                    label = "上下文轮数",
+                    value = draft.maxChatTurns,
+                    onValueChange = { draft.maxChatTurns = it },
+                    keyboardType = KeyboardType.Number,
+                    helper = "普通聊天携带最近几轮问答",
+                )
                 SettingsToggleRow(
                     title = "简单指令优先走端侧",
                     subtitle = "少一次模型请求，响应更快",
@@ -1015,6 +1035,163 @@ private fun AiSettingsPage(draft: SettingsDraft) {
                     onValueChange = { draft.webSearchApiKey = it },
                 )
                 InfoLine("可在 Brave Search API Dashboard 申请 Key")
+            }
+        }
+    }
+}
+
+@Composable
+private fun AgentSettingsPage(vm: AgentViewModel, draft: SettingsDraft) {
+    val scriptPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri != null) vm.importUserScript(uri)
+    }
+
+    LaunchedEffect(Unit) {
+        vm.refreshExtensions()
+    }
+
+    SettingsPageList {
+        item {
+            SettingsSectionCard(
+                title = "运行模式",
+                description = "助理自动处理规则、查询和聊天；Agent 增加多步执行、浏览器、MCP 与用户脚本。",
+            ) {
+                SegmentChoice(
+                    value = draft.mode.storageValue,
+                    options = AssistantMode.entries.map { it.storageValue to it.label },
+                    onSelect = { draft.mode = AssistantMode.fromStorage(it) },
+                )
+                InfoLine(draft.mode.description)
+                SettingsTextField(
+                    label = "Agent 最大执行步数",
+                    value = draft.maxTurns,
+                    onValueChange = { draft.maxTurns = it.filter(Char::isDigit).take(2) },
+                    keyboardType = KeyboardType.Number,
+                    helper = "${AgentSettings.MIN_AGENT_TURNS}–${AgentSettings.MAX_AGENT_TURNS} 步；默认 ${AgentSettings.DEFAULT_MAX_TURNS}",
+                )
+                DropdownSetting(
+                    label = "模型思考强度",
+                    selected = draft.reasoningEffort,
+                    options = listOf(
+                        "low" to "低",
+                        "medium" to "中",
+                        "high" to "高",
+                        "xhigh" to "极高",
+                        "max" to "最高",
+                    ),
+                    onSelect = { draft.reasoningEffort = it },
+                )
+                InfoLine("Agent 云端模型默认使用“中”；模型支持时可调整。")
+                SettingsToggleRow(
+                    title = "复用已学操作轨迹",
+                    subtitle = "相同任务优先回放成功过的界面步骤",
+                    checked = draft.allowSkillReplay,
+                    onCheckedChange = { draft.allowSkillReplay = it },
+                )
+            }
+        }
+
+        item {
+            SettingsSectionCard(
+                title = "浏览器会话",
+                description = "Agent 使用可见 WebView，保留登录 Cookie；只允许 HTTP/HTTPS，本地文件访问已关闭。",
+            ) {
+                StatusActionRow(
+                    title = "持久登录状态",
+                    value = "Cookie 保留在 Pilot 私有目录",
+                    action = "清除",
+                    onAction = { vm.clearBrowserSession() },
+                )
+            }
+        }
+
+        item {
+            SettingsSectionCard(
+                title = "用户脚本",
+                description = "脚本仅支持浏览器与 MCP 步骤。导入 JSON 后，命中触发器即可执行。",
+            ) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilledAction("导入 JSON", Modifier.weight(1f)) {
+                        scriptPicker.launch(arrayOf("application/json", "text/plain"))
+                    }
+                    OutlineAction("刷新", Modifier.weight(1f)) { vm.refreshExtensions() }
+                }
+                if (vm.userScripts.isEmpty()) {
+                    InfoLine("尚未安装脚本。可把 .json 放入 files/minis-global/skills。")
+                } else {
+                    vm.userScripts.forEach { script ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(Color.Black.copy(alpha = 0.18f))
+                                .padding(horizontal = 11.dp, vertical = 9.dp),
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    script.name,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                )
+                                Text(
+                                    script.triggers.joinToString(" · ").take(100),
+                                    fontSize = 9.sp,
+                                    color = SettingsMuted,
+                                )
+                            }
+                            TextButton(onClick = { vm.deleteUserScript(script.id) }) {
+                                Text("删除", fontSize = 10.sp, color = MaterialTheme.colorScheme.error)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        item {
+            SettingsSectionCard(
+                title = "MCP 客户端",
+                description = "与沙箱终端共用 servers.json；支持 HTTP、STDIO 与 OAuth 登录桥。",
+            ) {
+                if (vm.mcpServers.isEmpty()) {
+                    InfoLine("尚未配置 MCP 服务器。配置文件：files/minis-global/mcp-servers/servers.json")
+                } else {
+                    vm.mcpServers.forEach { server ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(
+                                server.name,
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.weight(1f),
+                            )
+                            StatusPill(
+                                "${server.transport}${if (server.enabled) "" else " · 停用"}",
+                                server.enabled,
+                            )
+                        }
+                    }
+                }
+                FilledAction(
+                    if (vm.mcpProbeRunning) "正在检查…" else "检查 MCP 运行时",
+                    Modifier.fillMaxWidth(),
+                ) {
+                    if (!vm.mcpProbeRunning) vm.probeMcp()
+                }
+                if (vm.mcpProbeText.isNotBlank()) {
+                    Text(
+                        vm.mcpProbeText,
+                        fontSize = 10.sp,
+                        color = SettingsMuted,
+                        lineHeight = 14.sp,
+                    )
+                }
             }
         }
     }

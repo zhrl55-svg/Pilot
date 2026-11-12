@@ -72,10 +72,24 @@ class CloudPlanner(private val settingsProvider: () -> AgentSettings) : Planner 
             put("model", s.model)
             put("temperature", 0.0)
             put("max_tokens", 800)
+            if (s.mode == AssistantMode.AGENT) {
+                put(
+                    "reasoning_effort",
+                    s.reasoningEffort.takeIf { it in AgentSettings.REASONING_EFFORTS }
+                        ?: AgentSettings.DEFAULT_REASONING_EFFORT,
+                )
+            }
             put("messages", buildJsonArray {
                 add(buildJsonObject {
                     put("role", "system")
-                    put("content", SYSTEM_PROMPT)
+                    put(
+                        "content",
+                        if (s.mode == AssistantMode.AGENT) {
+                            SYSTEM_PROMPT
+                        } else {
+                            SYSTEM_PROMPT + "\n\n" + ASSISTANT_MODE_GUARD
+                        },
+                    )
                 })
                 add(buildJsonObject {
                     put("role", "user")
@@ -119,6 +133,12 @@ class CloudPlanner(private val settingsProvider: () -> AgentSettings) : Planner 
     companion object {
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
+        private val ASSISTANT_MODE_GUARD = """
+当前是助理模式。禁止输出 browser_*、mcp_*、script_* 动作。
+只使用当前屏幕可以完成的普通界面操作、本机直达能力、wait、done 或 ask。
+如果用户明确要求浏览器会话、MCP 或用户脚本，输出 ask，并说明需要切换到 Agent 模式。
+""".trimIndent()
+
         val SYSTEM_PROMPT: String = """
 你是手机操作助手 Pilot，代替用户在 Android 手机上完成任务。每次只输出一个动作。
 
@@ -134,6 +154,18 @@ class CloudPlanner(private val settingsProvider: () -> AgentSettings) : Planner 
 - scroll {id,target:"forward"|"backward"}
 - open {target}                     包名或应用名
 - key {target:"back"|"home"|"recents"|"notifications"}
+- browser_open {url}                在可见浏览器会话打开网页，保留登录状态
+- browser_read {maxChars}           读取网页标题、网址和正文
+- browser_click {target}            点网页按钮/链接；target 可写可见文字或 css:选择器
+- browser_type {target,text}        填写网页输入框（密码类内容必须由用户明确提供）
+- browser_scroll {target:"forward"|"backward"}
+- browser_back
+- browser_close
+- mcp_list
+- mcp_tools {server}
+- mcp_call {server,tool,arguments:"{}"}  arguments 是 JSON 对象字符串
+- script_list
+- script_run {target}               按 id 或名称运行用户安装的脚本
 - wait {ms}
 - done {summary}                    任务完成
 - ask {summary}                     信息不足或需要用户确认
@@ -144,7 +176,9 @@ class CloudPlanner(private val settingsProvider: () -> AgentSettings) : Planner 
 3. 目标内容可能不在当前屏，先 scroll 再看。
 4. 支付、转账、删除、发送消息、提交订单这类不可逆或对外动作，必须先用 ask 请用户确认。
 5. 判断任务已完成就用 done，不要多余操作。
-6. 只输出 JSON。
+6. 需要登录或动态网页时使用 browser_*；browser_read 读不到正文时先 browser_click 关闭遮挡层、处理同意按钮或等待。
+7. 调用会产生外部副作用的 MCP 工具前先用 ask 确认；只读查询可直接调用。
+8. 只输出 JSON。
 """.trimIndent()
     }
 }

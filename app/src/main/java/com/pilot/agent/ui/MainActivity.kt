@@ -103,6 +103,8 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 import com.pilot.agent.Dbg
 import com.pilot.agent.agent.AgentSettings
+import com.pilot.agent.agent.AssistantMode
+import com.pilot.agent.browser.BrowserActivity
 
 /** 按住多久算长按（开始录音）。低于系统长按阈值，手感更跟手。 */
 private const val LONG_PRESS_MS = 450L
@@ -208,6 +210,28 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
             vm,
             onSettings = { showSettings = true },
             onClearChat = { showClearChatConfirm = true },
+            onTerminalOpen = {
+                runCatching {
+                    ctx.startActivity(Intent(ctx, TerminalActivity::class.java))
+                }.onFailure {
+                    android.widget.Toast.makeText(
+                        ctx,
+                        "无法打开终端：${it.message.orEmpty()}",
+                        android.widget.Toast.LENGTH_SHORT,
+                    ).show()
+                }
+            },
+            onBrowserOpen = {
+                runCatching {
+                    ctx.startActivity(Intent(ctx, BrowserActivity::class.java))
+                }.onFailure {
+                    android.widget.Toast.makeText(
+                        ctx,
+                        "无法打开浏览器：${it.message.orEmpty()}",
+                        android.widget.Toast.LENGTH_SHORT,
+                    ).show()
+                }
+            },
             onNavOpen = {
                 // 直接拉起导航界面（NavActivity 在 :navigation 进程）
                 runCatching {
@@ -224,6 +248,12 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
                     ).show()
                 }
             },
+        )
+        ModeSelector(
+            selected = vm.mode,
+            reasoningEffort = vm.settings.reasoningEffort,
+            onSelect = { vm.selectMode(it) },
+            onReasoningSelect = { vm.selectReasoningEffort(it) },
         )
         Spacer(Modifier.height(12.dp))
         StatusCard(
@@ -405,8 +435,183 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
 }
 
 @Composable
-private fun Header(vm: AgentViewModel, onSettings: () -> Unit, onClearChat: () -> Unit, onNavOpen: () -> Unit) {
+private fun ModeSelector(
+    selected: AssistantMode,
+    reasoningEffort: String,
+    onSelect: (AssistantMode) -> Unit,
+    onReasoningSelect: (String) -> Unit,
+) {
     val colors = MaterialTheme.colorScheme
+    var reasoningExpanded by remember { mutableStateOf(false) }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 7.dp),
+        horizontalArrangement = Arrangement.Center,
+    ) {
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(12.dp))
+                .background(colors.surfaceVariant.copy(alpha = 0.42f))
+                .padding(3.dp),
+            horizontalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
+            ModeChip(
+                label = AssistantMode.ASSISTANT.label,
+                selected = selected == AssistantMode.ASSISTANT,
+                modifier = Modifier
+                    .width(58.dp)
+                    .clip(RoundedCornerShape(9.dp))
+                    .background(
+                        if (selected == AssistantMode.ASSISTANT) {
+                            colors.primary.copy(alpha = 0.20f)
+                        }
+                        else Color.Transparent,
+                    )
+                    .clickable { onSelect(AssistantMode.ASSISTANT) }
+                    .padding(vertical = 7.dp),
+            )
+
+            Box(
+                modifier = Modifier
+                    .width(112.dp)
+                    .clip(RoundedCornerShape(9.dp))
+                    .background(
+                        if (selected == AssistantMode.AGENT) {
+                            colors.primary.copy(alpha = 0.20f)
+                        } else {
+                            Color.Transparent
+                        },
+                    ),
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clickable { onSelect(AssistantMode.AGENT) }
+                            .padding(start = 8.dp, end = 3.dp, top = 7.dp, bottom = 7.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            AssistantMode.AGENT.label,
+                            fontSize = 11.sp,
+                            fontWeight = if (selected == AssistantMode.AGENT) {
+                                FontWeight.SemiBold
+                            } else {
+                                FontWeight.Normal
+                            },
+                            color = if (selected == AssistantMode.AGENT) {
+                                colors.primary
+                            } else {
+                                colors.onSurfaceVariant
+                            },
+                        )
+                    }
+                    Box(
+                        Modifier
+                            .width(1.dp)
+                            .height(15.dp)
+                            .background(colors.outline.copy(alpha = 0.35f)),
+                    )
+                    Box(
+                        modifier = Modifier
+                            .clickable { reasoningExpanded = true }
+                            .padding(horizontal = 6.dp, vertical = 7.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            "${reasoningEffortLabel(reasoningEffort)} ▾",
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = if (selected == AssistantMode.AGENT) {
+                                colors.primary.copy(alpha = 0.90f)
+                            } else {
+                                colors.onSurfaceVariant
+                            },
+                        )
+                        DropdownMenu(
+                            expanded = reasoningExpanded,
+                            onDismissRequest = { reasoningExpanded = false },
+                            modifier = Modifier.width(132.dp),
+                        ) {
+                            Text(
+                                "Agent 思考强度",
+                                fontSize = 10.sp,
+                                color = colors.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                            )
+                            listOf(
+                                "low" to "低",
+                                "medium" to "中",
+                                "high" to "高",
+                                "xhigh" to "极高",
+                                "max" to "最高",
+                            ).forEach { (value, label) ->
+                                DropdownMenuItem(
+                                    text = {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                        ) {
+                                            Text(label, fontSize = 12.sp)
+                                            if (value == reasoningEffort) {
+                                                Text("✓", fontSize = 12.sp, color = colors.primary)
+                                            }
+                                        }
+                                    },
+                                    onClick = {
+                                        onReasoningSelect(value)
+                                        reasoningExpanded = false
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ModeChip(
+    label: String,
+    selected: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val colors = MaterialTheme.colorScheme
+    Box(modifier = modifier, contentAlignment = Alignment.Center) {
+        Text(
+            label,
+            fontSize = 11.sp,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            color = if (selected) colors.primary else colors.onSurfaceVariant,
+        )
+    }
+}
+
+private fun reasoningEffortLabel(value: String): String = when (value) {
+    "low" -> "低"
+    "medium" -> "中"
+    "high" -> "高"
+    "xhigh" -> "极高"
+    "max" -> "最高"
+    else -> "中"
+}
+
+@Composable
+private fun Header(
+    vm: AgentViewModel,
+    onSettings: () -> Unit,
+    onClearChat: () -> Unit,
+    onTerminalOpen: () -> Unit,
+    onBrowserOpen: () -> Unit,
+    onNavOpen: () -> Unit,
+) {
+    val colors = MaterialTheme.colorScheme
+    var menuExpanded by remember { mutableStateOf(false) }
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
         // ★ 老板要求：标题左侧不要圆点
         Column(Modifier.weight(1f)) {
@@ -429,7 +634,37 @@ private fun Header(vm: AgentViewModel, onSettings: () -> Unit, onClearChat: () -
                 onClick = onClearChat,
                 enabled = vm.chatLogs.isNotEmpty() && !vm.running && !vm.justSent,
             ) { Text("清屏", fontSize = 13.sp) }
-            TextButton(onClick = onSettings) { Text("设置", fontSize = 13.sp) }
+            Box {
+                TextButton(onClick = { menuExpanded = true }) {
+                    Text("⋮", fontSize = 22.sp, fontWeight = FontWeight.Medium)
+                }
+                DropdownMenu(
+                    expanded = menuExpanded,
+                    onDismissRequest = { menuExpanded = false },
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("打开终端") },
+                        onClick = {
+                            menuExpanded = false
+                            onTerminalOpen()
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("打开浏览器") },
+                        onClick = {
+                            menuExpanded = false
+                            onBrowserOpen()
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("设置") },
+                        onClick = {
+                            menuExpanded = false
+                            onSettings()
+                        },
+                    )
+                }
+            }
         }
     }
 }
