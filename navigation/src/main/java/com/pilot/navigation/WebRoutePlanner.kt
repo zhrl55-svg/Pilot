@@ -27,7 +27,8 @@ import java.net.URL
 class WebRoutePlanner {
 
     companion object {
-        private const val BASE = "https://restapi.amap.com/v3/direction/driving"
+        private const val BASE_DRIVE = "https://restapi.amap.com/v3/direction/driving"
+        private const val BASE_WALK = "https://restapi.amap.com/v3/direction/walking"
         private const val TAG = "PilotNavRoute"
 
         /** 播报「即将转弯」的提前量（米） */
@@ -59,6 +60,7 @@ class WebRoutePlanner {
         toLat: Double,
         toLon: Double,
         strategy: Int = 0,
+        walking: Boolean = false,
         avoidCongestion: Boolean = true,
         onResult: (Route) -> Unit,
         onError: (String) -> Unit,
@@ -68,18 +70,21 @@ class WebRoutePlanner {
             // 高德的经纬度顺序是「经度,纬度」
             append("&origin=").append("$fromLon,$fromLat")
             append("&destination=").append("$toLon,$toLat")
-            // Web v3: 0=速度优先，3=距离优先，4=躲避拥堵。
-            val webStrategy = when (strategy) {
-                2 -> 3
-                1 -> 4
-                3 -> if (avoidCongestion) 20 else 19
-                else -> if (avoidCongestion) 4 else 0
+            if (!walking) {
+                // Web v3: 0=速度优先，3=距离优先，4=躲避拥堵。
+                val webStrategy = when (strategy) {
+                    2 -> 3
+                    1 -> 4
+                    3 -> if (avoidCongestion) 20 else 19
+                    else -> if (avoidCongestion) 4 else 0
+                }
+                append("&strategy=").append(webStrategy)
             }
-            append("&strategy=").append(webStrategy)
             append("&extensions=base")
         }
+        val base = if (walking) BASE_WALK else BASE_DRIVE
         val json = try {
-            val conn = URL(BASE + tail).openConnection() as HttpURLConnection
+            val conn = URL(base + tail).openConnection() as HttpURLConnection
             conn.connectTimeout = 6000
             conn.readTimeout = 8000
             conn.requestMethod = "GET"
@@ -130,7 +135,8 @@ class WebRoutePlanner {
         )
         NLog.i(
             TAG,
-            "算路成功 ${route.totalDistance}m/${route.totalDuration}s ${steps.size} 步；" +
+            "${if (walking) "步行" else "驾车"}算路成功 " +
+                "${route.totalDistance}m/${route.totalDuration}s ${steps.size} 步；" +
                 "首步=${steps.firstOrNull()?.instruction}",
         )
         onResult(route)

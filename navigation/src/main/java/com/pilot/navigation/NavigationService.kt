@@ -77,6 +77,11 @@ class NavigationService : Service() {
     var currentDestination: String? = null
         private set
 
+    /** 当前这一单导航的出行方式。 */
+    @Volatile
+    var currentTravelMode: TravelMode = TravelMode.DRIVE
+        private set
+
     /** 是否已经请求停止（引擎回调里用来忽略迟到的事件）。 */
     @Volatile
     private var stopRequested = false
@@ -105,10 +110,20 @@ class NavigationService : Service() {
     private val binder = object : INavigationService.Stub() {
 
         override fun startNavi(destination: String, strategy: Int): Long {
+            val mode = TravelMode.fromValue(NavigationSettings.load(this@NavigationService).travelMode)
+            return startNaviInternal(destination, strategy, mode)
+        }
+
+        override fun startNaviWithMode(destination: String, strategy: Int, travelMode: Int): Long =
+            startNaviInternal(destination, strategy, TravelMode.fromValue(travelMode))
+
+        private fun startNaviInternal(destination: String, strategy: Int, travelMode: TravelMode): Long {
             val jobId = jobs.getAndIncrement()
             val simulationMarker = java.io.File(filesDir, "nav_simulate_next")
             val simulated = simulateNextRequest.getAndSet(false) || runCatching { simulationMarker.delete() }.getOrDefault(false)
             if (simulated) NLog.i(TAG, "本次请求启用模拟导航")
+            currentTravelMode = travelMode
+            NLog.i(TAG, "开始导航请求 mode=${travelMode.name} destination=$destination")
             currentState = State.ROUTING
 
             // ★ 先查常去地点：「回家」「去公司」这种词直接命中收藏，
@@ -120,15 +135,16 @@ class NavigationService : Service() {
                 emit(jobId, "state", "导航去${fav.label}", priority = 0, stateName = currentState.toString())
                 // 收藏里已经有坐标，直接算路
                 java.util.concurrent.Executors.newSingleThreadExecutor().execute {
-                    val sdkOk = trySdkRouteFromFav(jobId, fav, strategy, simulated)
+                    val sdkOk = trySdkRouteFromFav(jobId, fav, strategy, travelMode, simulated)
                     if (!sdkOk) {
                         webRoute().plan(
                             fromLat = locationProvider().lat, fromLon = locationProvider().lon,
                             toLat = fav.lat, toLon = fav.lon,
                             strategy = strategy,
+                            walking = travelMode == TravelMode.WALK,
                             avoidCongestion = NavigationSettings.load(this@NavigationService).avoidJam,
                             onResult = { r ->
-                                guide().start(r)
+                                guide().start(r, walking = travelMode == TravelMode.WALK)
                                 if (simulated) guide().simulatePlayback()
                                 emit(jobId, "state", "开始导航", priority = 0, stateName = currentState.toString())
                             },
@@ -170,7 +186,7 @@ class NavigationService : Service() {
             //   （local.properties 的键不会自动进 gradle project property，
             //   manifestPlaceholder 是空串——已修）。
             val onFound: (List<SdkPoiSearch.Candidate>) -> Unit = { candidates ->
-                onPoiResolved(jobId, candidates, loc, strategy, simulated)
+                onPoiResolved(jobId, candidates, loc, strategy, travelMode, simulated)
             }
             val onFailed: (String) -> Unit = { msg ->
                 currentState = State.FAILED
@@ -215,6 +231,7 @@ class NavigationService : Service() {
         override fun getNavState(): String = buildString {
             append("{\"state\":\"").append(currentState.toString()).append("\"")
             append(",\"destination\":").append(org.json.JSONObject.quote(currentDestination ?: ""))
+            append(",\"travelMode\":\"").append(currentTravelMode.name).append("\"")
             // 剩余距离/时间给「还有多远」查询用
             guide()?.let { g ->
                 g.remainingMeters()?.let { append(",\"remainMeters\":").append(it) }
@@ -283,6 +300,7 @@ class NavigationService : Service() {
         candidates: List<SdkPoiSearch.Candidate>,
         loc: LocationProvider,
         strategy: Int,
+        travelMode: TravelMode,
         simulated: Boolean,
     ) {
         if (candidates.isEmpty()) {
@@ -303,7 +321,7 @@ class NavigationService : Service() {
         //   策略：SDK 发起算路，等 15 秒。成功就走 SDK（体验最好）；
         //   失败/超时自动降级 Web（保证一定能导航）。
         Thread {
-            val sdkOk = trySdkRoute(jobId, best, loc, strategy, simulated)
+            val sdkOk = trySdkRoute(jobId, best, loc, strategy, travelMode, simulated)
             if (sdkOk) {
                 recordHistory(best.name, best.lat, best.lon, best.poiId)
             } else {
@@ -312,9 +330,10 @@ class NavigationService : Service() {
                     fromLat = loc.lat, fromLon = loc.lon,
                     toLat = best.lat, toLon = best.lon,
                     strategy = strategy,
+                    walking = travelMode == TravelMode.WALK,
                     avoidCongestion = NavigationSettings.load(this).avoidJam,
                     onResult = { r ->
-                        guide().start(r)
+                        guide().start(r, walking = travelMode == TravelMode.WALK)
                         if (simulated) guide().simulatePlayback()
                         emit(jobId, "state", "开始导航", priority = 0, stateName = currentState.toString())
                     },
@@ -336,6 +355,7 @@ class NavigationService : Service() {
         best: SdkPoiSearch.Candidate,
         loc: LocationProvider,
         strategy: Int,
+        travelMode: TravelMode,
         simulated: Boolean,
     ): Boolean {
         return try {
@@ -360,6 +380,7 @@ class NavigationService : Service() {
                 best.name, best.lat, best.lon, strategy,
                 startLat = loc.lat, startLon = loc.lon,
                 poiId = best.poiId,
+                travelMode = travelMode,
                 avoidCongestion = NavigationSettings.load(this).avoidJam,
                 simulated = simulated,
             )
@@ -414,6 +435,7 @@ class NavigationService : Service() {
         jobId: Long,
         fav: NavigationSettings.Favorite,
         strategy: Int,
+        travelMode: TravelMode,
         simulated: Boolean,
     ): Boolean = try {
         val now = System.currentTimeMillis()
@@ -436,6 +458,7 @@ class NavigationService : Service() {
                     fav.label, fav.lat, fav.lon, strategy,
                     startLat = loc.lat, startLon = loc.lon,
                     poiId = fav.poiId,
+                    travelMode = travelMode,
                     avoidCongestion = NavigationSettings.load(this).avoidJam,
                     simulated = simulated,
                 )
@@ -512,8 +535,11 @@ class NavigationService : Service() {
     }
 
     /** 供界面层发起导航（历史再导航用）。 */
-    fun startNaviFromOuter(destination: String, strategy: Int): Long =
-        binder.startNavi(destination, strategy)
+    fun startNaviFromOuter(
+        destination: String,
+        strategy: Int,
+        travelMode: TravelMode = TravelMode.fromValue(NavigationSettings.load(this).travelMode),
+    ): Long = binder.startNaviWithMode(destination, strategy, travelMode.value)
 
     /** 设备端测试入口：下一次导航使用 SDK 模拟器；Web 回退时回放路线坐标。 */
     fun startSimulatedNaviFromOuter(destination: String): Long {

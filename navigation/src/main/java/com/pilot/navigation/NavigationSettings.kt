@@ -110,6 +110,7 @@ class NavigationSettings(private val context: Context) {
                 keepScreenOn = o.optBoolean("keepScreenOn", true),
                 avoidJam = o.optBoolean("avoidJam", true),
                 autoZoom = o.optBoolean("autoZoom", true),
+                travelMode = o.optInt("travelMode", TravelMode.DRIVE.value),
                 favorites = favs,
                 history = hist,
             )
@@ -122,6 +123,7 @@ class NavigationSettings(private val context: Context) {
             o.put("keepScreenOn", s.keepScreenOn)
             o.put("avoidJam", s.avoidJam)
             o.put("autoZoom", s.autoZoom)
+            o.put("travelMode", s.travelMode)
             o.put("favorites", JSONArray().apply {
                 for (f in s.favorites) {
                     put(JSONObject().apply {
@@ -197,6 +199,8 @@ class NavigationSettings(private val context: Context) {
         val avoidJam: Boolean = true,
         /** 自动缩放 */
         val autoZoom: Boolean = true,
+        /** 上次选择的出行方式：0=驾车 1=步行 */
+        val travelMode: Int = TravelMode.DRIVE.value,
         val favorites: List<Favorite> = emptyList(),
         val history: List<HistoryEntry> = emptyList(),
     )

@@ -25,6 +25,12 @@ interface INavigationService {
      */
     long startNavi(String destination, int strategy);
 
+    /**
+     * 按指定出行方式开始导航。
+     * @param travelMode 0=驾车 1=步行
+     */
+    long startNaviWithMode(String destination, int strategy, int travelMode);
+
     /** 仅供设备诊断触发模拟导航，目的地解析和路线规划流程与正式导航一致。 */
     long startSimulatedNavi(String destination);
 

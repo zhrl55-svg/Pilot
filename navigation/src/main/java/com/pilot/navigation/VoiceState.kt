@@ -37,6 +37,15 @@ object VoiceState {
      */
     private const val NAV_FILE = "nav_search_state.txt"
 
+    /**
+     * 「导航麦克风刚被点过」的时间窗。
+     *
+     * 只有从导航界面点麦克风发起的识别，才允许自动填进搜索框。
+     * 否则用户在地图界面喊「小派，讲个故事」，会被导航面板当成地名去搜
+     * （日志实测：搜出「甘州故事」「故事集」并播报候选，真正要听的故事被丢掉）。
+     */
+    private const val NAV_VOICE_FILE = "nav_voice_arm.txt"
+
     /** 空闲（没播报也没录音）。 */
     const val IDLE = "idle"
 
@@ -57,7 +66,14 @@ object VoiceState {
         val line = f.readText().trim()
         if (line.isEmpty()) return IDLE
         val parts = line.split('|')
-        parts.firstOrNull()?.takeIf { it.isNotBlank() } ?: IDLE
+        val state = parts.firstOrNull()?.takeIf { it.isNotBlank() } ?: IDLE
+        // ★ 录音状态超过 60 秒一定是僵死的（正常一句话几秒就结束），
+        //   主进程被杀/崩了没来得及写回 IDLE 时，别让麦克风图标一直转。
+        if (state == RECORDING) {
+            val stateTs = parts.getOrNull(3)?.toLongOrNull() ?: 0L
+            if (stateTs > 0L && System.currentTimeMillis() - stateTs > 60_000L) return IDLE
+        }
+        state
     }.getOrDefault(IDLE)
 
     /**
@@ -87,10 +103,11 @@ object VoiceState {
             val keepText = asrText ?: old.getOrNull(1).orEmpty()
             val keepTs = if (asrText != null) System.currentTimeMillis()
             else old.getOrNull(2)?.toLongOrNull() ?: 0L
+            val stateTs = System.currentTimeMillis()
             val tmp = File(f.parentFile, "$FILE.tmp")
-            tmp.writeText("$state|$keepText|$keepTs")
+            tmp.writeText("$state|$keepText|$keepTs|$stateTs")
             if (!tmp.renameTo(f)) {
-                f.writeText("$state|$keepText|$keepTs")
+                f.writeText("$state|$keepText|$keepTs|$stateTs")
                 tmp.delete()
             }
         }.onFailure { NLog.w(TAG, "写语音状态失败 ${it.message}") }
@@ -127,4 +144,30 @@ object VoiceState {
             }
         }.getOrDefault(0)
     }
+
+    // ---------------------------------------------------- 导航语音搜索闸门
+
+    /** 导航界面点了麦克风：接下来 30 秒内的识别结果才允许填搜索框。 */
+    fun armNavVoice(context: Context) {
+        runCatching {
+            File(context.filesDir, NAV_VOICE_FILE)
+                .writeText((System.currentTimeMillis() + 30_000L).toString())
+        }.onFailure { NLog.w(TAG, "写导航语音闸门失败 ${it.message}") }
+    }
+
+    /** 本次导航语音已消费（填过搜索词/选过候选）→ 立刻关闸，避免下一句正常对话被吞。 */
+    fun disarmNavVoice(context: Context) {
+        runCatching { File(context.filesDir, NAV_VOICE_FILE).delete() }
+    }
+
+    /** 当前是否处在「导航麦克风」发起的识别窗口内。 */
+    fun isNavVoiceArmed(context: Context): Boolean = runCatching {
+        val f = File(context.filesDir, NAV_VOICE_FILE)
+        if (!f.isFile) {
+            false
+        } else {
+            val until = f.readText().trim().toLongOrNull() ?: 0L
+            System.currentTimeMillis() <= until
+        }
+    }.getOrDefault(false)
 }

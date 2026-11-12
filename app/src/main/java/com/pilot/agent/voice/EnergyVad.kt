@@ -26,6 +26,10 @@ class EnergyVad(
     private val segment = ArrayList<Short>()
     private var inSpeech = false
 
+    /** 当前是否正处在一句话中间（监听超时兜底用）。 */
+    @get:Synchronized
+    val isInSpeech: Boolean get() = inSpeech
+
     @Synchronized
     fun reset() {
         voicedFrames = 0

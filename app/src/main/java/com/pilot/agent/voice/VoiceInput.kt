@@ -208,8 +208,35 @@ class VoiceInput(
         vad?.reset()
         mode = Mode.LISTEN
         emitState(State.LISTENING)
+        armListenWatchdog()
         // 通知导航界面「正在录音」（麦克风图标动起来）
         runCatching { VoiceState.write(context, VoiceState.RECORDING) }
+    }
+
+    /**
+     * 「正在听」超时兜底。
+     *
+     * 点按钮进入 LISTEN 后，如果麦克风一直被放音闸门挡住（TTS 还在播）、
+     * 或者 AudioRecord 悄悄挂了，VAD 永远切不出一句话，mode 就会一直停在
+     * LISTEN——界面表现为麦克风/悬浮球一直「正在聆听」，再说也没反应。
+     * 20 秒还没有结果就强制收状态。
+     */
+    private val listenWatchdog: Runnable = Runnable {
+        if (mode != Mode.LISTEN) return@Runnable
+        // 声纹注册有自己的超时（enrollWatchdog），别抢它的会话
+        if (enrolling) return@Runnable
+        if (busy.get() || vad?.isInSpeech == true) {
+            main.postDelayed(listenWatchdog, 5_000L)
+            return@Runnable
+        }
+        Dbg.w(TAG, "聆听超时（${LISTEN_TIMEOUT_MS}ms）没识别到一句话，自动回待命")
+        runCatching { VoiceState.write(context, VoiceState.IDLE) }
+        backToIdleOrWake()
+    }
+
+    private fun armListenWatchdog() {
+        main.removeCallbacks(listenWatchdog)
+        main.postDelayed(listenWatchdog, LISTEN_TIMEOUT_MS)
     }
 
     /**
@@ -238,6 +265,7 @@ class VoiceInput(
 
     fun stop() {
         main.removeCallbacks(sleepTick)
+        main.removeCallbacks(listenWatchdog)
         activeUntil = 0L
         // A recognition worker may still be finishing. Do not let its finally block
         // restore WAKE after the user explicitly stopped standby.
@@ -284,7 +312,23 @@ class VoiceInput(
         vad = v
         val c = AudioCapture(
             onFrame = { frame, len -> onFrame(frame, len) },
-            onError = { msg -> main.post { onError(msg) } },
+            onError = { msg ->
+                main.post {
+                    onError(msg)
+                    // ★ 采集挂了还停在 LISTEN/ACTIVE 的话，界面会永远「正在聆听」，
+                    //   而且之后说话也不会有反应。直接关掉，下次点按钮重新建 AudioRecord。
+                    if (mode == Mode.LISTEN || mode == Mode.ACTIVE) {
+                        Dbg.w(TAG, "采集出错，回收语音状态：$msg")
+                        mode = Mode.OFF
+                        main.removeCallbacks(listenWatchdog)
+                        capture?.stop()
+                        capture = null
+                        vad = null
+                        emitState(State.IDLE)
+                        runCatching { VoiceState.write(context, VoiceState.IDLE) }
+                    }
+                }
+            },
         )
         capture = c
         if (!c.start()) {
@@ -643,6 +687,7 @@ class VoiceInput(
         }
         if (!busy.compareAndSet(false, true)) return
         main.removeCallbacks(finishGuard)
+        main.removeCallbacks(listenWatchdog)
         emitState(State.RECOGNIZING)
         worker.execute {
             try {
@@ -729,6 +774,9 @@ class VoiceInput(
     }
 
     private fun backToIdleOrWake() {
+        main.removeCallbacks(listenWatchdog)
+        // 任何收尾路径都要把「正在录音」清掉，否则导航麦克风图标会一直转
+        runCatching { VoiceState.write(context, VoiceState.IDLE) }
         // A recognition worker can finish after the main thread has already
         // switched to do-not-disturb. Never publish ACTIVE/WAKE_WAIT over DND.
         if (dndRequested) {
@@ -817,6 +865,9 @@ class VoiceInput(
 
         /** 普通指令的断句静音阈值 */
         const val NORMAL_SILENCE_MS = 800
+
+        /** 点按钮后最长等多久还切不出一句（防止永远停在「正在聆听」）。 */
+        const val LISTEN_TIMEOUT_MS = 20_000L
 
         /** 声纹注册的断句静音阈值（口令里有逗号停顿，要切得慢） */
         const val ENROLL_SILENCE_MS = 2500

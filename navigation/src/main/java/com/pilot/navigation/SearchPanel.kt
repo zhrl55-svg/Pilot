@@ -118,17 +118,18 @@ class SearchPanel(
         // ---- 输入框（灰色系）----
         val box = EditText(activity).apply {
             hint = "搜地点"
-            setHintTextColor(Color.parseColor("#9E9E9E"))
+            // 底色和右侧圆形按钮统一（灰色半透明），文字用深色保证可读
+            setHintTextColor(Color.parseColor("#4F4F4F"))
             setTextColor(Color.parseColor("#212121"))
             textSize = 15f
             setSingleLine(true)
             imeOptions = EditorInfo.IME_ACTION_SEARCH
             setPadding(dp(14), dp(10), dp(42), dp(10))
-            // 80% 透明白底，保留深色文字与描边确保地图上仍可读。
+            // 底色统一用 NavColors.FLOATING_BTN（和右侧圆形按钮同一份配色）。
             background = GradientDrawable().apply {
-                setColor(Color.parseColor("#33FFFFFF"))
+                setColor(NavColors.FLOATING_BTN)
                 cornerRadius = dp(10).toFloat()
-                setStroke(dp(1), Color.parseColor("#BDBDBD"))
+                setStroke(dp(1), Color.parseColor("#66FFFFFF"))
             }
             // 打字停下就搜
             addTextChangedListener(object : TextWatcher {
@@ -484,12 +485,23 @@ class SearchPanel(
             resultBox?.removeAllViews()
             resultScroll?.visibility = View.GONE
             input?.setText("")
+            runCatching { VoiceState.disarmNavVoice(activity) }
             if (active) onEndNavi()
             return
         }
 
         // 先看是不是「第 N 个」（选候选）
-        if (handleVoicePick(text)) return
+        if (handleVoicePick(text)) {
+            runCatching { VoiceState.disarmNavVoice(activity) }
+            return
+        }
+
+        // ★ 只有「点导航麦克风」发起的识别才当地名。
+        //   否则地图界面喊「小派，讲个故事」会被拿去搜 POI（实测踩过）。
+        if (!VoiceState.isNavVoiceArmed(activity)) {
+            NLog.i(TAG, "语音不是导航麦克风发起，忽略填词：$text")
+            return
+        }
 
         // 「导航去张掖西站」这类整句要截成地名，不能整句塞进搜索框
         val query = poiQueryFromVoice(text)
@@ -502,6 +514,7 @@ class SearchPanel(
 
         // 否则当作地点填进输入框
         NLog.i(TAG, "语音填入：$text → $query")
+        runCatching { VoiceState.disarmNavVoice(activity) }
         input?.setText(query)
         input?.setSelection(query.length)
     }

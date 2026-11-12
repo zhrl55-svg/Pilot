@@ -104,6 +104,12 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
     /** 转弯提示框下方的搜索面板。 */
     private var searchPanel: SearchPanel? = null
 
+    /** 导航中（搜索框收起时）在转向提示下方显示目的地。 */
+    private var destinationLabel: TextView? = null
+
+    /** 上一次画过的目的地，目的地变了要立刻刷新标签。 */
+    private var lastDestText: String? = null
+
     /** 高德退出导航时会紧接着发 onAMapNaviViewExit；等用户确认前不能 finish Activity。 */
     @Volatile private var exitConfirmationPending = false
 
@@ -134,6 +140,10 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
     /** 上一次看到的导航状态（用来在开始/结束导航时切换搜索面板）。 */
     private var lastNavState: NavigationService.State? = null
 
+    /** 当前选择的出行方式（驾车 / 步行）。 */
+    private var travelMode: TravelMode = TravelMode.DRIVE
+    private var modeToggleButton: Button? = null
+
     /** 导航状态轮询（搜索框只在没有路线时显示）。 */
     private val navStateHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private val navStateTick = object : Runnable {
@@ -148,6 +158,7 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
         NLog.attach(filesDir)
         current = this
         NLog.i(TAG, "NavActivity onCreate")
+        travelMode = TravelMode.fromValue(NavigationSettings.load(this).travelMode)
 
         // ★ 保证 NavigationService 在跑。
         //   从主界面「导航」进来时，主进程可能还没 bind 过导航服务，
@@ -224,6 +235,32 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
         // ★ 转弯提示框下方的搜索面板（老板要求）
         //   语音识别到地址会自动填进来，也可以手打；
         //   停下 600ms 自动搜，列 5 条候选，说「第2个」或点一下就开始导航。
+        // ★ 导航中搜索框收起后，同一位置换成「目的地」标签
+        val destLabel = TextView(this).apply {
+            setTextColor(Color.parseColor("#1A2B3C"))
+            textSize = 13f
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setPadding(dp(14), dp(7), dp(14), dp(7))
+            maxWidth = resources.displayMetrics.widthPixels - dp(120)
+            background = GradientDrawable().apply {
+                // 和搜索框、右侧圆形按钮同一份底色
+                setColor(NavColors.FLOATING_BTN)
+                cornerRadius = dp(12).toFloat()
+                setStroke(dp(1), Color.parseColor("#66FFFFFF"))
+            }
+            visibility = View.GONE
+            contentDescription = "导航目的地"
+        }
+        destinationLabel = destLabel
+        root.addView(destLabel, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            topMargin = dp(158)
+        })
+
         runCatching {
             val panel = SearchPanel(
                 activity = this,
@@ -433,14 +470,17 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
      */
     private fun syncSearchPanelWithNavState(force: Boolean = false) {
         val state = NavigationService.peek()?.currentState ?: return
-        if (!force && state == lastNavState) return
+        val dest = NavigationService.peek()?.currentDestination?.trim().orEmpty()
+        if (!force && state == lastNavState && dest == lastDestText) return
         lastNavState = state
+        lastDestText = dest
         // 开始导航时 SDK 会重建渲染层，顺手把日夜样式再套一次
         applyDayNightMode(force = true)
         val show = state == NavigationService.State.IDLE ||
             state == NavigationService.State.FAILED ||
             state == NavigationService.State.ARRIVED
         searchPanel?.setVisible(show)
+        updateDestinationLabel(panelVisible = show)
         // 空闲时显示自己的蓝色箭头；导航中隐藏，用高德车标
         locationMarker?.setVisible(show)
         if (show) {
@@ -451,17 +491,60 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
         NLog.i(TAG, "导航状态 $state → 搜索框${if (show) "显示" else "隐藏"}")
     }
 
-    // ------------------------------------------------------------ Pilot 按钮栏
+    // ------------------------------------------------------------ 出行方式切换
 
     /**
-     * Pilot 自定义按钮栏（浮在高德 UI 上方，避开底部导航信息区）。
+     * 「驾车 / 步行」切换按钮（圆形，和其它按钮同款）。
      *
-     * 五个按钮：
-     * - **语音**：回到主界面开语音识别（开车时手不能离开方向盘，语音是主交互）
-     * - **路线 / 历史**：切换候选路线、查看历史
-     * - **主页**：回到 Pilot 主界面（导航继续在后台跑）
-     * - **收起**：退到后台（导航继续跑），不关闭 App
+     * 图标表示当前模式：🚗 驾车 / 🚶 步行；点一下切到另一种模式。
+     * 图标用不同颜色区分当前模式，底色和圆角跟其它圆形按钮完全一致。
      */
+    private fun buildModeButton(): Button {
+        val button = roundButton("🚗") { toggleTravelMode() }
+        modeToggleButton = button
+        applyTravelModeStyle()
+        return button
+    }
+
+    private fun toggleTravelMode() {
+        selectTravelMode(
+            if (travelMode == TravelMode.DRIVE) TravelMode.WALK else TravelMode.DRIVE,
+        )
+    }
+
+    private fun selectTravelMode(mode: TravelMode) {
+        if (travelMode == mode) return
+        travelMode = mode
+        val cur = NavigationSettings.load(this)
+        NavigationSettings.save(this, cur.copy(travelMode = mode.value))
+        applyTravelModeStyle()
+        NLog.i(TAG, "出行方式切换为 ${mode.label}")
+
+        val svc = NavigationService.peek()
+        val dest = svc?.currentDestination?.trim().orEmpty()
+        val active = svc?.currentState in
+            setOf(NavigationService.State.ROUTING, NavigationService.State.NAVIGATING)
+        if (active && dest.isNotEmpty()) {
+            toast("正在按${mode.label}重新规划路线")
+            startNaviWithRetry(dest, attempt = 0, travelMode = mode)
+        } else {
+            toast("已选择${mode.label}导航")
+        }
+    }
+
+    private fun applyTravelModeStyle() {
+        val b = modeToggleButton ?: return
+        val walk = travelMode == TravelMode.WALK
+        b.text = if (walk) "🚶" else "🚗"
+        b.contentDescription = "当前${travelMode.label}，点击切换"
+        // 底色统一（灰色半透明），只用图标颜色区分当前模式
+        b.setTextColor(
+            if (walk) Color.parseColor("#2E9E63") else Color.parseColor("#2F7BFF"),
+        )
+    }
+
+    // ------------------------------------------------------------ Pilot 按钮栏
+
     /**
      * Pilot 自定义按钮。
      *
@@ -472,9 +555,10 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
      * - 右侧：路况条 + 全览按钮
      * - 底部：「退出 / 剩余距离时间 / 设置」三栏
      *
-     * 所以我们的按钮只能放在**中间偏下的空白区**：
-     * - 语音按钮：**左下**（单手拇指最容易够到，开车时盲按也不容易错）
-     * - 主页 / 收起：**右侧竖排**（低频操作，放边上）
+     * 所以我们的按钮只放在**两侧竖排**（老板要求）：
+     * - 左侧：导航模式（驾车/步行）、语音
+     * - 右侧：路线选择、导航历史、返回桌面
+     * - 全部是同款圆形按钮（灰色半透明底 + 圆边框）
      */
     private fun buildPilotBar(): View {
         val wrap = FrameLayout(this).apply {
@@ -485,18 +569,31 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
             isClickable = false
         }
 
-        // ★ 右侧竖排四个按钮（老板要求：语音移到最上，四个统一底色和圆边框）
-        //   顺序：语音 / 路线 / 历史 / 主页 / 收起
-        //   全部用同一个 FLOATING_BTN 底色 + 同一个圆角，视觉是一组。
+        // ★ 左侧竖排：导航模式 / 语音
+        //   语音放左边是因为开车时单手拇指最容易够到（盲按也不容易错）。
+        val left = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+        }
+        left.addView(buildModeButton())
+        left.addView(buildVoiceButton())
+
+        wrap.addView(left, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+        ).apply {
+            gravity = Gravity.CENTER_VERTICAL or Gravity.START
+            leftMargin = dp(8)
+        })
+
+        // ★ 右侧竖排：路线选择 / 导航历史 / 返回桌面
         val side = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
         }
-        side.addView(buildVoiceButton())
         side.addView(roundButton("🛣") { showRouteChoices() })
         side.addView(roundButton("🕘") { showHistoryDialog() })
         side.addView(roundButton("🏠") { onHomeButton() })
-        side.addView(roundButton("✕") { onMinimizeApp() })
 
         wrap.addView(side, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT,
@@ -555,6 +652,27 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
         }
     }
 
+    /**
+     * 导航中（搜索框收起）在转向提示下方显示「目的地 · XX」。
+     *
+     * 高德原生界面只显示剩余里程/时间，不显示终点名；
+     * 用户中途改目的地或从主界面语音发起时，这里也能立刻看到要去哪。
+     */
+    private fun updateDestinationLabel(panelVisible: Boolean) {
+        val label = destinationLabel ?: return
+        val svc = NavigationService.peek()
+        val state = svc?.currentState
+        val active = state == NavigationService.State.ROUTING ||
+            state == NavigationService.State.NAVIGATING
+        val dest = svc?.currentDestination?.trim().orEmpty()
+        if (active && !panelVisible && dest.isNotEmpty()) {
+            label.text = "目的地 · $dest"
+            label.visibility = View.VISIBLE
+        } else {
+            label.visibility = View.GONE
+        }
+    }
+
     /** 导航界面上的悬浮按钮（深底浅字）。 */
     /**
      * 悬浮按钮（灰色 + 高透明）。
@@ -597,12 +715,10 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
     private fun buildVoiceButton(): Button {
         // 用统一的 roundButton，保证和另外三个长得一样
         val btn = roundButton("🎤") { onVoiceButton() }
-        // 呼吸/跳动动画：只改 scale，不动 layout（避免触发重新布局）
-        voiceAnim = android.animation.ObjectAnimator.ofFloat(btn, "scaleX", 1f, 1.18f).apply {
-            duration = 600
-            repeatMode = android.animation.ValueAnimator.REVERSE
-            repeatCount = android.animation.ValueAnimator.INFINITE
-        }
+        // 动态效果：按钮外框彩色转圈（录音蓝紫 / 播报橙粉）
+        val ring = VoiceRingDrawable(resources.displayMetrics.density)
+        btn.foreground = ring
+        voiceRing = ring
         voiceBtn = btn
         startVoiceStatePolling()
         return btn
@@ -610,7 +726,7 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
 
     /** 语音按钮 + 动画（状态轮询里用）。 */
     private var voiceBtn: Button? = null
-    private var voiceAnim: android.animation.ObjectAnimator? = null
+    private var voiceRing: VoiceRingDrawable? = null
     private var lastVoiceState: String = ""
 
     /**
@@ -642,17 +758,17 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
         when (state) {
             VoiceState.SPEAKING -> {
                 btn.text = "🔈"
-                voiceAnim?.start()
+                voiceRing?.setSpeaking(true)
+                voiceRing?.start()
             }
             VoiceState.RECORDING -> {
                 btn.text = "🎤"
-                voiceAnim?.start()
+                voiceRing?.setSpeaking(false)
+                voiceRing?.start()
             }
             else -> {
                 btn.text = "🎤"
-                voiceAnim?.cancel()
-                btn.scaleX = 1f
-                btn.scaleY = 1f   // 恢复原大小，动画只动 scaleX
+                voiceRing?.stop()
             }
         }
         NLog.i(TAG, "语音按钮状态：$state")
@@ -671,16 +787,25 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
      *   直接调就是静默失败——**老板报的「选定后没有规划路线」就是这个**。
      *   重试 3 次、每次 300ms，覆盖服务冷启动。
      */
-    private fun startNaviWithRetry(destination: String, attempt: Int, simulated: Boolean = false) {
+    private fun startNaviWithRetry(
+        destination: String,
+        attempt: Int,
+        simulated: Boolean = false,
+        travelMode: TravelMode = this.travelMode,
+    ) {
         // 一开始规划路线就把搜索框收起，别挡住转向提示
         searchPanel?.setVisible(false)
         val svc = NavigationService.peek()
         if (svc != null) {
             val jobId = runCatching {
                 if (simulated) svc.startSimulatedNaviFromOuter(destination)
-                else svc.startNaviFromOuter(destination, 0)
+                else svc.startNaviFromOuter(destination, 0, travelMode)
             }.getOrDefault(0L)
-            NLog.i(TAG, "发起${if (simulated) "模拟" else "真实"}导航「$destination」jobId=$jobId（第 ${attempt + 1} 次尝试）")
+            NLog.i(
+                TAG,
+                "发起${if (simulated) "模拟" else travelMode.label}导航「$destination」" +
+                    "jobId=$jobId（第 ${attempt + 1} 次尝试）",
+            )
             if (jobId != 0L) {
                 toast("正在规划去$destination 的路线")
                 return
@@ -690,7 +815,7 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
         }
         if (attempt < 3) {
             window.decorView.postDelayed({
-                startNaviWithRetry(destination, attempt + 1, simulated)
+                startNaviWithRetry(destination, attempt + 1, simulated, travelMode)
             }, 300)
         } else {
             NLog.e(TAG, "发起导航失败：服务一直没就绪")
@@ -734,7 +859,13 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
         // 导航中搜索框默认收起；点语音时临时叫出来，方便看识别结果和候选
         val active = NavigationService.peek()?.currentState in
             setOf(NavigationService.State.ROUTING, NavigationService.State.NAVIGATING)
-        if (active) searchPanel?.setVisible(true)
+        if (active) {
+            searchPanel?.setVisible(true)
+            // 搜索框出来了，目的地标签让位
+            destinationLabel?.visibility = View.GONE
+        }
+        // 只有这次「导航麦克风」发起的识别才允许填进搜索框
+        runCatching { VoiceState.armNavVoice(this) }
         runCatching { AgentBridge.startVoice(this) }
         toast("请说地点名，或说「第几个」")
     }
@@ -749,15 +880,6 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
             }
             startActivity(i)
         }.onFailure { NLog.w(TAG, "回桌面失败 ${it.message}") }
-    }
-
-    /** 收起 App：退到后台，导航继续跑（老板要求 ✕ 不再是「杀进程」）。 */
-    private fun onMinimizeApp() {
-        NLog.i(TAG, "点击 ✕ → 退到后台（导航继续）")
-        // 不调 requestStop：用户只是想把界面收起来，
-        // 后台服务还在导航，转向播报不能断。
-        runCatching { moveTaskToBack(true) }
-            .onFailure { NLog.w(TAG, "退到后台失败 ${it.message}") }
     }
 
     // ------------------------------------------------------------ 高德界面回调
@@ -1228,7 +1350,7 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
                     .setTitle(f.label)
                     .setItems(arrayOf("改名字", "导航去这里")) { _, which ->
                         if (which == 0) renameFavorite(f, container)
-                        else NavigationService.peek()?.startNaviFromOuter(f.label, 0)
+                        else NavigationService.peek()?.startNaviFromOuter(f.label, 0, travelMode)
                     }
                     .show()
             }
@@ -1320,7 +1442,7 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
             return
         }
         // 复用 startNavi（会重新走 POI 搜索，保证拿到最新路况）
-        svc.startNaviFromOuter(h.alias.ifBlank { h.name }, 0)
+        svc.startNaviFromOuter(h.alias.ifBlank { h.name }, 0, travelMode)
     }
 
     /**
@@ -1655,6 +1777,7 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
     override fun onDestroy() {
         dayNightHandler.removeCallbacks(dayNightTick)
         navStateHandler.removeCallbacks(navStateTick)
+        runCatching { voiceRing?.stop() }
         runCatching { locationMarker?.remove() }
         locationMarker = null
         runCatching { naviView?.onDestroy() }

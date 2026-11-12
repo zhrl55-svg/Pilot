@@ -181,6 +181,8 @@ class AmapNaviEngine(
         startLon: Double = 0.0,
         /** POI ID（有就用 NaviPoi 重载，SDK 会找正确入口）。 */
         poiId: String? = null,
+        /** 驾车或步行。步行走 SDK 的 calculateWalkRoute。 */
+        travelMode: TravelMode = TravelMode.DRIVE,
         /** 按导航设置应用拥堵偏好。 */
         avoidCongestion: Boolean = true,
         /** 显式测试模式：使用 SDK 模拟定位推进路线。 */
@@ -221,37 +223,71 @@ class AmapNaviEngine(
             STRATEGY_AVOID_JAM -> n.strategyConvert(true, false, false, false, true)
             else -> n.strategyConvert(avoidCongestion, false, false, false, true)
         }
-        // ★ 算路**之前**设车辆信息（nav-agent 同款）：
-        //   官方文档说 setCarInfo 影响「路径规划时会躲避车辆限行区域和路线」，
-        //   所以必须在 calculateDriveRoute 之前生效，不能只在 init 里设一次。
-        //   不设的话算路可能直接失败（errorCode=3）。
-        applyCarInfo(n)
-        runCatching {
-            // ★ 有 POI ID 就用 **NaviPoi 重载**——这是解决 errorCode=6
-            //   （ERROR_ENDPOINT 终点错误）的关键。
-            //
-            //   原因：「张掖西站停车场」这类 POI 的经纬度是**停车场中心**，
-            //   不在可通行道路上，SDK 拿纯坐标算路会报终点错误。
-            //   传 POI ID 后 SDK 会查 POI 的**道路入口坐标**再算路。
-            val ok = if (poiId.isNullOrBlank()) {
-                // 没 POI ID：退回 String 重载（服务端会做纠偏）
-                n.calculateDriveRoute(
-                    "${round6(startLon)},${round6(startLat)}",
-                    "${round6(lon)},${round6(lat)}",
-                    null, pathStrategy,
+        if (travelMode == TravelMode.DRIVE) {
+            // 从步行切回驾车时，清掉上一次设置的步行出行信息。
+            runCatching {
+                n.setTravelInfo(
+                    com.amap.api.navi.model.AMapTravelInfo(
+                        com.amap.api.navi.enums.TransportType.Drive,
+                    ),
                 )
-            } else {
+            }
+            // ★ 算路**之前**设车辆信息（nav-agent 同款）：
+            //   官方文档说 setCarInfo 影响「路径规划时会躲避车辆限行区域和路线」，
+            //   所以必须在 calculateDriveRoute 之前生效，不能只在 init 里设一次。
+            //   不设的话算路可能直接失败（errorCode=3）。
+            applyCarInfo(n)
+        }
+        runCatching {
+            val ok = if (travelMode == TravelMode.WALK) {
+                runCatching {
+                    n.setTravelInfo(
+                        com.amap.api.navi.model.AMapTravelInfo(
+                            com.amap.api.navi.enums.TransportType.Walk,
+                        ),
+                    )
+                }
                 val startPoi = com.amap.api.navi.model.NaviPoi(
                     "", com.amap.api.maps.model.LatLng(round6(startLat), round6(startLon)), "起点",
                 )
                 val endPoi = com.amap.api.navi.model.NaviPoi(
-                    poiId, com.amap.api.maps.model.LatLng(round6(lat), round6(lon)), name,
+                    poiId.orEmpty(),
+                    com.amap.api.maps.model.LatLng(round6(lat), round6(lon)),
+                    name,
                 )
-                n.calculateDriveRoute(startPoi, endPoi, null, pathStrategy)
+                n.calculateWalkRoute(
+                    startPoi,
+                    endPoi,
+                    com.amap.api.navi.enums.TravelStrategy.SINGLE,
+                )
+            } else {
+                // ★ 有 POI ID 就用 **NaviPoi 重载**——这是解决 errorCode=6
+                //   （ERROR_ENDPOINT 终点错误）的关键。
+                //
+                //   原因：「张掖西站停车场」这类 POI 的经纬度是**停车场中心**，
+                //   不在可通行道路上，SDK 拿纯坐标算路会报终点错误。
+                //   传 POI ID 后 SDK 会查 POI 的**道路入口坐标**再算路。
+                if (poiId.isNullOrBlank()) {
+                    // 没 POI ID：退回 String 重载（服务端会做纠偏）
+                    n.calculateDriveRoute(
+                        "${round6(startLon)},${round6(startLat)}",
+                        "${round6(lon)},${round6(lat)}",
+                        null, pathStrategy,
+                    )
+                } else {
+                    val startPoi = com.amap.api.navi.model.NaviPoi(
+                        "", com.amap.api.maps.model.LatLng(round6(startLat), round6(startLon)), "起点",
+                    )
+                    val endPoi = com.amap.api.navi.model.NaviPoi(
+                        poiId, com.amap.api.maps.model.LatLng(round6(lat), round6(lon)), name,
+                    )
+                    n.calculateDriveRoute(startPoi, endPoi, null, pathStrategy)
+                }
             }
             NLog.i(
                 TAG,
-                "算路 起点($startLat,$startLon) → $name($lat,$lon) poiId=${poiId?.take(12)} simulated=$simulated ok=$ok",
+                "算路 mode=${travelMode.name} 起点($startLat,$startLon) → $name($lat,$lon) " +
+                    "poiId=${poiId?.take(12)} simulated=$simulated ok=$ok",
             )
             if (!ok) {
                 routePending = false
@@ -259,7 +295,7 @@ class AmapNaviEngine(
                 routeLatch?.countDown()
                 NLog.w(TAG, "SDK 未接受算路请求（同步返回 false）")
             }
-            onStateChange("正在规划去${name}的路线")
+            onStateChange("正在规划去${name}的${travelMode.label}路线")
         }.onFailure {
             NLog.e(TAG, "算路失败", it)
             onStateChange("算路失败：${it.message}")

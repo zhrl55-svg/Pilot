@@ -72,7 +72,7 @@ class RouteGuide(
     // ------------------------------------------------------------ 对外
 
     /** 设置路线并播报起步提示。 */
-    fun start(r: WebRoutePlanner.Route) {
+    fun start(r: WebRoutePlanner.Route, walking: Boolean = false) {
         route = r
         buildIndex(r)
         announcedStep = -1
@@ -83,9 +83,14 @@ class RouteGuide(
         lastLon = 0.0
         currentTravelled = 0.0
 
-        val km = (r.totalDistance / 1000.0).toInt()
+        val distanceText = if (r.totalDistance < 1000) {
+            "${r.totalDistance} 米"
+        } else {
+            "%.1f 公里".format(r.totalDistance / 1000.0)
+        }
         val minutes = (r.totalDuration / 60.0).toInt().coerceAtLeast(1)
-        onAnnounce("开始导航，全程 $km 公里，大约 $minutes 分钟", PRIORITY_NAV)
+        val modeText = if (walking) "步行导航" else "导航"
+        onAnnounce("开始$modeText，全程 $distanceText，大约 $minutes 分钟", PRIORITY_NAV)
         // 第一步的指令立刻播
         r.steps.firstOrNull()?.let {
             announcedStep = 0

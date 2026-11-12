@@ -54,6 +54,9 @@ class TriggerActivity : Activity() {
             //   点击导航界面的麦克风会静默失败（表现为「没录音」）。
             //   ensureVoiceInput 会创建单例；识别结果仍写 VoiceState 给导航搜索框。
             runCatching {
+                // ★ 点麦克风 = 用户要说话：先把 TTS 停掉，否则放音闸门会把
+                //   这几秒麦克风全静音，用户说完什么也没录到（表现为「聆听」不动）。
+                com.pilot.agent.runtime.AgentRuntime.speaker.stop()
                 com.pilot.agent.runtime.AgentRuntime.ensureVoiceInput().startListening()
             }.onFailure { Dbg.e(TAG, "开始语音识别失败", it) }
             return

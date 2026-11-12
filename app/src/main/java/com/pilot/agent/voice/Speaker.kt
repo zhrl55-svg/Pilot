@@ -73,6 +73,14 @@ class Speaker(context: Context) {
     /** 排队等播的导航提示。 */
     private val navQueue = ArrayDeque<String>()
 
+    /**
+     * 导航播报期间到达的普通播报（比如用户问「讲个故事」的回答）。
+     *
+     * 原来是直接丢弃——用户问完问题却一声不吭，看起来像没反应。
+     * 现在只保留最新一条，等导航播报结束立刻补上；再多就只说最后一句。
+     */
+    private var pendingNormal: String? = null
+
     /** 一条导航播报播完了：播队列里的下一条，或解锁。 */
     private fun onNavSpoken() {
         val next: String?
@@ -83,6 +91,15 @@ class Speaker(context: Context) {
         if (next != null) {
             Dbg.i(TAG, "导航播报出队：$next")
             speakInternal(next, isNav = true)
+        } else {
+            // 导航说完了，把刚才被挡下的普通播报补上
+            val pending = synchronized(navLock) {
+                pendingNormal.also { pendingNormal = null }
+            }
+            if (!pending.isNullOrBlank()) {
+                Dbg.i(TAG, "导航播报结束，补播排队的普通播报")
+                speakInternal(pending, isNav = false)
+            }
         }
     }
 
@@ -138,7 +155,8 @@ class Speaker(context: Context) {
         //   导航提示短且说完就没机会补（车已经过路口了），
         //   普通播报（「已帮你打开设置」）晚点说完全无所谓。
         if (!isNav && navSpeaking) {
-            Dbg.i(TAG, "导航播报中，丢弃普通播报：$t")
+            synchronized(navLock) { pendingNormal = t }
+            Dbg.i(TAG, "导航播报中，普通播报排队：$t")
             return
         }
 
@@ -277,6 +295,7 @@ class Speaker(context: Context) {
         system?.stop()
         minimax?.stop()
         isSpeaking = false
+        synchronized(navLock) { pendingNormal = null }
         runCatching { VoiceState.write(appContext, VoiceState.IDLE) }
     }
 
