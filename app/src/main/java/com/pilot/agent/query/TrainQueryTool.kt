@@ -128,6 +128,7 @@ class TrainQueryTool : QueryTool {
             val queryResult = queryTickets(parsed, originStations, destinationStations)
             val trains = queryResult.trains
                 .filter { it.matchesFilter(parsed.filter) }
+                .filter { train -> parsed.timeRange?.contains(train.startTime) ?: true }
                 .filter { !parsed.availableOnly || it.hasAvailability }
                 .let { list ->
                     when (parsed.sort) {
@@ -146,13 +147,14 @@ class TrainQueryTool : QueryTool {
                         .append(parsed.toDisplay).append("，").append(parsed.date).append('\n')
                     append("没有查到符合条件的车次")
                     if (parsed.filter != Filter.NONE) append("（已按").append(parsed.filter.label).append("筛选）")
+                    parsed.timeRange?.let { append("（出发时间 ").append(it.label).append("）") }
                     append("。日期或筛选条件不对时可以换个条件再查。\n")
                     append("来源：中国铁路 12306；查询时间：").append(queryTime())
                 }
             }
 
             synchronized(stateLock) { pending = null }
-            formatTrains(parsed, trains, queryResult.totalBeforePageLimit)
+            formatTrains(parsed, trains, trains.size)
         } catch (failure: TrainQueryFailure) {
             Dbg.w(TAG, "12306 查询失败：${failure.reason}")
             "12306 暂时没查成：${failure.message}。查询条件已保留，可以回复“重试”。"
@@ -167,6 +169,7 @@ class TrainQueryTool : QueryTool {
         val date = parseDate(text) ?: previous?.date.orEmpty()
         val filter = parseFilter(text).takeUnless { it == Filter.NONE } ?: previous?.filter ?: Filter.NONE
         val sort = parseSort(text) ?: previous?.sort ?: SortMode.EARLIEST
+        val timeRange = parseTimeRange(text) ?: previous?.timeRange
         val availableOnly = when {
             text.contains("有票") || text.contains("能买到") || text.contains("可售") -> true
             previous?.availableOnly == true -> true
@@ -187,6 +190,7 @@ class TrainQueryTool : QueryTool {
             to = to,
             filter = filter,
             sort = sort,
+            timeRange = timeRange,
             availableOnly = availableOnly,
             fromDisplay = from,
             toDisplay = to,
@@ -206,6 +210,7 @@ class TrainQueryTool : QueryTool {
                 if (request.from.isNotBlank()) add("出发：${request.from}")
                 if (request.to.isNotBlank()) add("到达：${request.to}")
                 if (request.date.isNotBlank()) add("日期：${request.date}")
+                request.timeRange?.let { add("出发时间：${it.label}") }
             }
             append(" ").append(known.joinToString("，")).append("。\n")
         }
@@ -220,12 +225,12 @@ class TrainQueryTool : QueryTool {
     }
 
     private fun parseOriginOnly(text: String): String? {
-        val match = ORIGIN_ONLY_REGEX.find(text) ?: return null
+        val match = ORIGIN_ONLY_REGEX.find(cleanForRoute(text)) ?: return null
         return cleanPlace(match.groupValues[1])
     }
 
     private fun parseDestinationOnly(text: String): String? {
-        val match = DESTINATION_ONLY_REGEX.find(text) ?: return null
+        val match = DESTINATION_ONLY_REGEX.find(cleanForRoute(text)) ?: return null
         return cleanPlace(match.groupValues[1])
     }
 
@@ -234,7 +239,9 @@ class TrainQueryTool : QueryTool {
         QUERY_PREFIXES.forEach { value = value.replace(it, " ") }
         DATE_WORDS.forEach { value = value.replace(it, " ") }
         value = DATE_FORMAT_REGEXES.fold(value) { current, regex -> regex.replace(current, " ") }
+        value = TIME_FILTER_REGEXES.fold(value) { current, regex -> regex.replace(current, " ") }
         value = SEARCH_SUFFIXES.fold(value) { current, suffix -> current.replace(suffix, " ") }
+        QUERY_OPTION_WORDS.forEach { value = value.replace(it, " ") }
         value = value
             .replace(Regex("\\s+"), "")
             .replace(Regex("[，,。.!！?？:：]"), "")
@@ -264,6 +271,50 @@ class TrainQueryTool : QueryTool {
         text.contains("最早") || text.contains("先走") -> SortMode.EARLIEST
         text.contains("最晚") -> SortMode.LATEST
         else -> null
+    }
+
+    private fun parseTimeRange(text: String): TimeRange? {
+        TIME_RANGE_REGEX.find(text)?.let { match ->
+            val firstPeriod = match.groupValues[1]
+            val secondPeriod = match.groupValues[3].ifBlank { firstPeriod }
+            val from = clockMinutes(match.groupValues[2], firstPeriod) ?: return@let
+            val to = clockMinutes(match.groupValues[4], secondPeriod) ?: return@let
+            return TimeRange(from, to)
+        }
+        TIME_AFTER_REGEX.find(text)?.let { match ->
+            val from = clockMinutes(match.groupValues[2], match.groupValues[1]) ?: return@let
+            return TimeRange(from, null)
+        }
+        TIME_BEFORE_REGEX.find(text)?.let { match ->
+            val to = clockMinutes(match.groupValues[2], match.groupValues[1]) ?: return@let
+            return TimeRange(null, to)
+        }
+        return null
+    }
+
+    private fun clockMinutes(raw: String, period: String): Int? {
+        val value = raw
+            .replace("：", ":")
+            .removeSuffix("分")
+            .removeSuffix("点")
+            .removeSuffix("时")
+        val hourText = value.substringBefore(':').trim()
+        val minuteText = if (value.contains(':')) value.substringAfter(':').trim() else ""
+        var hour = chineseNumber(hourText) ?: return null
+        val minute = when (minuteText) {
+            "", "整" -> 0
+            "半" -> 30
+            "一刻" -> 15
+            "三刻" -> 45
+            else -> chineseNumber(minuteText) ?: return null
+        }
+        hour = when (period) {
+            "凌晨", "早上", "早晨", "上午" -> if (hour == 12) 0 else hour
+            "中午", "下午", "傍晚", "晚上", "夜里" -> if (hour < 12) hour + 12 else hour
+            else -> hour
+        }
+        if (hour !in 0..23 || minute !in 0..59) return null
+        return hour * 60 + minute
     }
 
     private fun parseDate(raw: String): String? {
@@ -517,6 +568,7 @@ class TrainQueryTool : QueryTool {
             .append("，").append(request.date).append('\n')
         append("查询时间：").append(queryTime())
         if (request.filter != Filter.NONE) append("；筛选：").append(request.filter.label)
+        request.timeRange?.let { append("；出发时间：").append(it.label) }
         append("；查到 ").append(total).append(" 趟")
         append('\n')
         trains.take(MAX_RESULTS).forEachIndexed { index, train ->
@@ -599,10 +651,40 @@ class TrainQueryTool : QueryTool {
         val to: String,
         val filter: Filter,
         val sort: SortMode,
+        val timeRange: TimeRange?,
         val availableOnly: Boolean,
         val fromDisplay: String,
         val toDisplay: String,
     )
+
+    private data class TimeRange(val fromMinutes: Int?, val toMinutes: Int?) {
+        fun contains(rawTime: String): Boolean {
+            val parts = rawTime.split(':')
+            val hour = parts.getOrNull(0)?.toIntOrNull() ?: return false
+            val minute = parts.getOrNull(1)?.toIntOrNull() ?: return false
+            val value = hour * 60 + minute
+            val start = fromMinutes
+            val end = toMinutes
+            return when {
+                start == null && end == null -> true
+                start == null -> value <= end!!
+                end == null -> value >= start
+                start <= end -> value in start..end
+                else -> value >= start || value <= end
+            }
+        }
+
+        val label: String
+            get() = when {
+                fromMinutes != null && toMinutes != null ->
+                    "${formatMinutes(fromMinutes)}-${formatMinutes(toMinutes)}"
+                fromMinutes != null -> "≥${formatMinutes(fromMinutes)}"
+                else -> "≤${formatMinutes(toMinutes!!)}"
+            }
+
+        private fun formatMinutes(total: Int): String =
+            "%02d:%02d".format(Locale.CHINA, total / 60, total % 60)
+    }
 
     private data class Train(
         val code: String,
@@ -695,6 +777,9 @@ class TrainQueryTool : QueryTool {
         const val MAX_STATIONS_PER_SIDE = 3
         const val MAX_SALE_DAYS = 15L
         const val PRICE_CHUNK = 10
+        const val PERIOD_TEXT = "(?:凌晨|早上|早晨|上午|中午|下午|傍晚|晚上|夜里)"
+        const val CLOCK_TEXT =
+            "(?:\\d{1,2}|[一二两三四五六七八九十]{1,3})(?:[:：点时](?:\\d{1,2}|半|一刻|三刻)?分?)?"
 
         val SHANGHAI: ZoneId = ZoneId.of("Asia/Shanghai")
         val DATE_COMPACT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyyMMdd")
@@ -728,6 +813,14 @@ class TrainQueryTool : QueryTool {
         val SEARCH_SUFFIXES = listOf(
             "火车票余票", "高铁票余票", "动车票余票", "火车余票", "车票余票",
             "火车票", "高铁票", "动车票", "铁路票", "车票", "余票", "车次", "票价",
+        )
+        // These words describe how to answer, not which stations to query. Strip longer
+        // phrases first so a destination followed directly by "高铁最快只看有票" remains
+        // a station name after parsing.
+        val QUERY_OPTION_WORDS = listOf(
+            "只看有票", "只看可售", "能买到", "智能动车组", "高铁动车", "动车高铁",
+            "历时最短", "时间最短", "最早到", "最晚", "最快", "最早", "先到", "先走",
+            "复兴号", "高铁", "动车", "城际", "火车", "有票", "可售", "只看", "筛选",
         )
         val PLACE_PREFIXES = listOf("从", "由", "在")
         val PLACE_SUFFIXES = listOf("出发", "到站", "到达", "前往", "的票", "的车", "的")
@@ -779,6 +872,16 @@ class TrainQueryTool : QueryTool {
         )
         val DAY_ONLY_REGEX = Regex("(?:这个月)?([0-9一二两三四五六七八九十]{1,3})[日号]")
         val DATE_FORMAT_REGEXES = listOf(DATE_YM_REGEX, DATE_MD_REGEX, DAY_ONLY_REGEX)
+        val TIME_RANGE_REGEX = Regex(
+            "($PERIOD_TEXT)?\\s*($CLOCK_TEXT)\\s*(?:到|至|[-~—–])\\s*($PERIOD_TEXT)?\\s*($CLOCK_TEXT)",
+        )
+        val TIME_AFTER_REGEX = Regex(
+            "($PERIOD_TEXT)?\\s*($CLOCK_TEXT)\\s*(?:以后|之后|后|起)",
+        )
+        val TIME_BEFORE_REGEX = Regex(
+            "($PERIOD_TEXT)?\\s*($CLOCK_TEXT)\\s*(?:以前|之前|前)",
+        )
+        val TIME_FILTER_REGEXES = listOf(TIME_RANGE_REGEX, TIME_AFTER_REGEX, TIME_BEFORE_REGEX)
         val LEFT_TICKET_PATH_REGEX = Regex(
             "CLeftTicketUrl\\s*=\\s*['\"]([^'\"]+)['\"]",
         )
