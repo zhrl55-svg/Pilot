@@ -17,6 +17,7 @@ import com.pilot.agent.agent.SkillStore
 import com.pilot.agent.perception.ScreenReader
 import com.pilot.agent.perception.ScreenSnapshot
 import com.pilot.agent.service.AgentAccessibilityService
+import com.pilot.agent.tool.LocalToolRuntime
 import com.pilot.agent.voice.LocalAsr
 import com.pilot.agent.voice.LocalLlm
 import com.pilot.agent.voice.Speaker
@@ -55,6 +56,14 @@ object AgentRuntime {
 
     val skills: SkillStore by lazy { SkillStore(File(PilotApp.instance.filesDir, "skills")) }
     val guard: Guard by lazy { Guard(PilotApp.instance) }
+
+    /**
+     * Native tools that do not require accessibility. This layer is shared by
+     * the UI, voice input, and background RUN broadcasts.
+     */
+    val localTools: LocalToolRuntime by lazy {
+        LocalToolRuntime(PilotApp.instance) { reader }
+    }
 
     /** 端侧语音识别（sherpa-onnx + SenseVoice）。常驻单例，模型加载一次。 */
     val asr: LocalAsr by lazy { LocalAsr(PilotApp.instance) }

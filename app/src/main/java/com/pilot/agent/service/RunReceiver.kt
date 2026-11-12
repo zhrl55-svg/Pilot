@@ -175,6 +175,27 @@ class RunReceiver : BroadcastReceiver() {
             return
         }
 
+        // Local tools work even when accessibility is disconnected. This path has
+        // no UI, so mutating tools that require confirmation are auto-denied.
+        if (AgentRuntime.localTools.match(goal) != null) {
+            Thread {
+                val result = runCatching {
+                    runBlocking {
+                        AgentRuntime.localTools.execute(goal) { question, _ ->
+                            Dbg.w(TAG, "本地工具无人确认，已拒绝：$question")
+                            false
+                        }
+                    }
+                }.getOrNull()
+                if (result != null) {
+                    AgentRuntime.speaker.speak(result.spoken)
+                } else {
+                    Dbg.e(TAG, "本地工具没有返回结果")
+                }
+            }.apply { name = "local-tool"; isDaemon = true }.start()
+            return
+        }
+
         // ★ 意图门：不是操作指令就别进 agent loop。
         //   「你是谁」这类问题进 loop 会去乱点屏幕（真机实测过一句话触发 3 次乱点）。
         //   走模型回答 —— 老板 11-10：「你是谁这样的问题不要走规则，模型交给模型回答」。
@@ -230,6 +251,8 @@ class RunReceiver : BroadcastReceiver() {
         val s = com.pilot.agent.agent.AgentSettings.load()
         val now = java.text.SimpleDateFormat("yyyy年M月d日 EEEE HH:mm", java.util.Locale.CHINA)
             .format(java.util.Date())
+        val memory = AgentRuntime.localTools.memory.promptContext(text, 5)
+        val memoryPrompt = if (memory.isBlank()) "" else "\n相关长期记忆：\n$memory"
         // 云端
         if (s.cloudReady) {
             runCatching {
@@ -243,7 +266,8 @@ class RunReceiver : BroadcastReceiver() {
                                 "content",
                                 "你是手机助手 Pilot，运行在这台安卓手机上。现在是 $now。" +
                                     "用一到两句话回答，简短口语化，不要用列表。" +
-                                    "你能开关应用、查天气、股票和火车余票、播音乐、跑 shell 命令、做导航。",
+                                    "你能开关应用、查天气、股票和火车余票、播音乐、跑 shell 命令、做导航。" +
+                                    memoryPrompt,
                             )
                         })
                         put(org.json.JSONObject().apply {
@@ -274,6 +298,7 @@ class RunReceiver : BroadcastReceiver() {
         return llm.generate(
             "system\n你是手机助手 Pilot，运行在这台安卓手机上，现在是 $now。" +
                 "能开关应用、查天气股票和火车余票、播音乐、跑命令、做导航。" +
+                memoryPrompt +
                 "回答简短口语化，不超过 25 个字。$noThink\n" +
                 "user\n$text\nassistant\n"
         )?.trim()?.take(200) ?: "我暂时没法回答。"

@@ -1,6 +1,9 @@
 package com.pilot.agent.ui
 
 import android.app.Application
+import android.content.ComponentName
+import android.content.Intent
+import android.provider.Settings
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -13,11 +16,16 @@ import com.pilot.agent.agent.AgentSettings
 import com.pilot.agent.agent.IntentGate
 import com.pilot.agent.agent.Risk
 import com.pilot.agent.runtime.AgentRuntime
+import com.pilot.agent.tool.ToolGroup
+import com.pilot.agent.tool.ToolPolicy
+import com.pilot.agent.tool.ToolStatus
 import com.pilot.agent.voice.VoiceInput
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaType
 
 data class LogEntry(val id: Long, val kind: Kind, val text: String) {
@@ -25,6 +33,11 @@ data class LogEntry(val id: Long, val kind: Kind, val text: String) {
 }
 
 data class ConfirmUi(val id: Long, val question: String, val risk: Risk)
+
+private data class PendingToolConfirm(
+    val id: Long,
+    val deferred: CompletableDeferred<Boolean>,
+)
 
 class AgentViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -189,6 +202,44 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         showSkillList = false
     }
 
+    var toolPolicies by mutableStateOf(AgentRuntime.localTools.policies())
+        private set
+    var toolMemoryCount by mutableStateOf(0)
+        private set
+    var allFilesAccess by mutableStateOf(false)
+        private set
+    var showMemoryList by mutableStateOf(false)
+        private set
+    var memoryList by mutableStateOf<List<com.pilot.agent.tool.MemoryStore.Memory>>(emptyList())
+        private set
+
+    fun refreshLocalToolState() {
+        toolPolicies = AgentRuntime.localTools.policies()
+        toolMemoryCount = AgentRuntime.localTools.memoryCount()
+        allFilesAccess = AgentRuntime.localTools.allFilesAccessGranted()
+    }
+
+    fun setToolPolicy(group: ToolGroup, policy: ToolPolicy) {
+        AgentRuntime.localTools.setPolicy(group, policy)
+        toolPolicies = AgentRuntime.localTools.policies()
+    }
+
+    fun openMemoryList() {
+        memoryList = AgentRuntime.localTools.memory.all()
+        toolMemoryCount = memoryList.size
+        showMemoryList = true
+    }
+
+    fun closeMemoryList() {
+        showMemoryList = false
+    }
+
+    fun forgetMemory(id: Long) {
+        AgentRuntime.localTools.deleteMemoryFromUi(id)
+        memoryList = AgentRuntime.localTools.memory.all()
+        toolMemoryCount = memoryList.size
+    }
+
     var foreground by mutableStateOf("")
         private set
 
@@ -320,6 +371,9 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     /** 最近一次用户说的话（用于去重） */
     private var lastUserText: String? = null
     private var lastUserTextAt = 0L
+    private var lastAccessibilityPromptAt = 0L
+    @Volatile
+    private var pendingToolConfirm: PendingToolConfirm? = null
     private var seq = 0L
 
     init {
@@ -941,6 +995,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
      * 查不到就退回端侧模型答（哪怕答得不好，也比一声不吭强）。
      */
     private fun query(text: String) {
+        if (tryRunLocalTool(text, allowConfirmation = true)) return
         viewModelScope.launch {
             add(LogEntry.Kind.THINK, "查一下…")
             val answer = withContext(Dispatchers.IO) {
@@ -969,6 +1024,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
      * 会答成占位符。
      */
     private fun chat(text: String) {
+        if (tryRunLocalTool(text, allowConfirmation = true)) return
         viewModelScope.launch {
             add(LogEntry.Kind.THINK, "这句不是操作指令，交给模型回答")
             val reply = withContext(Dispatchers.IO) {
@@ -999,6 +1055,10 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         val s = AgentSettings.load()
         if (!s.cloudReady) return null
         return try {
+            val memoryContext = AgentRuntime.localTools.memory.promptContext(text, 5)
+            val memoryPrompt = if (memoryContext.isBlank()) "" else {
+                "\n与本轮相关的用户长期记忆（仅用于回答当前问题）：\n$memoryContext"
+            }
             val body = org.json.JSONObject().apply {
                 put("model", s.model)
                 put("stream", false)
@@ -1009,7 +1069,9 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                             "content",
                             "你是手机助手 Pilot，运行在这台安卓手机上。现在是 $now。" +
                                 "用一到两句话回答，简短口语化，不要用列表。" +
-                                "你能开关应用、查天气、股票和火车余票、播音乐、跑 shell 命令、做导航。" +
+                                "你能开关应用、查天气、股票和火车余票、播音乐、做导航，" +
+                                "也能在明确请求下查看设备状态、读取指定文件和管理本机长期记忆。" +
+                                memoryPrompt +
                                 "下面是最近的对话，接住其中的指代和上下文。",
                         )
                     })
@@ -1059,17 +1121,77 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         val llm = AgentRuntime.localLlm
         if (!llm.ensureReady()) return null
         val noThink = if (llm.wantsNoThink) "/no_think" else ""
+        val memoryContext = AgentRuntime.localTools.memory.promptContext(text, 5)
+        val memoryPrompt = if (memoryContext.isBlank()) "" else "相关长期记忆：\n$memoryContext\n"
         return llm.generate(
             "system\n你是手机助手 Pilot，运行在这台安卓手机上，现在是 $now。" +
                 "能开关应用、查天气股票和火车余票、播音乐、跑命令、做导航。" +
+                memoryPrompt +
                 "回答简短口语化，不超过 25 个字。$noThink\n" +
                 "user\n$text\nassistant\n"
         )
     }
 
+    /**
+     * Handles file, screenshot, status, and memory intent before screen control.
+     *
+     * @return true when the local tool layer owns this request.
+     */
+    private fun tryRunLocalTool(text: String, allowConfirmation: Boolean): Boolean {
+        if (AgentRuntime.localTools.match(text) == null) return false
+        if (logs.lastOrNull()?.let { it.kind == LogEntry.Kind.USER && it.text == text } != true) {
+            add(LogEntry.Kind.USER, text)
+        }
+        add(LogEntry.Kind.THINK, "调用本机工具…")
+        running = true
+        justSent = true
+        activeTaskLabel = "本机工具"
+        publishNotificationStatus()
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                AgentRuntime.localTools.execute(text) { question, risk ->
+                    if (allowConfirmation) askToolConfirmation(question, risk)
+                    else false
+                }
+            }
+            running = false
+            justSent = false
+            activeTaskLabel = ""
+            publishNotificationStatus()
+            if (result == null) {
+                add(LogEntry.Kind.ERROR, "没有找到可执行的本地工具。")
+            } else {
+                val kind = if (result.status == ToolStatus.SUCCESS) LogEntry.Kind.DONE
+                else LogEntry.Kind.ERROR
+                add(kind, result.message)
+                AgentRuntime.speaker.speak(result.spoken)
+            }
+            refreshStatus()
+        }
+        return true
+    }
+
+    private suspend fun askToolConfirmation(question: String, risk: Risk): Boolean {
+        val id = System.nanoTime()
+        val deferred = CompletableDeferred<Boolean>()
+        withContext(Dispatchers.Main) {
+            pendingToolConfirm = PendingToolConfirm(id, deferred)
+            confirm = ConfirmUi(id, question, risk)
+            AgentRuntime.speaker.speak(question)
+        }
+        val answer = withTimeoutOrNull(60_000L) { deferred.await() } ?: false
+        withContext(Dispatchers.Main) {
+            val current = pendingToolConfirm
+            if (current?.id == id) pendingToolConfirm = null
+            if (confirm?.id == id) confirm = null
+        }
+        return answer
+    }
+
     fun run(goal: String) {
         val g = goal.trim()
         if (g.isEmpty() || running) return
+        if (tryRunLocalTool(g, allowConfirmation = true)) return
         // 文本输入同样过意图门：不是操作指令就不碰屏幕
         if (!IntentGate.isTask(g)) {
             add(LogEntry.Kind.USER, g)
@@ -1078,9 +1200,20 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         }
         refreshStatus()
         if (!accessibilityOn || AgentRuntime.loop == null) {
-            // ★ 不再往对话区写这条错误：顶部「操作权限 未开启」卡片已经带了
-            //   「去开启」按钮，重复一遍反而把「操作权限」下面堆满字（老板要求删）。
-            //   只刷新一次状态，卡片会自己显示"未开启"。
+            // Android 不允许普通 App 静默勾选无障碍开关，但可以把用户直接带到
+            // Pilot 的服务详情页，并同时用聊天文字和语音说明下一步。
+            Dbg.w(TAG, "操作权限未开启，已提示并打开设置：goalChars=${g.length}")
+            if (logs.lastOrNull()?.let { it.kind == LogEntry.Kind.USER && it.text == g } != true) {
+                add(LogEntry.Kind.USER, g)
+            }
+            val prompt = "需要先开启 Pilot 的操作权限。我已打开设置页，请找到 Pilot 并开启，然后再说一次。"
+            add(LogEntry.Kind.DONE, prompt)
+            val now = System.currentTimeMillis()
+            if (now - lastAccessibilityPromptAt > 5_000L) {
+                lastAccessibilityPromptAt = now
+                AgentRuntime.speaker.speak(prompt)
+            }
+            openAccessibilitySettings()
             refreshStatus()
             return
         }
@@ -1091,6 +1224,35 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         justSent = true
         progress = 0 to settings.maxTurns
         AgentRuntime.loop?.start(AgentRuntime.scope, g)
+    }
+
+    private fun openAccessibilitySettings() {
+        val app = getApplication<Application>()
+        val component = ComponentName(app, com.pilot.agent.service.AgentAccessibilityService::class.java)
+        val detail = Intent("android.settings.ACCESSIBILITY_DETAILS_SETTINGS")
+            .putExtra(Intent.EXTRA_COMPONENT_NAME, component)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val openedDetail = runCatching {
+            if (detail.resolveActivity(app.packageManager) != null) {
+                app.startActivity(detail)
+                true
+            } else {
+                false
+            }
+        }.getOrElse {
+            Dbg.w(TAG, "权限详情页不可用，回退到无障碍总设置：${it.javaClass.simpleName}: ${it.message}")
+            false
+        }
+        if (!openedDetail) {
+            runCatching {
+                app.startActivity(
+                    Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                )
+            }.onFailure {
+                Dbg.w(TAG, "打开无障碍设置失败：${it.javaClass.simpleName}: ${it.message}")
+            }
+        }
     }
 
     /**
@@ -1199,6 +1361,8 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
 
     fun stop() {
         AgentRuntime.loop?.cancel()
+        pendingToolConfirm?.deferred?.complete(false)
+        pendingToolConfirm = null
         running = false
         justSent = false
         confirm = null
@@ -1208,7 +1372,13 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     fun answerConfirm(approved: Boolean) {
         val c = confirm ?: return
         confirm = null
-        AgentRuntime.loop?.confirm(c.id, approved)
+        val local = pendingToolConfirm
+        if (local != null && local.id == c.id) {
+            pendingToolConfirm = null
+            local.deferred.complete(approved)
+        } else {
+            AgentRuntime.loop?.confirm(c.id, approved)
+        }
     }
 
     fun updateSettings(next: AgentSettings) {

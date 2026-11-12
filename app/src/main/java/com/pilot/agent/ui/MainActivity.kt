@@ -330,8 +330,11 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
         )
     }
 
-    // 打开设置时把系统音色列表拉出来（要等 TTS 引擎初始化）
-    LaunchedEffect(Unit) { vm.loadSystemVoices() }
+    // 打开设置时刷新系统音色和本机工具状态。
+    LaunchedEffect(showSettings) {
+        vm.loadSystemVoices()
+        if (showSettings) vm.refreshLocalToolState()
+    }
 
     vm.confirm?.let { c ->
         AlertDialog(
@@ -372,6 +375,10 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
     // 技能列表放这一层：嵌在设置弹窗里会被遮住（跟声纹注册同一个坑）
     if (vm.showSkillList) {
         SkillListDialog(vm, onDismiss = { vm.closeSkillList() })
+    }
+
+    if (vm.showMemoryList) {
+        MemoryListDialog(vm, onDismiss = { vm.closeMemoryList() })
     }
 
     // 二维码单独一层：不嵌在设置弹窗里，扫码时设置可以先关掉
@@ -1797,7 +1804,14 @@ private fun SettingsDialog(
     var vpThreshold by remember {
         mutableStateOf(String.format(java.util.Locale.US, "%.2f", vm.settings.voiceprintThreshold))
     }
+    var toolPolicyDraft by remember { mutableStateOf(vm.toolPolicies) }
     val colors = MaterialTheme.colorScheme
+    LaunchedEffect(Unit) {
+        while (true) {
+            vm.refreshLocalToolState()
+            kotlinx.coroutines.delay(1_500)
+        }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1983,6 +1997,74 @@ private fun SettingsDialog(
                     }
                 }
 
+                SettingsSection(
+                    title = "本机工具与长期记忆",
+                    hint = "文件操作只允许应用目录和共享存储，并会拦截 .. 越界。读取默认允许；修改、分享和删除默认每次确认，可在这里改成禁止。长期记忆只在你明确说“记住”时保存；使用云端模型时，只为当前问题选取最多 5 条相关记忆，不上传整页记忆库或整段聊天。",
+                ) {
+                    com.pilot.agent.tool.ToolGroup.entries.forEach { group ->
+                        Text(group.label, fontSize = 11.sp, color = colors.onSurfaceVariant)
+                        OptionChips(
+                            options = com.pilot.agent.tool.ToolPolicy.entries.map {
+                                it.name to it.label
+                            },
+                            selected = (toolPolicyDraft[group] ?: group.defaultPolicy).name,
+                            onSelect = { value ->
+                                runCatching { com.pilot.agent.tool.ToolPolicy.valueOf(value) }
+                                    .getOrNull()?.let { policy ->
+                                        toolPolicyDraft = toolPolicyDraft + (group to policy)
+                                    }
+                            },
+                        )
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "长期记忆 ${vm.toolMemoryCount} 条（点击查看和删除）",
+                            fontSize = 12.sp,
+                            color = colors.primary,
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable { vm.openMemoryList() }
+                                .padding(vertical = 6.dp),
+                        )
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("应用使用统计", fontSize = 12.sp, modifier = Modifier.weight(1f))
+                        TextButton(onClick = {
+                            runCatching {
+                                settingsContext.startActivity(
+                                    Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
+                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                )
+                            }
+                        }) { Text("系统授权", fontSize = 12.sp) }
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            if (vm.allFilesAccess) "所有文件访问：已授权" else "所有文件访问：未授权",
+                            fontSize = 12.sp,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(onClick = {
+                            val appSettings = Intent(
+                                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                android.net.Uri.parse("package:${settingsContext.packageName}"),
+                            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            val opened = runCatching {
+                                settingsContext.startActivity(appSettings)
+                                true
+                            }.getOrDefault(false)
+                            if (!opened) {
+                                runCatching {
+                                    settingsContext.startActivity(
+                                        Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    )
+                                }
+                            }
+                        }) { Text(if (vm.allFilesAccess) "管理" else "开启", fontSize = 12.sp) }
+                    }
+                }
+
                 // ---------------- 音乐 ----------------
                 SettingsSection(
                     title = "音乐",
@@ -2102,6 +2184,9 @@ private fun SettingsDialog(
         },
         confirmButton = {
             TextButton(onClick = {
+                toolPolicyDraft.forEach { (group, policy) ->
+                    vm.setToolPolicy(group, policy)
+                }
                 AgentSettings.save(
                     vm.settings.copy(
                         baseUrl = baseUrl.trim(),
@@ -2134,6 +2219,63 @@ private fun SettingsDialog(
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )
 
+}
+
+/** Long-term memories are explicit records and can be deleted in this dialog. */
+@Composable
+private fun MemoryListDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
+    val colors = MaterialTheme.colorScheme
+    var pendingDelete by remember {
+        mutableStateOf<com.pilot.agent.tool.MemoryStore.Memory?>(null)
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Color(0xFF000000),
+        title = { Text("长期记忆 ${vm.memoryList.size} 条", fontSize = 16.sp) },
+        text = {
+            if (vm.memoryList.isEmpty()) {
+                Text("还没有长期记忆。明确说“记住……”才会保存。", fontSize = 12.sp)
+            } else {
+                LazyColumn(
+                    modifier = Modifier.heightIn(max = 420.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    items(vm.memoryList, key = { it.id }) { memory ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                memory.content,
+                                fontSize = 12.sp,
+                                lineHeight = 18.sp,
+                                modifier = Modifier.weight(1f),
+                            )
+                            TextButton(onClick = { pendingDelete = memory }) {
+                                Text("删除", fontSize = 12.sp, color = colors.error)
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("关闭") }
+        },
+    )
+    pendingDelete?.let { memory ->
+        AlertDialog(
+            onDismissRequest = { pendingDelete = null },
+            title = { Text("删除这条记忆？") },
+            text = { Text(memory.content) },
+            confirmButton = {
+                TextButton(onClick = {
+                    vm.forgetMemory(memory.id)
+                    pendingDelete = null
+                }) { Text("永久删除", color = colors.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDelete = null }) { Text("取消") }
+            },
+        )
+    }
 }
 
 /** 已学技能列表。 */

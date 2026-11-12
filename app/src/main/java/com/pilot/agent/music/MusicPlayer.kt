@@ -252,12 +252,15 @@ class MusicPlayer private constructor(private val context: Context) {
         loading = false
         consecutiveErrors = 0
         runCatching { exo.volume = 1f }
-        audioGate = com.pilot.agent.voice.AudioGate.hold("music")
+        // 音乐暂停后用户会立刻说指令，不设置 TTS 才需要的 900ms 尾音门。
+        audioGate = com.pilot.agent.voice.AudioGate.hold("music", guardEcho = false)
         com.pilot.agent.voice.AudioFocusManager.requestMusicFocus(context)
         com.pilot.agent.voice.AudioFocusManager.musicVolume = { volume ->
             runCatching { exo.volume = volume }
         }
         com.pilot.agent.voice.AudioFocusManager.musicStop = { stop() }
+        com.pilot.agent.voice.AudioFocusManager.musicPause = { pause() }
+        com.pilot.agent.voice.AudioFocusManager.musicResume = { resume() }
         com.pilot.agent.voice.AudioFocusManager.onMusicStarted()
         Dbg.i(TAG, "开始播放：${queue.getOrNull(queueIndex)?.display} (${queueIndex + 1}/${queue.size})")
     }
@@ -342,21 +345,24 @@ class MusicPlayer private constructor(private val context: Context) {
         return playbackMode
     }
 
-    fun pause() {
-        val exo = player ?: return
-        if (paused) return
+    fun pause(): Boolean {
+        val exo = player ?: return false
+        if (paused) return false
         exo.pause()
         isPlaying = false
         paused = true
         releaseGate()
         Dbg.i(TAG, "音乐已暂停：$currentTitle")
+        return true
     }
 
     fun resume() {
         val exo = player ?: return
         if (!paused) return
         com.pilot.agent.voice.AudioFocusManager.requestMusicFocus(context)
-        if (audioGate == null) audioGate = com.pilot.agent.voice.AudioGate.hold("music")
+        if (audioGate == null) {
+            audioGate = com.pilot.agent.voice.AudioGate.hold("music", guardEcho = false)
+        }
         exo.play()
         paused = false
         Dbg.i(TAG, "音乐已恢复：$currentTitle")
@@ -390,6 +396,8 @@ class MusicPlayer private constructor(private val context: Context) {
         com.pilot.agent.voice.AudioFocusManager.abandonMusicFocus()
         com.pilot.agent.voice.AudioFocusManager.musicVolume = null
         com.pilot.agent.voice.AudioFocusManager.musicStop = null
+        com.pilot.agent.voice.AudioFocusManager.musicPause = null
+        com.pilot.agent.voice.AudioFocusManager.musicResume = null
     }
 
     private fun releaseGate() {

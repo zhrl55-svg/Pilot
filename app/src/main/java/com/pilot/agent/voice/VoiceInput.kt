@@ -195,6 +195,9 @@ class VoiceInput(
     /** 直接听一整句（点按钮） */
     fun startListening(resumeWake: Boolean = false) {
         if (!ensureCapture()) return
+        if ("music" in AudioGate.activeHolders()) {
+            AudioFocusManager.pauseMusicForVoice()
+        }
         resumeToWake = resumeWake
         wakeAuthorized = true
         vad?.reset()
@@ -243,6 +246,7 @@ class VoiceInput(
         ring.clear()
         runCatching { VoiceState.write(context, VoiceState.IDLE) }
         if (!busy.get()) emitState(State.IDLE)
+        AudioFocusManager.resumeMusicAfterVoice()
         Dbg.i(TAG, "语音停止")
     }
 
@@ -501,6 +505,11 @@ class VoiceInput(
         val st = AgentSettings.load()
         val snapshot = ring.snapshot()
         val needVerify = st.requireVoiceprint && gate.hasTemplate()
+        // 播报或音乐正在占用扬声器时，先让声音让路：既避免唤醒词和音乐
+        // 混在一起影响声纹，也让验声纹通过后第一句指令能立即被麦克风收到。
+        if ("music" in AudioGate.activeHolders()) {
+            AudioFocusManager.pauseMusicForVoice()
+        }
         val proceed = {
             Dbg.i(TAG, "语音打断「$word」（打断词=$isInterruptWord）")
             runCatching { onInterrupt(word) }
@@ -529,12 +538,19 @@ class VoiceInput(
             if (pass) {
                 main.post { proceed() }
             } else {
-                main.post { onVoiceprint(score, false) }
+                main.post {
+                    onVoiceprint(score, false)
+                    // 不是主人就继续播放，不能让一句误唤醒把音乐永久停住。
+                    AudioFocusManager.resumeMusicAfterVoice()
+                }
             }
         }
     }
 
     private fun onWakeHit(word: String) {
+        if ("music" in AudioGate.activeHolders()) {
+            AudioFocusManager.pauseMusicForVoice()
+        }
         // 立刻切聆听：用户接下来的话不能丢
         mode = Mode.LISTEN
         dndRequested = false
@@ -687,6 +703,7 @@ class VoiceInput(
     }
 
     private fun backToIdleOrWake() {
+        AudioFocusManager.resumeMusicAfterVoice()
         if (resumeToWake) {
             val sec = AgentSettings.load().idleSleepSeconds
             if (sec > 0) {

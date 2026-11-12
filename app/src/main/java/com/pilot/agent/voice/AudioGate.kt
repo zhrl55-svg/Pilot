@@ -29,7 +29,10 @@ import com.pilot.agent.Dbg
 object AudioGate {
 
     private const val TAG = "PilotAudioGate"
+    private val lock = Any()
     private val holders = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val echoGuardHolders = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val whenUnmuted = ArrayList<() -> Unit>()
 
     /** 当前是否静音（麦克风内容不可信）。 */
     @Volatile
@@ -50,17 +53,49 @@ object AudioGate {
     /** 占用来源名（调试用）。 */
     fun activeHolders(): Set<String> = holders.toSet()
 
-    /** 拿一个占用令牌。返回的 close() 幂等，重复调无害。 */
-    fun hold(name: String): AutoCloseable {
-        holders.add(name)
-        sync()
-        Dbg.i(TAG, "音频占用 +$name（持有者=${holders.size}）")
-        return AutoCloseable {
-            holders.remove(name)
-            lastReleaseAt = android.os.SystemClock.uptimeMillis()
-            sync()
-            Dbg.i(TAG, "音频占用 -$name（持有者=${holders.size}）")
+    /**
+     * 拿一个占用令牌。返回的 close() 幂等，重复调无害。
+     *
+     * [guardEcho] 只对 TTS 这类结束时会留下尾音的放音源开启。音乐暂停时
+     * 用户通常马上说指令，不能把随后 900ms 的人声当成回声丢掉。
+     */
+    fun hold(name: String, guardEcho: Boolean = true): AutoCloseable {
+        synchronized(lock) {
+            holders.add(name)
+            if (guardEcho) echoGuardHolders.add(name)
+            syncLocked()
         }
+        Dbg.i(TAG, "音频占用 +$name（持有者=${holders.size}）")
+        var closed = false
+        return AutoCloseable {
+            val callbacks = ArrayList<() -> Unit>()
+            synchronized(lock) {
+                if (closed) return@AutoCloseable
+                closed = true
+                val removed = holders.remove(name)
+                val guarded = echoGuardHolders.remove(name)
+                if (removed && guarded && holders.isEmpty()) {
+                    lastReleaseAt = android.os.SystemClock.uptimeMillis()
+                }
+                syncLocked(callbacks)
+            }
+            Dbg.i(TAG, "音频占用 -$name（持有者=${holders.size}）")
+            callbacks.forEach { runCatching(it) }
+        }
+    }
+
+    /**
+     * 所有放音源结束后执行一次。若当前没有占用则立即执行。
+     * 用于音乐被语音助手暂停后，等 TTS 也结束再恢复。
+     */
+    fun whenUnmuted(action: () -> Unit) {
+        val runNow = synchronized(lock) {
+            if (holders.isEmpty()) true else {
+                whenUnmuted += action
+                false
+            }
+        }
+        if (runNow) runCatching(action)
     }
 
     /** 便捷用法：play { ... } 块内自动静音。 */
@@ -73,11 +108,15 @@ object AudioGate {
         }
     }
 
-    private fun sync() {
+    private fun syncLocked(callbacks: MutableList<() -> Unit> = ArrayList()) {
         val muted = holders.isNotEmpty()
         if (muted != isMuted) {
             isMuted = muted
             Dbg.i(TAG, if (muted) "麦克风内容不可信（放音中），不送 ASR" else "麦克风恢复可信")
+        }
+        if (!muted && whenUnmuted.isNotEmpty()) {
+            callbacks += whenUnmuted
+            whenUnmuted.clear()
         }
     }
 }

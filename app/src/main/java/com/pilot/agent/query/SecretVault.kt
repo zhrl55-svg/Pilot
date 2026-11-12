@@ -11,7 +11,7 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
 /** Small AndroidKeyStore-backed secret storage for optional service tokens. */
-internal object SecretVault {
+object SecretVault {
     private const val PREFS = "secure_service_secrets"
     private const val ALIAS = "pilot_service_secrets_v1"
 

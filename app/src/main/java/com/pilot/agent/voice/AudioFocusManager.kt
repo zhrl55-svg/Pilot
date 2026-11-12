@@ -4,6 +4,8 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.os.Handler
+import android.os.Looper
 import com.pilot.agent.Dbg
 
 /**
@@ -48,6 +50,19 @@ object AudioFocusManager {
     @Volatile
     var musicStop: (() -> Unit)? = null
 
+    /** 音乐播放器注册：暂停并返回本次是否真的从播放态切到暂停态。 */
+    @Volatile
+    var musicPause: (() -> Boolean)? = null
+
+    /** 音乐播放器注册：恢复播放。 */
+    @Volatile
+    var musicResume: (() -> Unit)? = null
+
+    private val main = Handler(Looper.getMainLooper())
+
+    @Volatile
+    private var musicPausedForVoice = false
+
     private var musicRequest: AudioFocusRequest? = null
     private var musicManager: AudioManager? = null
 
@@ -91,10 +106,44 @@ object AudioFocusManager {
     }
 
     fun abandonMusicFocus() {
+        musicPausedForVoice = false
         val req = musicRequest ?: return
         musicRequest = null
         runCatching { musicManager?.abandonAudioFocusRequest(req) }
         Dbg.i(TAG, "音乐焦点已释放")
+    }
+
+    /**
+     * 唤醒词命中或语音打断时调用。暂停只在主线程执行，避免从 AudioRecord
+     * 线程直接操作线程受限的 ExoPlayer。
+     */
+    fun pauseMusicForVoice() {
+        main.post {
+            if (musicPausedForVoice) return@post
+            val pause = musicPause ?: return@post
+            if (pause()) {
+                musicPausedForVoice = true
+                Dbg.i(TAG, "音乐已为语音输入暂停")
+            }
+        }
+    }
+
+    /**
+     * 这一轮语音结束后恢复音乐。若 AI 正在播报，则等 TTS 和麦克风闸门
+     * 都释放后再恢复，避免在播报声里突然把歌曲抬起来。
+     */
+    fun resumeMusicAfterVoice() {
+        main.post {
+            if (!musicPausedForVoice) return@post
+            AudioGate.whenUnmuted {
+                main.post {
+                    if (!musicPausedForVoice) return@post
+                    musicPausedForVoice = false
+                    musicResume?.invoke()
+                    Dbg.i(TAG, "语音输入结束，音乐恢复")
+                }
+            }
+        }
     }
 
     /**
