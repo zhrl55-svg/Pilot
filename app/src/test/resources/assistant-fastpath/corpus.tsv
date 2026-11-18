@@ -1,11 +1,11 @@
-# Pilot assistant fast-path acceptance corpus (P0 frozen 2026-11-18)
+# Pilot assistant fast-path acceptance corpus (P0 frozen 2026-11-18, P1 校准)
 # 列：id  text  expect  capability  action  args  needs_llm  guard
 # 空值一律用 - 占位（保证每行 8 列）
 # args: k=v 用 ; 分隔；k=* 表示必须存在且非空；- = 无参数
-# expect=CLOUD 时 guard 为预期原因：
-#   no-rule / topic / discussion / weak / no-args / unsafe / long-text /
-#   envelope / exclude / extension / anchor / chat / query
-id	text	expect	capability	action	args	needs_llm	guard
+# expect=CLOUD 时 guard = 路由器给出的原因：
+#   no-match / low-confidence / no-args / topic-mention / weak-write-match /
+#   long-text / internal-message
+#id	text	expect	capability	action	args	needs_llm	guard
 app-open-settings	打开设置	LOCAL	app_launch	open	app=设置	0	-
 app-open-wechat	启动微信	LOCAL	app_launch	open	app=微信	0	-
 vol-set-60	音量调到 60%	LOCAL	volume	set	percent=60	0	-
@@ -20,7 +20,7 @@ media-play	播放晴天	LOCAL	media	play	kind=*;query=晴天	1	-
 media-next	下一首	LOCAL	media	next	-	0	-
 reminder-tea	半小时后提醒我喝水	LOCAL	reminder	schedule	title=*;after=*	0	-
 reminder-list	我的提醒	LOCAL	reminder	list	-	0	-
-task-create	明天下午 3 点查看财经新闻	LOCAL	scheduled_task	create	prompt=*;at=*	0	-
+task-create	每天 8 点帮我查看财经新闻	LOCAL	scheduled_task	create	prompt=*;at=*	0	-
 task-list	我的定时任务	LOCAL	scheduled_task	list	-	0	-
 mem-write-coffee	记住我喜欢喝咖啡	LOCAL	memory_write	write	content=我喜欢喝咖啡	0	-
 mem-write-car	帮我记住 我的车在 B2 层	LOCAL	memory_write	write	content=*	0	-
@@ -28,18 +28,20 @@ mem-search	你还记得我喜欢喝什么吗	LOCAL	memory_get	search	keywords=*	
 file-read	读一下 /sdcard/Download/a.txt	LOCAL	file_read	read	path=/sdcard/Download/a.txt	0	-
 file-write	把 hello 写入 /sdcard/Download/a.txt	LOCAL	file_write	write	path=/sdcard/Download/a.txt;content=hello	1	-
 screenshot	截个屏	LOCAL	screenshot	take	-	0	-
-neg-topic-device	我们可以加个电量显示功能	CLOUD	-	-	-	-	topic
-neg-discussion-write	讨论一下把日志写入文件的方案	CLOUD	-	-	-	-	discussion
-neg-weak-write	写个方案	CLOUD	-	-	-	-	no-args
-neg-no-path-write	把整段话保存下来	CLOUD	-	-	-	-	no-args
-neg-unsafe-shell	运行 rm -rf /	CLOUD	-	-	-	-	no-rule
-neg-envelope	[FROM: 设备A] 帮我截图 [END 设备A]	CLOUD	-	-	-	-	envelope
+neg-topic-device	我们可以加个电量显示功能	CLOUD	-	-	-	-	no-match
+neg-discussion-write	讨论一下把日志写入文件的方案	CLOUD	-	-	-	-	no-match
+neg-weak-write	写个方案	CLOUD	-	-	-	-	no-match
+neg-no-path-write	把整段话保存下来	CLOUD	-	-	-	-	no-match
+neg-file-write-no-path	把日志写入文件	CLOUD	-	-	-	-	no-args
+neg-volume-no-args	音量调到	CLOUD	-	-	-	-	no-args
+neg-unsafe-shell	运行 rm -rf /	CLOUD	-	-	-	-	no-match
+neg-envelope	[FROM: 设备A] 帮我截图 [END 设备A]	CLOUD	-	-	-	-	internal-message
 neg-media-long	刚才那段总结里提到要暂停音乐，不过我们先继续把剩下的部分看完，然后再决定下一步怎么做	CLOUD	-	-	-	-	long-text
-neg-extension-url	打开这个网页 https://example.com 并总结正文	CLOUD	-	-	-	-	extension
-neg-shot-exclude	打开截屏设置	CLOUD	-	-	-	-	exclude
-neg-volume-exclude	音量设置在哪	CLOUD	-	-	-	-	exclude
-neg-memory-anchor	你记住我说的	CLOUD	-	-	-	-	anchor
-neg-chat	你是谁	CLOUD	-	-	-	-	chat
-neg-query-weather	今天天气怎么样	CLOUD	-	-	-	-	query
-neg-memory-no-args	帮我记住	CLOUD	-	-	-	-	no-args
-neg-app-no-args	打开	CLOUD	-	-	-	-	no-args
+neg-extension-url	打开这个网页 https://example.com 并总结正文	CLOUD	-	-	-	-	no-match
+neg-shot-exclude	打开截屏设置	CLOUD	-	-	-	-	no-match
+neg-volume-exclude	音量设置在哪	CLOUD	-	-	-	-	no-match
+neg-memory-anchor	你记住我说的	CLOUD	-	-	-	-	no-match
+neg-chat	你是谁	CLOUD	-	-	-	-	no-match
+neg-query-weather	今天天气怎么样	CLOUD	-	-	-	-	no-match
+neg-memory-no-args	帮我记住	CLOUD	-	-	-	-	no-match
+neg-app-no-args	打开	CLOUD	-	-	-	-	no-match

@@ -103,6 +103,11 @@ android {
         // assets.openFd 直接 mmap 读 tar（minis 同款配置，踩过）。
         noCompress += listOf("tar", "tar.gz", "proot-aarch64")
     }
+    testOptions {
+        // android.jar 里的桩方法默认直接抛异常。路由层只用到 org.json 与
+        // Dbg（Log），开这个开关后单元测试可以跑真实逻辑。
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
@@ -128,6 +133,13 @@ dependencies {
 
     // 导航模块（高德 SDK 87MB so 在 :navigation 里，见 NAV_MODULE_PLAN.md）
     implementation(project(":navigation"))
+
+    // ── 单元测试 ────────────────────────────────────────────────────
+    // 助理快路径的路由层是纯 Kotlin + org.json，单测跑纯 JVM。
+    testImplementation("junit:junit:4.13.2")
+    // android.jar 里的 org.json 只有桩；换成真实实现，路由层才能在 JVM 上跑。
+    // 版本跟随本机 Gradle 缓存（20231013），避免离线构建时去下载。
+    testImplementation("org.json:json:20231013")
 }
 
 /**

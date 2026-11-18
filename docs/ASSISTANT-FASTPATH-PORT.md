@@ -87,7 +87,7 @@ agent/Guard.kt              ← 风险分级 + 审计
 | `device` | `battery` / `storage` / `info` | — | 否 | `tool/DeviceTools.kt` | 1 |
 | `media` | `play` / `pause` / `resume` / `next` / `previous` / `stop` / `status` | play 的 `kind`（enum） | play 是 | `music/MusicPlayer.kt` + `NeteaseApi.kt` | 2 |
 | `reminder` | `schedule` / `list` / `cancel` | `title`，`at`/`after` 二选一 | 否 | `action/ReminderManager.kt` | 2 |
-| `scheduled_task` | `create` / `list` / `cancel` | `prompt`，`at`/`after` 二选一 | 否 | `tool/ScheduledTaskManager.kt` | 遗留（不迁） |
+| `scheduled_task` | `create` / `list` / `cancel` | `prompt`，`at`/`after` 二选一 | 否 | `tool/ScheduledTaskManager.kt` | 1（遗留 matcher 并存，owner 切换在 P4） |
 | `memory_write` | `write` | `content` | 否 | `tool/MemoryStore.kt` | 2 |
 | `memory_get` | `search` | `keywords`（可选） | 否 | `tool/MemoryStore.kt` | 2 |
 | `file_read` | `read` | `path` | 否 | `tool/FileTools.kt:readFile` | 3 |
@@ -220,7 +220,7 @@ Minis 的 `LocalIntentPlanner` prompt 是纯文本补全，Pilot 的本地规划
 | 3 | `memory_write` / `cancel` | 中 | **保留句首锚定**（`^(?:请\|帮我\|麻烦)?(?:记住\|牢记\|记下来)`） |
 | 4 | `screenshot` | 中 | 保留排除词「打开截屏设置」「关闭截屏」 |
 | 5 | `file_*` | 高 | 路径解析最复杂，最后迁 |
-| 6 | `scheduled_task` | 高 | **不迁**，保留遗留 matcher |
+| 6 | `scheduled_task` | 高 | 遗留 matcher **保留到 P4 影子比对通过**，之后由路由接管 |
 | — | `ssh` | 很高 | **不迁**，保持兜底一档；路由命中 `remote_exec` 时调用其解析 |
 
 ### 5.3 owner 状态机与影子模式
@@ -275,7 +275,7 @@ TSV 列（`#` 开头为注释）：
 | `capability` / `action` | LOCAL 必填 |
 | `args` | `k=v` 用 `;` 分隔；`k=*` 表示必须存在且非空；`-` 表示无参数/不约束 |
 | `needs_llm` | `1` = 该句预期要端侧模型补值（纯规则测试可跳过） |
-| `guard` | CLOUD 行的预期原因：`no-rule`/`topic`/`discussion`/`weak`/`no-args`/`unsafe`/`long-text`/`envelope`/`exclude`/`extension`/`anchor`/`chat`/`query` |
+| `guard` | CLOUD 行的预期原因，取**路由器自己的 reason**：`no-match` / `low-confidence` / `no-args` / `topic-mention` / `weak-write-match` / `long-text` / `internal-message` |
 
 空值一律用 `-` 占位，保证每行恰好 8 列。
 
@@ -328,5 +328,47 @@ adb shell "run-as com.pilot.agent cat files/assistant_fastpath.log"
 - [x] 决策 D1–D6 冻结（§0.2）
 - [x] v1 能力表（§2.2）与执行器映射
 - [x] P4 收敛策略与迁移顺序（§5）
-- [x] 验收语料 `corpus.tsv`（22 正 + 15 反，共 37 条）
+- [x] 验收语料 `corpus.tsv`（22 正 + 17 反，共 39 条）
 - [x] 接线点、优先级链、trace 字段（§3.2 / §2.3 / §4.4）
+
+## 11. P1 产出（路由内核，不接线）
+
+新增包 `app/src/main/java/com/pilot/agent/assistant/routing/`：
+
+| 文件 | 来源 | 说明 |
+|---|---|---|
+| `AssistantRoute.kt` | Minis `AssistantRoute.kt` | 路由模型 + `ConfirmMode` + `SlotType` / `SlotSpec` / `CapabilityRisk` / `CapabilityAction` / `LocalCapability` |
+| `CapabilityRegistry.kt` | Minis `LocalCapabilityRegistry.kt` | 按 Pilot v1 能力裁剪（11 个 capability） |
+| `AssistantRouteMatcher.kt` | Minis `AssistantRouteMatcher.kt` | 原样移植（全量打分，非首命中） |
+| `ChineseTimeParser.kt` | Minis 同名 | 原样移植（中文/英文时间、时长、重复） |
+| `MusicVocabulary.kt` | Minis 同名 | 原样移植（流派/场景/榜单词表） |
+| `SlotExtractor.kt` | Minis `SlotExtractor.kt` | 裁剪移植：保留 v1 能力的确定性抽取 |
+| `AssistantRouter.kt` | Minis `AssistantRouter.kt` | 裁剪移植：五道闸、确认口径、缺槽转原链路 |
+| `DefaultRoutes.kt` | Minis `DefaultAssistantRoutes.kt` | Pilot 种子：Minis 词表 + Pilot 遗留匹配器词表 |
+| `RouteStore.kt` | Minis `AssistantRouteStore.kt` | `filesDir/assistant/routes.json`，原子写 + 自愈 + 种子迁移 |
+
+新增测试 `app/src/test/java/com/pilot/agent/assistant/routing/`：
+
+| 测试 | 说明 |
+|---|---|
+| `CorpusRoutingTest` | 语料驱动：LOCAL 行断言能力/动作/槽位，CLOUD 行断言原因 |
+| `AssistantRouteMatcherTest` | 匹配器契约（归一化、词边界、排除、打分） |
+| `SlotExtractorTest` | 槽位契约（音量、路径、正文、记忆、应用、音乐语义） |
+| `ChineseTimeParserTest` | 时间解析契约 |
+| `RouteStoreTest` | 存储契约（种子、校验、持久化、自愈、导入导出） |
+
+构建改动 `app/build.gradle.kts`：新增 `junit:junit:4.13.2` 与 `org.json:json:20231013`
+（路由层沿用 `org.json`，单测用真实实现替换 android.jar 的桩），并开启
+`unitTests.isReturnDefaultValues = true`。
+
+**P1 验收结果（2026-11-18）**：`./gradlew testDebugUnitTest` → **32 个单测全绿**。
+语料 39 条（22 正 + 17 反）逐条断言「本地接管 + 能力 + 动作 + 槽位」或「不接管 + 原因」。
+
+语料在 P1 期间做过两处校准（**实现没动，期望值修正**）：
+
+- 表头行改为注释行（原先被当成数据行参与断言）。
+- 新增两条反例补齐缺口：`neg-file-write-no-path`（写文件没路径 → `no-args`）、
+  `neg-volume-no-args`（音量没数值 → `no-args`）；原「写个方案」「把整段话保存下来」
+  「帮我记住」「打开」实际是 `no-match`（根本没命中路由），已改成实际原因。
+
+
