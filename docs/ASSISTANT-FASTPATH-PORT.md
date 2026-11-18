@@ -503,6 +503,19 @@ adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent \
   completed=write_file args={"path":"…minis_fastpath_model.txt","content":"hello"}
 ```
 
+聊天 UI 端到端（用户输入同一句 → 确认框 → 确认）：
+
+```
+[17:49:33] enter enabled=true source=ui
+[17:49:33] model-fill-needed: capability=file_write missing=[content]
+[17:49:34] model-fill-ok: capability=file_write
+[17:49:36] handled: capability=file_write/write status=SUCCESS len=96
+$ cat /sdcard/Download/minis_fastpath_model.txt
+hello
+```
+
+从输入到确认框约 1 秒（模型 1 次命中），确认后写入成功。
+
 接线：
 
 | 入口 | 行为 |
