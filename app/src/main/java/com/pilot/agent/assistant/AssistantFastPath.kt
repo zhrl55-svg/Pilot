@@ -115,7 +115,14 @@ object AssistantFastPath {
         }
 
         // 安全闸：值必须来自用户原话，破坏性命令不执行。
-        when (val safety = CapabilitySafety.check(decision, trimmed)) {
+        // 还要交给模型补的槽位允许暂时缺失 —— 补完会再跑一次完整校验。
+        when (
+            val safety = CapabilitySafety.check(
+                decision,
+                trimmed,
+                pending = decision.missingSlots,
+            )
+        ) {
             is CapabilitySafety.Verdict.Deny -> {
                 FastPathTrace.line(
                     context,
@@ -158,10 +165,7 @@ object AssistantFastPath {
         val llm = AgentRuntime.localLlm
         val filler = SlotFiller(
             available = { llm.abiSupported() && llm.modelPresent() },
-            generate = { prompt ->
-                val suffix = if (llm.wantsNoThink) "\n/no_think" else ""
-                llm.generate(prompt + suffix)
-            },
+            generate = { prompt -> llm.generate(prompt) },
         )
         val filled = withContext(Dispatchers.Default) {
             filler.fill(
@@ -169,6 +173,7 @@ object AssistantFastPath {
                 capability = plan.capability,
                 args = plan.args,
                 missing = plan.decision.missingSlots,
+                noThink = llm.wantsNoThink,
             )
         }
         if (filled == null) {

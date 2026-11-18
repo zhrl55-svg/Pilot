@@ -14,14 +14,14 @@ import com.pilot.agent.assistant.routing.RouteDecision
  *
  * > **端侧要写出去的内容，必须逐词来自用户自己的原话。**
  *
- * 这条由逐词/子序列校验兜底 —— 模型把 `ls -la` 截成 `ls`、把占位符抄成
- * 「示例值」，都会在这一层被丢掉。
+ * 这条由逐词/连续子串校验兜底 —— 模型把 `ls -la` 截成 `ls`、把占位符抄成
+ * 「示例值」、把「明天开会」截成「明天会」，都会在这一层被丢掉。
  *
  * 移植自 Minis 的 `LocalAssistantRouter.isSafe`，按 Pilot 的 v1 能力裁剪。
  */
 object CapabilitySafety {
 
-    /** 标点：子序列比对时忽略。 */
+    /** 标点：派生值比对时忽略。 */
     private const val PUNCTUATION = "，。；、！？：,.!?;:'\"()（）【】[]{}"
 
     /**
@@ -32,13 +32,13 @@ object CapabilitySafety {
     private val VERBATIM_SLOTS = setOf("path", "url", "command")
 
     /**
-     * 子序列型槽位：措辞可以变，字不能凭空多。
+     * 派生型槽位：必须是用户原话里的一段**连续**片段。
      *
      * 写入正文、应用名、记忆内容都是「从用户那句话里摘出来的一段」，
-     * 用子序列判定：「我喜欢喝咖啡」是「记住我喜欢喝咖啡」的子序列，
-     * 而「家乐福」不是。
+     * 「我喜欢喝咖啡」是「记住我喜欢喝咖啡」的连续子串，
+     * 而「家乐福」不是，截断的「明天会」（原话「明天开会」）也不是。
      */
-    private val SUBSEQUENCE_SLOTS = setOf("query", "keywords", "content", "app")
+    private val DERIVED_SLOTS = setOf("query", "keywords", "content", "app")
 
     /**
      * 破坏性命令 —— 即使用户原话里有，也不该由端侧直接执行。
@@ -67,18 +67,24 @@ object CapabilitySafety {
     /**
      * @param decision 路由器的本地决策
      * @param userText 用户原话
+     * @param pending 还要交给端侧模型补的槽位。这些槽位**允许暂时缺失**，
+     *   补值后会再跑一次完整校验（不带 pending）。
      */
-    fun check(decision: RouteDecision.Local, userText: String): Verdict {
+    fun check(
+        decision: RouteDecision.Local,
+        userText: String,
+        pending: Set<String> = emptySet(),
+    ): Verdict {
         val args = decision.args
 
-        // 逐字 / 子序列校验：值必须来自用户自己的话。
+        // 逐字 / 连续子串校验：值必须来自用户自己的话。
         args.keys().forEach { key ->
             val value = args.optString(key)
             if (value.isBlank()) return@forEach
             if (key in VERBATIM_SLOTS && !isVerbatim(value, userText)) {
                 return Verdict.Deny("slot-not-verbatim:$key")
             }
-            if (key in SUBSEQUENCE_SLOTS && !isDerivedFrom(value, userText)) {
+            if (key in DERIVED_SLOTS && !isContiguousFrom(value, userText)) {
                 return Verdict.Deny("slot-not-derived:$key")
             }
         }
@@ -86,9 +92,13 @@ object CapabilitySafety {
         when (decision.capability) {
             "file_write" -> {
                 val path = args.optString("path")
-                if (path.isBlank()) return Verdict.Deny("file-write-without-path")
+                if (path.isBlank() && "path" !in pending) {
+                    return Verdict.Deny("file-write-without-path")
+                }
                 val content = args.optString("content")
-                if (content.isBlank()) return Verdict.Deny("file-write-without-content")
+                if (content.isBlank() && "content" !in pending) {
+                    return Verdict.Deny("file-write-without-content")
+                }
             }
             "volume" -> {
                 val percent = args.optInt("percent", 0)
@@ -135,22 +145,18 @@ object CapabilitySafety {
     }
 
     /**
-     * 子序列判定：「附近的超市」不是「附近有超市吗」的子串，
-     * 但去掉空白标点后是它的子序列 —— 模型把「超市」摘出来是合法的，
-     * 凭空造一个「家乐福」就不是。
+     * 连续子串判定：「附近的超市」里的「超市」合法，凭空造一个「家乐福」不合法。
+     *
+     * 早期版本用的是**子序列**校验，真机实测放过了 0.6B 的截断输出
+     * （把「明天开会」抽成「明天会」——字都在原话里、顺序也对，但不是原话的连续片段），
+     * 这类值执行起来就是错的。收紧成去掉空白标点后的连续子串：
+     * 允许模型摘抄片段，不允许它改写 / 漏字。
      */
-    fun isDerivedFrom(content: String, userText: String): Boolean {
+    fun isContiguousFrom(content: String, userText: String): Boolean {
         val c = content.filter { !it.isWhitespace() && it !in PUNCTUATION }
         if (c.isEmpty()) return false
         val u = userText.filter { !it.isWhitespace() && it !in PUNCTUATION }
-        var i = 0
-        for (ch in u) {
-            if (ch == c[i]) {
-                i++
-                if (i == c.length) return true
-            }
-        }
-        return false
+        return u.contains(c)
     }
 
     private fun tokenize(text: String): List<String> =

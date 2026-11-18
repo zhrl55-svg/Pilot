@@ -110,11 +110,63 @@ class SlotFillerTest {
     }
 
     @Test
+    fun `no_think stays inside the user turn`() {
+        val filler = SlotFiller({ true }, { null })
+        val prompt = filler.buildPrompt(
+            "保存到 /tmp/a.txt 内容 hello",
+            "file_write",
+            listOf("content"),
+            noThink = true,
+        )
+        val thinkIndex = prompt.indexOf("/no_think")
+        val assistantIndex = prompt.lastIndexOf("<|im_start|>assistant")
+        assertTrue("no_think should be present", thinkIndex > 0)
+        assertTrue(
+            "no_think must come before the assistant turn (otherwise the model answers empty)",
+            thinkIndex < assistantIndex,
+        )
+    }
+
+    @Test
     fun `prompt uses real demo values and stays short`() {
         val filler = SlotFiller({ true }, { null })
         val prompt = filler.buildPrompt("把 hello 写入 /tmp/a.txt", "file_write", listOf("content"))
-        assertTrue(prompt.contains("""{"content":"hello"}"""))
+        assertTrue(prompt.contains("""{"content":"小结"}"""))
         assertTrue(!prompt.contains("示例值"))
         assertTrue("prompt should stay compact", prompt.length < 400)
+    }
+
+    @Test
+    fun `the demo matching the user phrasing is chosen`() {
+        val filler = SlotFiller({ true }, { null })
+        val prompt = filler.buildPrompt(
+            "保存到 /sdcard/Download/note.txt 内容 明天开会",
+            "file_write",
+            listOf("content"),
+        )
+        // 「保存到 … 内容 …」句式必须用同构例句，否则 0.6B 会把路径抄成正文。
+        assertTrue(prompt.contains("保存到 /tmp/c.txt 内容 小结"))
+        assertTrue(!prompt.contains("写入 /tmp/a.txt"))
+    }
+
+    @Test
+    fun `a truncated attempt is rejected and the next one is used`() {
+        var calls = 0
+        val filler = SlotFiller(
+            available = { true },
+            generate = {
+                calls++
+                // 第一次截断（「明天会」），第二次才是完整值。
+                if (calls == 1) """{"content":"明天会"}""" else """{"content":"明天开会"}"""
+            },
+        )
+        val merged = filler.fill(
+            userText = "保存到 /sdcard/Download/note.txt 内容 明天开会",
+            capability = "file_write",
+            args = JSONObject().put("path", "/sdcard/Download/note.txt"),
+            missing = setOf("content"),
+        )
+        assertEquals("明天开会", merged?.optString("content"))
+        assertEquals(2, calls)
     }
 }

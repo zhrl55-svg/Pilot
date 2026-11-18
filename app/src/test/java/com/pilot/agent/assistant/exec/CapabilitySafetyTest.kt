@@ -43,9 +43,13 @@ class CapabilitySafetyTest {
     }
 
     @Test
-    fun `derived values may reword but not invent`() {
-        assertTrue(CapabilitySafety.isDerivedFrom("超市", "附近有超市吗"))
-        assertFalse(CapabilitySafety.isDerivedFrom("家乐福", "附近有超市吗"))
+    fun `derived values must be a contiguous slice of the user text`() {
+        assertTrue(CapabilitySafety.isContiguousFrom("超市", "附近有超市吗"))
+        assertFalse(CapabilitySafety.isContiguousFrom("家乐福", "附近有超市吗"))
+        // 真机上 0.6B 的截断输出：「明天会」字都在，但不是「明天开会」的连续片段。
+        assertFalse(CapabilitySafety.isContiguousFrom("明天会", "保存到 /sdcard/a.txt 内容 明天开会"))
+        assertFalse(CapabilitySafety.isContiguousFrom("明天会议", "保存到 /sdcard/a.txt 内容 明天开会"))
+        assertTrue(CapabilitySafety.isContiguousFrom("明天开会", "保存到 /sdcard/a.txt 内容 明天开会"))
     }
 
     @Test
@@ -93,6 +97,29 @@ class CapabilitySafetyTest {
     fun `an out of range volume is rejected`() {
         val decision = local("volume", "adjust", JSONObject().put("percent", 500))
         assertTrue(CapabilitySafety.check(decision, "调大音量") is CapabilitySafety.Verdict.Deny)
+    }
+
+    @Test
+    fun `slots waiting for the on-device model may be empty`() {
+        // 模型补值前：content 还没抽出来，但它在 pending 里 —— 允许通过。
+        val decision = local(
+            "file_write",
+            "write",
+            JSONObject().put("path", "/sdcard/Download/a.txt"),
+        )
+        assertEquals(
+            CapabilitySafety.Verdict.Allow,
+            CapabilitySafety.check(
+                decision,
+                "保存到 /sdcard/Download/a.txt 内容 hello",
+                pending = setOf("content"),
+            ),
+        )
+        // 补完再跑完整校验：content 仍然空 → 拒绝。
+        assertTrue(
+            CapabilitySafety.check(decision, "保存到 /sdcard/Download/a.txt 内容 hello")
+                is CapabilitySafety.Verdict.Deny,
+        )
     }
 
     @Test

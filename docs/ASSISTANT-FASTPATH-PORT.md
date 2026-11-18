@@ -130,7 +130,7 @@ app/src/main/java/com/pilot/agent/assistant/
 ├── routing/ChineseTimeParser.kt       ← 原样
 ├── routing/AssistantRouter.kt         ← 原样
 ├── exec/CapabilityExecutor.kt         ← capability/action → ToolInvocation → LocalToolRuntime.execute
-├── exec/CapabilitySafety.kt           ← 自 LocalAssistantRouter（破坏性命令/重定向/管道/写入子序列）
+├── exec/CapabilitySafety.kt           ← 自 LocalAssistantRouter（破坏性命令/重定向/管道/写入连续子串）
 ├── exec/ResultFormatter.kt            ← 自 LocalResultFormatter + AssistantFastPath.formatResult
 ├── exec/Trace.kt                      ← assistant_fastpath.log
 └── llm/SlotFiller.kt                  ← 自 LocalIntentPlanner，适配 voice/LocalLlm
@@ -152,7 +152,7 @@ Minis 的 `LocalIntentPlanner` prompt 是纯文本补全，Pilot 的本地规划
 
 1. prompt ≤ 260 字；
 2. few-shot 示例必须是**另一句真实用户话 + 从这句话抽出的真实值**，不能用占位符；
-3. 值必须逐词/子序列来自用户原话，否则丢弃 → 规则兜底 → 仍失败则转云端。
+3. 值必须逐词/连续子串来自用户原话，否则丢弃 → 规则兜底 → 仍失败则转云端。
 
 ---
 
@@ -379,7 +379,7 @@ adb shell "run-as com.pilot.agent cat files/assistant_fastpath.log"
 |---|---|
 | `assistant/AssistantFastPath.kt` | 编排：开关 → 扩展意图排除 → 路由 → 安全闸 → 执行器 → 返回计划 |
 | `assistant/exec/CapabilityExecutor.kt` | 能力 → `ToolInvocation`（落到 Pilot 已有执行器，不新写工具） |
-| `assistant/exec/CapabilitySafety.kt` | 逐词/子序列校验、破坏性命令闸、破坏性必确认 |
+| `assistant/exec/CapabilitySafety.kt` | 逐词/连续子串校验、破坏性命令闸、破坏性必确认 |
 | `assistant/exec/ResultFormatter.kt` | 「✅ 动作 + 参数 + 结果」与播报摘要 |
 | `assistant/exec/FastPathTrace.kt` | 诊断轨迹 `files/assistant_fastpath.log` |
 
@@ -447,12 +447,61 @@ adb shell "run-as com.pilot.agent sed -i 's|<boolean name=\"assistant_fast_path\
 - **只补自由文本槽**：路由层选能力、规则抽参，抽不全且能力允许时
   （`needsLlm` = file_write / media）才叫模型补缺的槽位。
 - **防幻觉**：补出来的值必须能追溯到用户原话 —— 路径/网址/命令逐词校验，
-  正文/查询词/应用名子序列校验；一个有效值都没有就返回 null。
-- **补不出来就回落**：模型不可用、JSON 吐坏（重试一次）、值被校验丢掉 →
-  `complete()` 返回 null，调用方调用 `dispatchWithoutFastPath`，行为和没有
-  快路径时完全一致。
-- **prompt ≤ 400 字符**：一句指令 + 参数名 + 真实示例（**禁止占位符**） + 原话；
-  Qwen3 系模型自动补 `/no_think`。
+  正文/查询词/应用名**连续子串**校验（原实现是子序列，真机实测放过了截断值
+  「明天开会」→「明天会」，见 13.1）；一个有效值都没有就返回 null。
+- **补不出来就回落**：模型不可用、JSON 吐坏、值被校验丢掉 → 最多换 3 次
+  prompt/重采，仍不过 → `complete()` 返回 null，调用方 `dispatchWithoutFastPath`，
+  行为和没有快路径时完全一致。
+- **prompt ≤ 400 字符**：一句指令 + **一条同构例句** + 原话；Qwen3 系模型
+  自动补 `/no_think`（独占一行）。
+
+### 13.1 端侧 prompt 形态实测（P40 / Qwen3-0.6B，2026-11-18）
+
+初版 prompt 是「system 指令 + 多轮『用户：… / 输出：…』示例」，真机上模型
+**输出空串**（778ms 首字、立即 EOS），表现为用户在聊天框输入
+「保存到 /sdcard/Download/minis_fastpath_model.txt 内容 hello」时
+`model-fill-needed` → `model-fill-failed`，没弹确认框，反而被兜底成云端回复。
+
+用 `llm_probe` 广播探针对比了 20 余种模板（同一句输入、只改 prompt 形态）：
+
+| 形态 | 输出 | 结论 |
+|---|---|---|
+| 多轮「用户：/输出：」示例（初版） | 空串 | ✗ |
+| 示例放 system 回合 | 空串或整段思考（`好的，我现在需要…`） | ✗ |
+| 两条例句（任意排布） | 抄错模板 / 把路径当正文（`"content":"保存到 /sdcard/…"`） | ✗ |
+| 单句内联「例句：X → JSON」+「现在：原话」 | `{"content":"hello"}`，574~826ms | ✓ |
+
+最终形态（`SlotFiller.buildPrompt`）：
+
+```
+<|im_start|>user
+提取参数 content，只输出 JSON。例句：保存到 /tmp/c.txt 内容 小结 → {"content":"小结"}
+现在：<用户原话>
+/no_think<|im_end|>
+<|im_start|>assistant
+```
+
+三条硬结论：
+
+1. **例句必须与用户句式同构**。规则能抽「把 X 写入 Y」，用户说
+   「保存到 Y 内容 X」时 content 要交给模型；此时若例句是「把 … 写入 …」，
+   模型会把路径抄成正文。所以 `DEMOS` 每个能力登记例句的 `hints`，
+   运行时按命中挑最贴近的一条（file_write 备了两种句式）。
+2. **`/no_think` 独占一行**。紧贴正文时会被分词器并成普通文本
+   （实测输出 `明天开会/no_t`），模型随即长篇思考；独占一行才稳定生效。
+3. **采样不稳，必须多重校验**。同一 prompt 连跑：一次正确、一次截断
+   （「明天会」）、一次编造（「明天会议」）。子序列校验放过了截断值，
+   故收紧为连续子串；`fill()` 最多尝试 3 次（首选例句 → 备用例句 → 首选重采），
+   任一次过校验即用。三次都失败才回落 —— 宁可多花 ~1 秒，也不执行错值。
+
+真机自检（修正后，一次命中）：
+
+```
+adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent \
+    --es fastpath_fill_test '保存到 /sdcard/Download/minis_fastpath_model.txt 内容 hello'"
+→ 补值自检：plan=file_write/write missing=[content]
+  completed=write_file args={"path":"…minis_fastpath_model.txt","content":"hello"}
+```
 
 接线：
 
@@ -469,8 +518,9 @@ content），所以模型路径主要覆盖规则漏掉的说法（例如「内�
 手动验证：在聊天框输入这句，观察 `files/assistant_fastpath.log` 里出现
 `model-fill-needed` → `model-fill-ok`，随后是一次带确认的写入。
 
-单元测试 `SlotFillerTest`（8 例）：合并、编造值拒绝、路径越界拒绝、子序列接受、
-空值/未知键丢弃、坏 JSON 重试、模型不可用不调用、prompt 无占位符且足够短。
+单元测试 `SlotFillerTest`（11 例）：合并、编造值拒绝、路径越界拒绝、连续子串接受、
+截断值拒绝后重采、句式同构例句选择、空值/未知键丢弃、坏 JSON 重试、
+模型不可用不调用、prompt 无占位符且足够短、`/no_think` 位置。
 
 **真机自检（P40，2026-11-18）**：
 

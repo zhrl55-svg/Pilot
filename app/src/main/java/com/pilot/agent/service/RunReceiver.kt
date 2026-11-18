@@ -58,6 +58,26 @@ class RunReceiver : BroadcastReceiver() {
             return
         }
 
+        // 端侧补值自检：走完整 plan → complete 流程，但**不执行**工具。
+        //   adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent \
+        //       --es fastpath_fill_test '保存到 /sdcard/Download/a.txt 内容 hello'"
+        val fillTest = intent.getStringExtra("fastpath_fill_test")
+        if (!fillTest.isNullOrBlank()) {
+            Thread {
+                val plan = AssistantFastPath.plan(context, fillTest, "selftest")
+                val completed = plan?.let {
+                    runCatching { runBlocking { AssistantFastPath.complete(context, it) } }.getOrNull()
+                }
+                Dbg.i(
+                    TAG,
+                    "补值自检：plan=${plan?.capability}/${plan?.action} " +
+                        "missing=${plan?.decision?.missingSlots} " +
+                        "completed=${completed?.invocation?.name} args=${completed?.args}",
+                )
+            }.apply { name = "fastpath-fill-test"; isDaemon = true }.start()
+            return
+        }
+
         // 从服务器侧写入网易云 cookie（扫码/验证码在电脑上完成，不用在 App 里走一遍）
         //   adb shell am broadcast -a com.pilot.agent.RUN -p com.pilot.agent.debug \
         //       --es set_netease_cookie "MUSIC_U=xxx; __csrf=yyy"
