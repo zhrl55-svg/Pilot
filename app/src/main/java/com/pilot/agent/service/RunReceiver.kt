@@ -180,28 +180,28 @@ class RunReceiver : BroadcastReceiver() {
 
         // 助理快路径：规则选能力 → 确定性抽参 → 本机执行，不调云端。
         // 接管了就不走下面的遗留匹配器，避免同一个请求被执行两遍。
+        // 需要端侧模型补值的请求在无界面场景不处理（保持确定性），照旧走原链路。
         val fastPlan = AssistantFastPath.plan(context, goal, "broadcast")
-        if (fastPlan != null) {
+        val fastInvocation = fastPlan?.invocation
+        if (fastPlan != null && fastInvocation != null) {
+            val capability = fastPlan.capability
+            val action = fastPlan.action
+            val args = fastPlan.args
             Thread {
                 val result = runCatching {
                     runBlocking {
-                        AgentRuntime.localTools.execute(fastPlan.invocation) { question, _ ->
+                        AgentRuntime.localTools.execute(fastInvocation) { question, _ ->
                             Dbg.w(TAG, "快路径无人确认，已拒绝：$question")
                             false
                         }
                     }
                 }.getOrNull()
                 if (result != null) {
-                    val reply = ResultFormatter.format(
-                        fastPlan.capability,
-                        fastPlan.action,
-                        fastPlan.args,
-                        result,
-                    )
+                    val reply = ResultFormatter.format(capability, action, args, result)
                     FastPathTrace.handled(
                         context,
-                        fastPlan.capability,
-                        fastPlan.action,
+                        capability,
+                        action,
                         result.status.name,
                         reply.text.length,
                     )

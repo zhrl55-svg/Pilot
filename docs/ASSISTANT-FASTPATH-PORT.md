@@ -440,6 +440,39 @@ adb shell "run-as com.pilot.agent cat files/assistant_fastpath.log"
 adb shell "run-as com.pilot.agent sed -i 's|<boolean name=\"assistant_fast_path\" value=\"true\" />||' shared_prefs/pilot.xml"
 ```
 
+## 13. P3 产出（端侧抽参）
+
+新增 `assistant/llm/SlotFiller.kt`：
+
+- **只补自由文本槽**：路由层选能力、规则抽参，抽不全且能力允许时
+  （`needsLlm` = file_write / media）才叫模型补缺的槽位。
+- **防幻觉**：补出来的值必须能追溯到用户原话 —— 路径/网址/命令逐词校验，
+  正文/查询词/应用名子序列校验；一个有效值都没有就返回 null。
+- **补不出来就回落**：模型不可用、JSON 吐坏（重试一次）、值被校验丢掉 →
+  `complete()` 返回 null，调用方调用 `dispatchWithoutFastPath`，行为和没有
+  快路径时完全一致。
+- **prompt ≤ 400 字符**：一句指令 + 参数名 + 真实示例（**禁止占位符**） + 原话；
+  Qwen3 系模型自动补 `/no_think`。
+
+接线：
+
+| 入口 | 行为 |
+|---|---|
+| 聊天 UI | `plan()` 认领 → 后台 `complete()`（0.3B 补值）→ 成功则执行，失败回原链路 |
+| 广播 / 语音 | **不跑模型**（无界面场景保持确定性）；需要补值的请求交回原链路 |
+
+为什么广播不跑模型：无 UI 时模型补值失败没有回退通道，而且 1~3 秒的加载/推理
+对免提场景不划算。确定性路径已经是零延迟。
+
+**v1 的实际命中面**：规则已经覆盖常见说法（「把 hello 写入 /tmp/a.txt」由规则抽出
+content），所以模型路径主要覆盖规则漏掉的说法（例如「内容 hello 保存在 /tmp/a.txt」）。
+手动验证：在聊天框输入这句，观察 `files/assistant_fastpath.log` 里出现
+`model-fill-needed` → `model-fill-ok`，随后是一次带确认的写入。
+
+单元测试 `SlotFillerTest`（8 例）：合并、编造值拒绝、路径越界拒绝、子序列接受、
+空值/未知键丢弃、坏 JSON 重试、模型不可用不调用、prompt 无占位符且足够短。
+
+
 
 
 

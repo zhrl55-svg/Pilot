@@ -18,6 +18,7 @@ import com.pilot.agent.agent.AssistantMode
 import com.pilot.agent.agent.IntentGate
 import com.pilot.agent.agent.Risk
 import com.pilot.agent.assistant.AssistantFastPath
+import com.pilot.agent.assistant.FastPathPlan
 import com.pilot.agent.assistant.exec.FastPathTrace
 import com.pilot.agent.assistant.exec.ResultFormatter
 import com.pilot.agent.runtime.AgentRuntime
@@ -1264,15 +1265,56 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * 助理快路径：规则选能力 → 确定性抽参 → 本机执行。
+     * 助理快路径：规则选能力 → 确定性抽参（必要时端侧模型补值）→ 本机执行。
      *
      * 只在**助理模式**下生效（Agent 模式由模型主导决策）；开关默认关。
-     * 决策是同步的（路由是纯计算），执行放到后台线程。
+     * 决策与执行都放到后台：确定性路径不碰模型，需要补值的路径会先跑 0.3B，
+     * 补不出来就回落到 [dispatchWithoutFastPath]，原有链路一行不改。
+     *
+     * @param matchedTool run() 里已经算好的遗留匹配结果，回落时直接复用
      */
-    private fun tryRunFastPath(text: String, allowConfirmation: Boolean): Boolean {
+    private fun tryRunFastPath(
+        text: String,
+        allowConfirmation: Boolean,
+        matchedTool: ToolInvocation?,
+    ): Boolean {
         if (mode != AssistantMode.ASSISTANT) return false
         if (!AssistantFastPath.isEnabled()) return false
         val plan = AssistantFastPath.plan(getApplication(), text, "ui") ?: return false
+
+        // 需要端侧模型补值：先认领，后台补；补不出来再回落原链路。
+        if (plan.invocation == null) {
+            add(LogEntry.Kind.THINK, "端侧理解参数…")
+            running = true
+            justSent = true
+            activeTaskLabel = "本机能力"
+            publishNotificationStatus()
+            viewModelScope.launch {
+                val completed = runCatching {
+                    AssistantFastPath.complete(getApplication(), plan)
+                }.getOrNull()
+                val invocation = completed?.invocation
+                if (completed == null || invocation == null) {
+                    running = false
+                    justSent = false
+                    activeTaskLabel = ""
+                    publishNotificationStatus()
+                    // 端侧没补出来 —— 交回原链路，行为和没有快路径时完全一致。
+                    dispatchWithoutFastPath(text, matchedTool)
+                    return@launch
+                }
+                val result = withContext(Dispatchers.IO) {
+                    AgentRuntime.localTools.execute(invocation) { question, risk ->
+                        if (allowConfirmation) askToolConfirmation(question, risk)
+                        else false
+                    }
+                }
+                finishFastPath(completed, result)
+            }
+            return true
+        }
+
+        val invocation = plan.invocation ?: return false
         add(LogEntry.Kind.THINK, "调用本机能力…")
         running = true
         justSent = true
@@ -1280,30 +1322,35 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         publishNotificationStatus()
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) {
-                AgentRuntime.localTools.execute(plan.invocation) { question, risk ->
+                AgentRuntime.localTools.execute(invocation) { question, risk ->
                     if (allowConfirmation) askToolConfirmation(question, risk)
                     else false
                 }
             }
-            running = false
-            justSent = false
-            activeTaskLabel = ""
-            publishNotificationStatus()
-            val reply = ResultFormatter.format(plan.capability, plan.action, plan.args, result)
-            val kind = if (result.status == ToolStatus.SUCCESS) LogEntry.Kind.DONE
-            else LogEntry.Kind.ERROR
-            add(kind, reply.text)
-            FastPathTrace.handled(
-                getApplication(),
-                plan.capability,
-                plan.action,
-                result.status.name,
-                reply.text.length,
-            )
-            AgentRuntime.speaker.speak(reply.spoken)
-            refreshStatus()
+            finishFastPath(plan, result)
         }
         return true
+    }
+
+    /** 快路径执行的收尾：恢复状态、回执、播报、刷新。 */
+    private fun finishFastPath(plan: FastPathPlan, result: com.pilot.agent.tool.ToolResult) {
+        running = false
+        justSent = false
+        activeTaskLabel = ""
+        publishNotificationStatus()
+        val reply = ResultFormatter.format(plan.capability, plan.action, plan.args, result)
+        val kind = if (result.status == ToolStatus.SUCCESS) LogEntry.Kind.DONE
+        else LogEntry.Kind.ERROR
+        add(kind, reply.text)
+        FastPathTrace.handled(
+            getApplication(),
+            plan.capability,
+            plan.action,
+            result.status.name,
+            reply.text.length,
+        )
+        AgentRuntime.speaker.speak(reply.spoken)
+        refreshStatus()
     }
 
     private suspend fun askToolConfirmation(question: String, risk: Risk): Boolean {
@@ -1347,7 +1394,15 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     ) {
         // 助理快路径优先：规则选能力 → 确定性抽参 → 本机执行，不调云端。
         // 接管了就返回，后面的链路不再执行，避免同一个请求被执行两遍。
-        if (tryRunFastPath(g, allowConfirmation = true)) return
+        if (tryRunFastPath(g, allowConfirmation = true, matchedTool = invocation)) return
+        dispatchWithoutFastPath(g, invocation)
+    }
+
+    /** 原有链路：遗留本地工具 → 意图门 → 助理/Agent 分支。 */
+    private fun dispatchWithoutFastPath(
+        g: String,
+        invocation: ToolInvocation?,
+    ) {
         if (tryRunLocalTool(g, allowConfirmation = true, matchedTool = invocation)) return
 
         val kind = IntentGate.classify(g)
