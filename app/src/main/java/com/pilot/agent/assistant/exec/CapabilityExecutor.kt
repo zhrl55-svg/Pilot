@@ -58,6 +58,18 @@ class CapabilityExecutor(
     private fun appLaunch(args: JSONObject): ToolInvocation? {
         val app = args.optString("app").trim()
         if (app.isBlank()) return null
+
+        // 先看能不能真的打开：
+        // 1) 系统设置页 / 系统动作 / deep link —— 不需要索引，最稳；
+        // 2) 普通 App —— 要索引里有它的启动入口。
+        //
+        // ★ 两样都没有就**交回原链路**（返回 null），而不是回一句「没找到「X」」。
+        //   原链路的 agent 还能在屏幕上找；快路径不能把用户的请求做死。
+        //   索引没建好时（appIndexProvider() 为 null）尤其要这样。
+        val catalog = ActionCatalog.resolve(app)
+        val entry = if (catalog == null) appIndexProvider()?.resolve(app) else null
+        if (catalog == null && entry == null) return null
+
         val summary = "打开 $app"
         return ToolInvocation(
             name = "open_app",
@@ -65,8 +77,7 @@ class CapabilityExecutor(
             summary = summary,
             confirmation = "允许打开「$app」吗？",
         ) { ctx, _ ->
-            // 1) 系统设置页 / 系统动作 / deep link：最稳，优先。
-            val catalog = ActionCatalog.resolve(app)
+            // 1) 系统设置页 / 系统动作 / deep link。
             if (catalog != null) {
                 val intent = ActionCatalog.toIntent(catalog)
                 return@ToolInvocation runCatching { ctx.startActivity(intent) }
@@ -75,28 +86,25 @@ class CapabilityExecutor(
                         onFailure = { ToolResult.error("打开「${catalog.label}」失败：${it.message}") },
                     )
             }
-            // 2) App 内入口 / App 图标：需要无障碍服务才能可靠启动。
-            val entry = appIndexProvider()?.resolve(app)
-            if (entry == null) {
-                return@ToolInvocation ToolResult.error("没找到「$app」，可以用名字再说一次。")
-            }
+            // 2) App 内入口：需要无障碍服务才能可靠启动。
+            val launchable = entry ?: return@ToolInvocation ToolResult.error("没找到「$app」")
             val actions = actionsProvider()
             if (actions != null) {
-                val ok = actions.launchComponent(entry.pkg, entry.component.className)
+                val ok = actions.launchComponent(launchable.pkg, launchable.component.className)
                 return@ToolInvocation if (ok) {
-                    ToolResult.success("已打开「${entry.appLabel}」")
+                    ToolResult.success("已打开「${launchable.appLabel}」")
                 } else {
-                    ToolResult.error("没能打开「${entry.appLabel}」。")
+                    ToolResult.error("没能打开「${launchable.appLabel}」。")
                 }
             }
             // 3) 没有无障碍服务：退回包名主入口。
-            val launch = ctx.packageManager.getLaunchIntentForPackage(entry.pkg)
+            val launch = ctx.packageManager.getLaunchIntentForPackage(launchable.pkg)
                 ?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 ?: return@ToolInvocation ToolResult.error("没找到「$app」的主入口。")
             runCatching { ctx.startActivity(launch) }
                 .fold(
-                    onSuccess = { ToolResult.success("已打开「${entry.appLabel}」") },
-                    onFailure = { ToolResult.error("打开「${entry.appLabel}」失败：${it.message}") },
+                    onSuccess = { ToolResult.success("已打开「${launchable.appLabel}」") },
+                    onFailure = { ToolResult.error("打开「${launchable.appLabel}」失败：${it.message}") },
                 )
         }
     }

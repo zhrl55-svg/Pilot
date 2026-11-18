@@ -25,13 +25,15 @@ enum class FastPathOwner {
  * 默认归属。
  *
  * 提升顺序（风险从低到高）：device → memory_get → memory_write → screenshot →
- * file_* → scheduled_task。每提升一个都要先用 [FastPathOwner.SHADOW] 在真机
- * 对照 10 句语料（5 正 + 5 反），分歧为 0 再切 [FastPathOwner.ROUTE]。
+ * file_* → scheduled_task → volume → media → reminder → app_launch。
+ * 每提升一个都要先用 [FastPathOwner.SHADOW] 在真机对照 10 句语料
+ * （5 正 + 5 反），分歧为 0 再切 [FastPathOwner.ROUTE]。
  *
- * 现状（2026-11-18 真机影子对照后）：device / memory_get / memory_write /
- * screenshot / file_read / file_write / scheduled_task 已提升为 [ROUTE]；
- * app_launch / volume / media / reminder 仍留 [LEGACY] —— 这四类在遗留链路里
- * 匹配器不接、由下游规划器处理，提升等于换执行路径，得单独评估。
+ * 现状（2026-11-18 真机影子对照后）：v1 的 11 个能力**全部**已提升为 [ROUTE]。
+ * 最后一批（app_launch / volume / media / reminder）在遗留链路里匹配器不接、
+ * 由下游规划器处理，提升等于换执行路径 —— 评估要点见文档 §17。
+ *
+ * 以后新增能力默认仍是 [LEGACY]：新能力没做过影子对照，不该自动接管。
  *
  * 注意：这份默认值只决定**新装**的归属。已经装过的机器以
  * `files/assistant/routes.json` 里存的为准（设置页或广播改过就保留），
@@ -47,6 +49,10 @@ object DefaultOwners {
         "file_read",
         "file_write",
         "scheduled_task",
+        "volume",
+        "media",
+        "reminder",
+        "app_launch",
     )
 
     val all: Map<String, FastPathOwner> =

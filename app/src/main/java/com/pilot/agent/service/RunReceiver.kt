@@ -88,6 +88,24 @@ class RunReceiver : BroadcastReceiver() {
             return
         }
 
+        // 提醒维护：按标题关键词取消提醒。
+        //   DELETE 组在无界面场景一律拒绝确认，清理测试提醒只能走这里。
+        //   adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent \
+        //       --es reminder_cancel '快路径验收样本'"
+        val reminderKeyword = intent.getStringExtra("reminder_cancel")
+        if (!reminderKeyword.isNullOrBlank()) {
+            Thread {
+                val message = runCatching {
+                    com.pilot.agent.action.ReminderManager.handle(
+                        context,
+                        "取消提醒 ${reminderKeyword.trim()}",
+                    )
+                }.getOrNull()
+                Dbg.i(TAG, "提醒维护：取消「$reminderKeyword」→ ${message ?: "失败"}")
+            }.apply { name = "reminder-cancel"; isDaemon = true }.start()
+            return
+        }
+
         // 记忆维护（按 id 精确删除）：清理测试数据用这个。
         //   adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent \
         //       --es memory_delete_id 7"

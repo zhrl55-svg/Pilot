@@ -61,4 +61,25 @@ class AssistantRouterTest {
         assertEquals("memory_get", decision.capability)
         assertEquals("search", decision.action)
     }
+
+    @Test
+    fun `a question about opening is not an instruction to open`() {
+        // 「怎么打开应用」含关键词「打开应用」，但用户在**问**怎么打开。
+        // 当成打开指令会去打开一个叫「应用」的东西。
+        val decision = router.route("怎么打开应用", DefaultRoutes.all)
+        assertTrue("疑问句不该被当成指令", decision is RouteDecision.Cloud)
+        assertEquals(
+            "question-not-command",
+            (decision as RouteDecision.Cloud).reason,
+        )
+    }
+
+    @Test
+    fun `questions may still query read only capabilities`() {
+        // 「怎么查电量」是问状态 —— 回答电量没什么不对，只读能力不挡。
+        val decision = router.route("怎么查电量", DefaultRoutes.all)
+        assertTrue("查询型能力照常接管", decision is RouteDecision.Local)
+        decision as RouteDecision.Local
+        assertEquals("device", decision.capability)
+    }
 }

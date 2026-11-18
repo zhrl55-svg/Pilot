@@ -75,15 +75,13 @@ class RouteStoreTest {
                 DefaultOwners.all[capability.id],
                 store.ownerFor(capability.id),
             )
+            // v1 的 11 个能力全部已提升（2026-11-18 真机影子对照后）。
+            assertEquals(
+                "「${capability.id}」应当由快路径接管",
+                FastPathOwner.ROUTE,
+                store.ownerFor(capability.id),
+            )
         }
-        // 明确留着的四个：遗留匹配器不接、由下游规划器处理，提升等于换执行路径。
-        listOf("app_launch", "volume", "media", "reminder").forEach {
-            assertEquals(FastPathOwner.LEGACY, store.ownerFor(it))
-        }
-        listOf("device", "memory_get", "memory_write", "screenshot", "file_read", "file_write", "scheduled_task")
-            .forEach {
-                assertEquals(FastPathOwner.ROUTE, store.ownerFor(it))
-            }
     }
 
     @Test
@@ -96,7 +94,8 @@ class RouteStoreTest {
         val reloaded = RouteStore(dir)
         assertEquals(FastPathOwner.SHADOW, reloaded.ownerFor("device"))
         assertEquals(FastPathOwner.ROUTE, reloaded.ownerFor("memory_get"))
-        assertEquals(FastPathOwner.LEGACY, reloaded.ownerFor("volume"))
+        // 没显式改过的能力跟出厂默认走（v1 全部已提升）。
+        assertEquals(FastPathOwner.ROUTE, reloaded.ownerFor("file_write"))
     }
 
     @Test

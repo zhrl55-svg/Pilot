@@ -91,6 +91,20 @@ class AssistantRouter(
 
         val readOnly = action.readOnly
         val highRisk = action.risk == CapabilityRisk.HIGH
+
+        // 疑问句不是指令。
+        //
+        // 「怎么打开应用」里含关键词「打开应用」，本来会被当成打开 App 的指令 ——
+        // 打开一个叫「应用」的东西。用户在**问**怎么打开，不是在**要**你打开。
+        //
+        // 只挡动作型能力（打开、调音量、播放控制、建提醒…）；查询型
+        // （查电量、看播放状态、搜记忆）照常接管 —— 回答状态本身没问题。
+        if (!readOnly) {
+            val normalized = AssistantRouteMatcher.normalizeText(userText)
+            if (QUESTION_CUES.any { normalized.contains(it) }) {
+                return RouteDecision.Cloud("question-not-command", ranked = ranked)
+            }
+        }
         // 只有破坏性操作才弹确认卡。
         //
         // 之前 Minis 的口径是「任何写操作都要确认」，结果「暂停播放」「设个闹钟」
@@ -210,6 +224,14 @@ class AssistantRouter(
 
         /** 超过这个长度还只命中一个短关键词，就当成「提到」而非「命令」。 */
         const val TOPIC_MENTION_MIN_LENGTH = 14
+
+        /**
+         * 疑问词：出现在**动作型**能力里就是「在问」，不是在「要你做」。
+         *
+         * 故意不含「什么」——「你还记得我喜欢喝什么吗」是查记忆，问句也该接管；
+         * 「什么」太常见，挡掉会误伤查询。
+         */
+        val QUESTION_CUES = listOf("怎么", "如何", "怎样", "为什么", "咋")
 
         /** 媒体路由的最大指令长度，超出走云端。 */
         const val MEDIA_COMMAND_MAX_LENGTH = 20

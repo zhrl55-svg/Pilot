@@ -275,7 +275,7 @@ TSV 列（`#` 开头为注释）：
 | `capability` / `action` | LOCAL 必填 |
 | `args` | `k=v` 用 `;` 分隔；`k=*` 表示必须存在且非空；`-` 表示无参数/不约束 |
 | `needs_llm` | `1` = 该句预期要端侧模型补值（纯规则测试可跳过） |
-| `guard` | CLOUD 行的预期原因，取**路由器自己的 reason**：`no-match` / `low-confidence` / `no-args` / `topic-mention` / `weak-write-match` / `long-text` / `internal-message` |
+| `guard` | CLOUD 行的预期原因，取**路由器自己的 reason**：`no-match` / `low-confidence` / `no-args` / `topic-mention` / `weak-write-match` / `long-text` / `internal-message` / `question-not-command` |
 
 空值一律用 `-` 占位，保证每行恰好 8 列。
 
@@ -693,9 +693,8 @@ adb shell "run-as com.pilot.agent cat files/assistant_fastpath.log"
   显式关过的用户保留 `false`（key 已存在时以存储值为准）。
 - **回滚**：设置页关闭开关即可；不需要回退代码。快路径任何一步失败都会回落
   原链路，关闭后行为与移植前完全一致。
-- **未提升的能力**：`app_launch` / `volume` / `media` / `reminder` 仍是 `LEGACY`。
-  这四个在遗留链路里匹配器不接、由下游规划器处理，提升等于换执行路径，
-  评估要点见 §16.7。（`memory_write` / `screenshot` 已于 §16.6 提升。）
+- **未提升的能力**：v1 的 11 个能力已全部提升为 `ROUTE`（最后一批见 §17）。
+  以后**新增**能力默认仍是 `LEGACY` —— 新能力没做过影子对照，不该自动接管。
 
 #### 手动验证端侧补值（修正后的句子）
 
@@ -863,7 +862,63 @@ fast   侧：记住 影子对照样本乙 → memories.content = "影子对照�
 | `app_launch` | READ 组**不弹确认**；索引未建 / 无障碍未连时是"没找到「X」"的报错，而 agent 会继续找图标点进去 |
 
 做法同 §16.1：先 `fastpath_owner '<cap>=SHADOW'`，用 5 正 + 5 反语料跑对照，
-再逐个切 ROUTE。
+再逐个切 ROUTE。**结果见 §17。**
+
+## 17. 最后一批：app_launch / volume / media / reminder（2026-11-18）
+
+### 17.1 两边对照（`fastpath_compare`，39 句）
+
+四个能力的 `legacy` 一律是 `none` —— 它们今天由下游规划器/管理器处理，
+所以这里比的不是"匹配器"，而是"快路径的判定是否说得通"。
+
+| 能力 | 正例（快路径判定） | 反例 |
+|---|---|---|
+| `volume` | 音量调到 60% → set 60 / 声音大一点 → adjust +10 / 调大音量 → adjust +20 / 音量状态 → status / 音量调小 20% → adjust −20 / 把声音调到 30 → set 30 | 音量设置在哪 / 讨论一下音量调节的原理 / 音量 / 怎么实现音量控制功能 → no-match；音量调到 → no-args |
+| `media` | 暂停音乐 / 下一首 / 继续播放 / 上一首 / 查看播放列表 → 对应动作；播放晴天 → play(kind=song, query=晴天) | 讨论一下音乐推荐的原理 / 音乐怎么下载 / 来点轻音乐 → no-match |
+| `app_launch` | 打开设置 → 设置 / 启动微信 → 微信 / 打开相机 → 相机 / 打开音乐 → 音乐 | 打开设置页 / 打开音量设置 / 打开网页 / 打开 → no-match；**怎么打开应用 → question-not-command** |
+| `reminder` | 半小时后提醒我喝水 → schedule(after=1799, title=喝水) / 明天下午三点提醒我开会 → schedule(at=…, title=开会) / 我的提醒 → list / 取消提醒 → cancel(确认) | 讨论一下提醒的实现 / 怎么设置提醒 / 邮件提醒怎么关 / 提醒 → no-match；**提醒我买牛奶 → no-args（按设计：提醒必须有时间点）** |
+
+### 17.2 对照抓到的两个问题（已修）
+
+1. **疑问句被当成指令**：「怎么打开应用」含关键词「打开应用」，于是快路径会去打开一个
+   叫「应用」的东西 —— 用户明明在**问**怎么打开。
+   修法：路由器加一道**疑问句闸**（`QUESTION_CUES`：怎么 / 如何 / 怎样 / 为什么 / 咋），
+   只挡**动作型**能力；查询型（查电量、看状态、搜记忆）照常接管 —— 回答状态没问题。
+   故意不含「什么」：「你还记得我喜欢喝什么吗」是查记忆，问句也该接管。
+2. **app_launch 会把用户请求做死**：索引没建好 / 查不到 App 时，原实现回一句
+   「没找到「X」」就结束了；agent 还能在屏幕上找。
+   修法：执行器改成**交回原链路**（返回 null → plan 放弃 → 回落），只有真的能打开
+   （系统设置页走 `ActionCatalog`，普通 App 索引里有启动入口）才接管。
+
+### 17.3 真机执行验证（提升为 ROUTE 之后）
+
+| 输入 | 结果 |
+|---|---|
+| 音量状态 / 音量调到 30 / 声音大一点 | `volume/status`、`volume/set`、`volume/adjust` 全部 SUCCESS |
+| 音量调到 80 | 系统实际音量 33% → 80%（`dumpsys audio` 确认 `streamVolume` 变化），随后恢复到 33% |
+| 播放状态 | `media/status` SUCCESS（没有在播放时如实说"现在没有在播放"）|
+| 暂停播放 | `media/pause` UNAVAILABLE（如实说没在播，不是假装成功）|
+| 半小时后提醒我 快路径验收样本 | `reminder/schedule` SUCCESS；`我的提醒` → `reminder/list` SUCCESS；测试提醒已按标题取消 |
+| 打开相机 / 打开设置 | `app_launch/open` SUCCESS，前台变成 `com.huawei.camera/.controller.CameraActivity` |
+| 播放晴天 | `no-route: no-executor` —— `media/play` 没有执行器（检索流水线在 AgentLoop），自动回落原链路 |
+| 怎么打开应用 | `no-route: question-not-command` |
+| 音量设置在哪 / 讨论一下音乐推荐的原理 | `no-route: no-match` |
+| 提醒我买牛奶 | `no-route: no-args`（无时间点不接管，与 agent 的"我还不能确定提醒时间"一致）|
+
+### 17.4 结论：v1 的 11 个能力全部接管
+
+`DefaultOwners.PROMOTED` 现在包含全部 11 个能力 —— **新装机器默认全接管**；
+老机器以 `routes.json` 里存的为准（本次在真机上也逐个切成了 ROUTE）。
+
+以后**新增**能力默认仍是 `LEGACY`：新能力没做过影子对照，不该自动接管。
+
+已知覆盖缺口（不是回归，只是这些说法仍走原链路）：
+
+- `media/play` 的「来点轻音乐」不命中路由（关键词里没有「来点」）；
+  即便命中也没有执行器，一样回落。
+- `reminder` 没有时间点就不接管（「提醒我买牛奶」），由原链路回
+  「我还不能确定提醒时间」。
+- 讨论句「截图功能怎么实现」仍会触发遗留匹配器截屏（§16.4-1，未修）。
 
 
 
