@@ -9,7 +9,12 @@ data class AgentSettings(
     val apiKey: String = "",
     val webSearchApiKey: String = "",
     val model: String = DEFAULT_MODEL,
-    val mode: AssistantMode = AssistantMode.ASSISTANT,
+    /**
+     * 路由模式。现在固定为自动：快路径有规则的指令本机直执行，
+     * 没有规则的交给 Agent（模型决定回答还是执行）。
+     * 字段保留是为了兼容旧的 routes/settings schema，不再对用户暴露。
+     */
+    val mode: AssistantMode = AssistantMode.AGENT,
     val maxTurns: Int = DEFAULT_MAX_TURNS,
     /** Agent 云端模型的思考强度：low / medium / high / xhigh / max。 */
     val reasoningEffort: String = DEFAULT_REASONING_EFFORT,
@@ -179,7 +184,9 @@ data class AgentSettings(
                 apiKey = p.getString(K_KEY, null) ?: "",
                 webSearchApiKey = SecretVault.get(K_WEB_SEARCH_KEY),
                 model = p.getString(K_MODEL, null) ?: DEFAULT_MODEL,
-                mode = AssistantMode.fromStorage(p.getString(K_MODE, null)),
+                // 自动路由：忽略旧版保存的助理/Agent 选择，统一按 Agent 语义执行
+                // （快路径仍在前置，命中规则的确定性指令不会进 Agent）。
+                mode = AssistantMode.AGENT,
                 maxTurns = p.getInt(K_TURNS, DEFAULT_MAX_TURNS)
                     .coerceIn(MIN_AGENT_TURNS, MAX_AGENT_TURNS),
                 reasoningEffort = p.getString(K_REASONING_EFFORT, null)
@@ -221,7 +228,7 @@ data class AgentSettings(
                 .putString(K_URL, s.baseUrl)
                 .putString(K_KEY, s.apiKey)
                 .putString(K_MODEL, s.model)
-                .putString(K_MODE, s.mode.storageValue)
+                .putString(K_MODE, AssistantMode.AGENT.storageValue)
                 .putInt(K_TURNS, s.maxTurns.coerceIn(MIN_AGENT_TURNS, MAX_AGENT_TURNS))
                 .putString(
                     K_REASONING_EFFORT,

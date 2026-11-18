@@ -65,7 +65,22 @@ class NewsSearchTool : QueryTool {
             val combined = (recentDay + recentWeek).distinctBy { it.title to it.source }
                 .sortedByDescending { it.publishedAt }
                 .take(MAX_ITEMS)
-            combined to "最近7天（24小时内结果不足，已扩展范围）"
+            // ★ Google News RSS 在国内网络不可达（经常 InterruptedIOException）。
+            //   这时用国内可达的 Bing News RSS 兜底。
+            val bing = if (combined.isEmpty()) {
+                fetchBingNews(query)
+                    .filter { it.publishedAt in weekStart..(now + FUTURE_SKEW_MS) }
+                    .sortedByDescending { it.publishedAt }
+                    .take(MAX_ITEMS)
+            } else {
+                emptyList()
+            }
+            if (bing.isNotEmpty()) {
+                Dbg.i(TAG, "news fallback: Bing ${bing.size} 条")
+                bing to "最近7天（Bing 新闻）"
+            } else {
+                combined to "最近7天（24小时内结果不足，已扩展范围）"
+            }
         }
         if (items.isEmpty()) return@withContext "最近 7 天没有找到“$query”的新闻。可以换个关键词再搜。"
         formatWithArticles(query, items, rangeLabel)
@@ -92,6 +107,31 @@ class NewsSearchTool : QueryTool {
             }
         } catch (t: Throwable) {
             Dbg.w(TAG, "RSS fetch failed range=$range ${t.javaClass.simpleName}")
+            emptyList()
+        }
+    }
+
+    private fun fetchBingNews(query: String): List<Item> {
+        val encoded = URLEncoder.encode(query, StandardCharsets.UTF_8.name())
+        val url = "https://www.bing.com/news/search?q=$encoded&format=rss&qft=sortbydate%3d%221%22"
+        return try {
+            val request = Request.Builder()
+                .url(url)
+                .header("User-Agent", "PilotAndroid/1.0")
+                .header("Accept", "application/rss+xml, application/xml, text/xml")
+                .get()
+                .build()
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    Dbg.w(TAG, "Bing News RSS HTTP ${response.code}")
+                    emptyList()
+                } else {
+                    val body = response.body?.byteStream() ?: return@use emptyList()
+                    body.use(::parse)
+                }
+            }
+        } catch (t: Throwable) {
+            Dbg.w(TAG, "Bing News RSS failed ${t.javaClass.simpleName}")
             emptyList()
         }
     }
@@ -223,7 +263,10 @@ class NewsSearchTool : QueryTool {
             append(" · ").append(formatDate(item.publishedAt))
             if (index < articleBodies.size) {
                 val body = articleBodies[index]
-                if (body.startsWith("正文抓取失败") && item.description.isNotBlank()) {
+                // Google News 的原文链接是跳转页，抓回来经常只有「Google News」
+                // 这几个字；这种情况用 RSS 自带的摘要，别在结果里刷空内容。
+                val uselessBody = body == "Google News" || body.length < 40
+                if ((body.startsWith("正文抓取失败") || uselessBody) && item.description.isNotBlank()) {
                     append("\n   文章摘要：").append(item.description)
                     append("（原文暂时无法读取）")
                 } else {

@@ -330,26 +330,8 @@ class RunReceiver : BroadcastReceiver() {
             return
         }
 
-        // Local tools work even when accessibility is disconnected. This path has
-        // no UI, so mutating tools that require confirmation are auto-denied.
-        if (AgentRuntime.localTools.match(goal) != null) {
-            Thread {
-                val result = runCatching {
-                    runBlocking {
-                        AgentRuntime.localTools.execute(goal) { question, _ ->
-                            Dbg.w(TAG, "本地工具无人确认，已拒绝：$question")
-                            false
-                        }
-                    }
-                }.getOrNull()
-                if (result != null) {
-                    AgentRuntime.speaker.speak(result.spoken)
-                } else {
-                    Dbg.e(TAG, "本地工具没有返回结果")
-                }
-            }.apply { name = "local-tool"; isDaemon = true }.start()
-            return
-        }
+        // 自动路由：快路径有规则就本机直执行；没有规则的请求交给 Agent，
+        // 由模型决定回答还是执行。遗留匹配器不再插在中间。
 
         // ★ 意图门：不是操作指令就别进 agent loop。
         //   「你是谁」这类问题进 loop 会去乱点屏幕（真机实测过一句话触发 3 次乱点）。
@@ -394,7 +376,13 @@ class RunReceiver : BroadcastReceiver() {
 
         Dbg.i(TAG, "broadcast run goal=$goal caller=$caller")
         // ui=false：后台触发时没人能点确认按钮，遇到需要确认的动作应快速放弃
-        loop.start(AgentRuntime.scope, goal, ui = false)
+        // 自动路由的后半段：没有快路径规则的 TASK 交给 Agent 执行。
+        loop.start(
+            AgentRuntime.scope,
+            goal,
+            ui = false,
+            executionMode = com.pilot.agent.agent.AssistantMode.AGENT,
+        )
     }
 
     /**

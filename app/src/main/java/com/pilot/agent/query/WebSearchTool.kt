@@ -37,19 +37,25 @@ class WebSearchTool : QueryTool {
     }
 
     override suspend fun execute(goal: String): String = withContext(Dispatchers.IO) {
-        val key = SecretVault.get(KEY_NAME)
-        if (key.isBlank()) {
-            return@withContext "通用网页搜索需要 Brave Search API Key。请在设置 → 网络搜索中填写；实时新闻类搜索仍可直接使用。"
-        }
         val query = normalize(goal)
         if (query.isBlank()) return@withContext "请补充要搜索的主题。"
+
+        // ★ 当前网络（国内）访问 Brave/Google 会超时（InterruptedIOException）。
+        //   先用国内可达的 Bing HTML 搜索；失败再回退 Brave（有 key 时）。
+        //   Bing 结果用标题 + 摘要，不再抓原文正文，避免再被墙住的站点拖超时。
+        bingSearch(query)?.let { return@withContext it }
+
+        val key = SecretVault.get(KEY_NAME)
+        if (key.isBlank()) {
+            return@withContext "网页搜索暂时不可用，请检查网络后重试。"
+        }
         val url = "https://api.search.brave.com/res/v1/web/search?q=" +
             URLEncoder.encode(query, Charsets.UTF_8.name()) + "&count=5&country=CN&search_lang=zh-hans&extra_snippets=false"
         try {
             val req = Request.Builder().url(url)
                 .header("X-Subscription-Token", key)
                 .header("Accept", "application/json")
-                .header("User-Agent", "PilotAssistant/1.0 (Android)")
+                .header("User-Agent", "PilotAndroid/1.0")
                 .get().build()
             client.newCall(req).execute().use { response ->
                 if (!response.isSuccessful) {
@@ -98,6 +104,67 @@ class WebSearchTool : QueryTool {
         }
     }
 
+    /**
+     * Bing 国内可达的 HTML 搜索结果（不需要 API Key）。
+     *
+     * 只取标题和摘要：国内网络下很多外链正文抓不到，抓取会把整体拖到超时。
+     * @return null = 没拿到有效结果（调用方回退 Brave）
+     */
+    private fun bingSearch(query: String): String? {
+        val url = "https://www.bing.com/search?q=" +
+            URLEncoder.encode(query, Charsets.UTF_8.name()) +
+            "&count=5&setlang=zh-hans&cc=cn"
+        val request = Request.Builder()
+            .url(url)
+            .header(
+                "User-Agent", "PilotAndroid/1.0",
+            )
+            .header("Accept-Language", "zh-CN,zh;q=0.9")
+            .header("Accept", "text/html,application/xhtml+xml")
+            .get()
+            .build()
+        return runCatching {
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    Dbg.w(TAG, "bing HTTP ${response.code}")
+                    return@use null
+                }
+                val html = response.body?.string().orEmpty()
+                val items = BING_ALGO.findAll(html)
+                    .take(MAX_RESULTS)
+                    .mapNotNull { block ->
+                        val text = block.value
+                        val link = BING_TITLE.find(text) ?: return@mapNotNull null
+                        // 两种 Bing 结构：<h2><a>…</a></h2> 或 <a><h2>…</h2></a>
+                        val titleHtml = link.groupValues[1].ifBlank { link.groupValues[2] }
+                        val title = plainText(titleHtml)
+                        if (title.isBlank()) return@mapNotNull null
+                        val snippet = BING_SNIPPET.find(text)?.groupValues?.get(1)
+                            ?.let(::plainText).orEmpty().take(360)
+                        title to snippet
+                    }
+                    .toList()
+                if (items.isEmpty()) return@use null
+                buildString {
+                    append("网页搜索：").append(query)
+                        .append("（").append(items.size).append(" 条 · Bing）")
+                    items.forEachIndexed { i, (title, snippet) ->
+                        append("\n\n").append(i + 1).append(". ").append(title)
+                        if (snippet.isNotBlank()) append("\n   ").append(snippet)
+                    }
+                    append("\n\n结果由 Bing 搜索提供。")
+                }
+            }
+        }.getOrElse {
+            Dbg.w(TAG, "bing search failed: ${it.javaClass.simpleName}")
+            null
+        }
+    }
+
+    private fun plainText(value: String): String =
+        Html.fromHtml(value, Html.FROM_HTML_MODE_COMPACT)
+            .toString().replace(Regex("\\s+"), " ").trim()
+
     private fun normalize(goal: String): String {
         var q = goal.trim()
         listOf("请帮我", "帮我", "请", "在网上", "上网", "网页搜索", "搜索网页", "网页", "搜索一下", "搜一下", "搜索", "搜", "查资料", "查官网")
@@ -111,6 +178,19 @@ class WebSearchTool : QueryTool {
         private const val MAX_RESULTS = 5
         private const val MAX_ARTICLE_FETCHES = 3
         private const val ARTICLE_TEXT_LIMIT = 1_200
+
+        private val BING_ALGO = Regex(
+            """<li[^>]*class="[^"]*\bb_algo\b[^"]*"[^>]*>.*?</li>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        )
+        private val BING_TITLE = Regex(
+            """(?:<h2[^>]*>\s*<a[^>]*href="[^"]*"[^>]*>(.*?)</a>|<a[^>]*href="[^"]*"[^>]*>\s*<h2[^>]*>(.*?)</h2>)""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        )
+        private val BING_SNIPPET = Regex(
+            """<p[^>]*>(.*?)</p>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        )
     }
 }
 
@@ -165,7 +245,7 @@ class WebPageTool : QueryTool {
             if (uri.scheme != "https" || uri.host.isNullOrBlank()) return@withContext "正文抓取失败：只允许 HTTPS 链接。"
             try {
                 val request = Request.Builder().url(url)
-                    .header("User-Agent", "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/124 Mobile Safari/537.36")
+                    .header("User-Agent", "PilotAndroid/1.0")
                     .header("Accept", "text/html,application/xhtml+xml")
                     .get().build()
                 client.newCall(request).execute().use { response ->

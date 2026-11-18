@@ -8,6 +8,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
 import android.os.SystemClock
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -42,6 +43,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.getValue
@@ -72,6 +74,15 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.waitForUpOrCancellation
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isShiftPressed
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.offset
@@ -81,6 +92,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.RoundRect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.geometry.Offset
@@ -91,20 +103,33 @@ import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.zIndex
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInWindow
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalTextToolbar
+import androidx.compose.ui.platform.TextToolbar
+import androidx.compose.ui.platform.TextToolbarStatus
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntRect
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupPositionProvider
+import androidx.compose.ui.window.PopupProperties
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.graphics.StrokeCap
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 
 import com.pilot.agent.Dbg
 import com.pilot.agent.agent.AgentSettings
-import com.pilot.agent.agent.AssistantMode
 import com.pilot.agent.browser.BrowserActivity
+import com.pilot.agent.chat.ChatSessionStore
 
 /** 按住多久算长按（开始录音）。低于系统长按阈值，手感更跟手。 */
 private const val LONG_PRESS_MS = 450L
@@ -183,6 +208,11 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
     var showClearChatConfirm by remember { mutableStateOf(false) }
     // 当前哪条消息处于文字选择态；点对话区空白处就清空（放弃选择）
     var selectingEntryId by remember { mutableStateOf<Long?>(null) }
+    // ★ 当前是否有 LogRow 正在处理手势、命中的是哪一条。
+    //   父级的 onTap 也会收到行内点击的抬起事件（Compose 的 tap 检测
+    //   在 up 上不检查消费标记），所以靠这两个值判断"点在选中行上"还是"点空白"。
+    var rowGestureActive by remember { mutableStateOf(false) }
+    var rowGestureId by remember { mutableStateOf<Long?>(null) }
     // ★ 最近一次长按的时间戳。松手时父级也会收到一次 tap，
     //   用它区分"用户点了别处" vs "刚长按完松手"，后者不能清选择。
     var lastLongPressAt by remember { mutableStateOf(0L) }
@@ -208,8 +238,8 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
     ) {
         Header(
             vm,
-            onSettings = { showSettings = true },
-            onClearChat = { showClearChatConfirm = true },
+            onSettings = { selectingEntryId = null; showSettings = true },
+            onClearChat = { selectingEntryId = null; showClearChatConfirm = true },
             onTerminalOpen = {
                 runCatching {
                     ctx.startActivity(Intent(ctx, TerminalActivity::class.java))
@@ -249,11 +279,15 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
                 }
             },
         )
-        ModeSelector(
-            selected = vm.mode,
+        AssistantStatusBar(
+            model = vm.settings.model,
             reasoningEffort = vm.settings.reasoningEffort,
-            onSelect = { vm.selectMode(it) },
+            sessions = vm.sessions,
+            currentSessionId = vm.currentSessionId,
+            busy = vm.running || vm.justSent,
             onReasoningSelect = { vm.selectReasoningEffort(it) },
+            onOpenSession = { vm.openSession(it) },
+            onNewSession = { vm.newSession() },
         )
         Spacer(Modifier.height(12.dp))
         StatusCard(
@@ -275,14 +309,14 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
                 //   用 clickable 而不是 focusable：不用依赖 isFocused 之类的 API，
                 //   行为也更直接（点一下就收键盘）。
                 .pointerInput(Unit) {
-                    // ★ 这里**只负责收焦点/键盘**，不清除文字选择。
-                    //   原因：父级的 onTap 和长按的抬起是同一个事件，
-                    //   无论怎么加延迟都会在"长按完松手"时误清选择（实测反复踩）。
-                    //   清除选择改由 AgentScreen 顶层统一处理：点击落在任何一条
-                    //   LogRow 之外时才清（见下方 LaunchedEffect）。
+                    // ★ 点在 LogRow 之外 → 收键盘 + 取消文字选择。
+                    //   行内手势会先置 rowGestureActive，所以点在选中的那条
+                    //   消息上时不清；点其他消息（id 不同）或空白都会清。
                     detectTapGestures(onTap = {
                         rootFocusManager.clearFocus(force = true)
                         keyboard?.hide()
+                        val keep = rowGestureActive && rowGestureId == selectingEntryId
+                        if (!keep) selectingEntryId = null
                     })
                 },
         ) {
@@ -302,6 +336,14 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
                                 selectingEntryId = if (active) entry.id else null
                             },
                             onLongPress = { lastLongPressAt = SystemClock.uptimeMillis() },
+                            onRowGesture = { id, active ->
+                                if (active) {
+                                    rowGestureId = id
+                                    rowGestureActive = true
+                                } else {
+                                    rowGestureActive = false
+                                }
+                            },
                             onCopy = { text ->
                                 val cm = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
                                     as android.content.ClipboardManager
@@ -324,13 +366,11 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
             value = input,
             onValueChange = { input = it },
             running = vm.running,
+            // 只在"正在采这一句"时显示录音动画；识别中(RECOGNIZING)和
+            // 唤醒后的活跃期(ACTIVE)都不显示——松手后动画必须立刻停。
             sessionListening = run {
                 val st = vm.voiceState
-                !vm.dndRequested && (
-                    st == com.pilot.agent.voice.VoiceInput.State.ACTIVE ||
-                        st == com.pilot.agent.voice.VoiceInput.State.LISTENING ||
-                        st == com.pilot.agent.voice.VoiceInput.State.RECOGNIZING
-                )
+                !vm.dndRequested && st == com.pilot.agent.voice.VoiceInput.State.LISTENING
             },
             onSend = {
                 vm.run(input.text)
@@ -353,6 +393,7 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
                 }
             },
             onFinishVoice = { vm.finishVoiceHold() },
+            onInputFocused = { selectingEntryId = null },
         )
     }
 
@@ -437,160 +478,282 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
 }
 
 @Composable
-private fun ModeSelector(
-    selected: AssistantMode,
+private fun AssistantStatusBar(
+    model: String,
     reasoningEffort: String,
-    onSelect: (AssistantMode) -> Unit,
+    sessions: List<ChatSessionStore.Session>,
+    currentSessionId: String?,
+    busy: Boolean,
     onReasoningSelect: (String) -> Unit,
+    onOpenSession: (String) -> Unit,
+    onNewSession: () -> Unit,
+) {
+    val colors = MaterialTheme.colorScheme
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 7.dp),
+    ) {
+        // 现在已经自动选择路由（快路径有规则就本机执行，没有就交给 Agent），
+        // 所以不再显示助理 / Agent 开关；左侧留给最近会话，
+        // 右侧显示当前模型和思考强度。
+        Row(
+            modifier = Modifier
+                .align(Alignment.CenterStart)
+                .clip(RoundedCornerShape(12.dp))
+                .background(colors.surfaceVariant.copy(alpha = 0.42f))
+                .padding(3.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            SessionMenuButton(
+                sessions = sessions,
+                currentSessionId = currentSessionId,
+                enabled = !busy,
+                onOpenSession = onOpenSession,
+            )
+            Box(
+                Modifier
+                    .width(1.dp)
+                    .height(15.dp)
+                    .background(colors.outline.copy(alpha = 0.35f)),
+            )
+            NewSessionButton(enabled = !busy, onClick = onNewSession)
+        }
+
+        ModelReasoningChips(
+            model = model,
+            reasoningEffort = reasoningEffort,
+            onReasoningSelect = onReasoningSelect,
+            modifier = Modifier.align(Alignment.CenterEnd),
+        )
+    }
+}
+
+/** 顶栏右侧：当前模型 + 思考强度（点强度可改）。 */
+@Composable
+private fun ModelReasoningChips(
+    model: String,
+    reasoningEffort: String,
+    onReasoningSelect: (String) -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val colors = MaterialTheme.colorScheme
     var reasoningExpanded by remember { mutableStateOf(false) }
     Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(top = 7.dp),
-        horizontalArrangement = Arrangement.Center,
+        modifier = modifier
+            .clip(RoundedCornerShape(12.dp))
+            .background(colors.surfaceVariant.copy(alpha = 0.42f))
+            .padding(horizontal = 10.dp, vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Row(
-            modifier = Modifier
-                .clip(RoundedCornerShape(12.dp))
-                .background(colors.surfaceVariant.copy(alpha = 0.42f))
-                .padding(3.dp),
-            horizontalArrangement = Arrangement.spacedBy(3.dp),
-        ) {
-            ModeChip(
-                label = AssistantMode.ASSISTANT.label,
-                selected = selected == AssistantMode.ASSISTANT,
-                modifier = Modifier
-                    .width(58.dp)
-                    .clip(RoundedCornerShape(9.dp))
-                    .background(
-                        if (selected == AssistantMode.ASSISTANT) {
-                            colors.primary.copy(alpha = 0.20f)
-                        }
-                        else Color.Transparent,
-                    )
-                    .clickable { onSelect(AssistantMode.ASSISTANT) }
-                    .padding(vertical = 7.dp),
-            )
-
-            Box(
-                modifier = Modifier
-                    .width(112.dp)
-                    .clip(RoundedCornerShape(9.dp))
-                    .background(
-                        if (selected == AssistantMode.AGENT) {
-                            colors.primary.copy(alpha = 0.20f)
-                        } else {
-                            Color.Transparent
-                        },
-                    ),
+        Text("模型", fontSize = 9.sp, color = colors.onSurfaceVariant)
+        Spacer(Modifier.width(5.dp))
+        Text(
+            model.ifBlank { "未配置" },
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Medium,
+            color = colors.onSurface,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.widthIn(max = 150.dp),
+        )
+        Box(
+            Modifier
+                .padding(horizontal = 8.dp)
+                .width(1.dp)
+                .height(15.dp)
+                .background(colors.outline.copy(alpha = 0.35f)),
+        )
+        Box {
+            Row(
+                modifier = Modifier.clickable { reasoningExpanded = true },
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .clickable { onSelect(AssistantMode.AGENT) }
-                            .padding(start = 8.dp, end = 3.dp, top = 7.dp, bottom = 7.dp),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Text(
-                            AssistantMode.AGENT.label,
-                            fontSize = 11.sp,
-                            fontWeight = if (selected == AssistantMode.AGENT) {
-                                FontWeight.SemiBold
-                            } else {
-                                FontWeight.Normal
-                            },
-                            color = if (selected == AssistantMode.AGENT) {
-                                colors.primary
-                            } else {
-                                colors.onSurfaceVariant
-                            },
-                        )
-                    }
-                    Box(
-                        Modifier
-                            .width(1.dp)
-                            .height(15.dp)
-                            .background(colors.outline.copy(alpha = 0.35f)),
-                    )
-                    Box(
-                        modifier = Modifier
-                            .clickable { reasoningExpanded = true }
-                            .padding(horizontal = 6.dp, vertical = 7.dp),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Text(
-                            "${reasoningEffortLabel(reasoningEffort)} ▾",
-                            fontSize = 9.sp,
-                            fontWeight = FontWeight.Medium,
-                            color = if (selected == AssistantMode.AGENT) {
-                                colors.primary.copy(alpha = 0.90f)
-                            } else {
-                                colors.onSurfaceVariant
-                            },
-                        )
-                        DropdownMenu(
-                            expanded = reasoningExpanded,
-                            onDismissRequest = { reasoningExpanded = false },
-                            modifier = Modifier.width(132.dp),
-                        ) {
-                            Text(
-                                "Agent 思考强度",
-                                fontSize = 10.sp,
-                                color = colors.onSurfaceVariant,
-                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
-                            )
-                            listOf(
-                                "low" to "低",
-                                "medium" to "中",
-                                "high" to "高",
-                                "xhigh" to "极高",
-                                "max" to "最高",
-                            ).forEach { (value, label) ->
-                                DropdownMenuItem(
-                                    text = {
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            horizontalArrangement = Arrangement.SpaceBetween,
-                                        ) {
-                                            Text(label, fontSize = 12.sp)
-                                            if (value == reasoningEffort) {
-                                                Text("✓", fontSize = 12.sp, color = colors.primary)
-                                            }
-                                        }
-                                    },
-                                    onClick = {
-                                        onReasoningSelect(value)
-                                        reasoningExpanded = false
-                                    },
-                                )
+                Text("思考", fontSize = 9.sp, color = colors.onSurfaceVariant)
+                Spacer(Modifier.width(4.dp))
+                Text(
+                    "${reasoningEffortLabel(reasoningEffort)} ▾",
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = colors.primary.copy(alpha = 0.90f),
+                )
+            }
+            DropdownMenu(
+                expanded = reasoningExpanded,
+                onDismissRequest = { reasoningExpanded = false },
+                modifier = Modifier.width(132.dp),
+            ) {
+                Text(
+                    "思考强度",
+                    fontSize = 10.sp,
+                    color = colors.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                )
+                listOf(
+                    "low" to "低",
+                    "medium" to "中",
+                    "high" to "高",
+                    "xhigh" to "极高",
+                    "max" to "最高",
+                ).forEach { (value, label) ->
+                    DropdownMenuItem(
+                        text = {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                            ) {
+                                Text(label, fontSize = 12.sp)
+                                if (value == reasoningEffort) {
+                                    Text("✓", fontSize = 12.sp, color = colors.primary)
+                                }
                             }
-                        }
-                    }
+                        },
+                        onClick = {
+                            onReasoningSelect(value)
+                            reasoningExpanded = false
+                        },
+                    )
                 }
             }
         }
     }
 }
 
+/**
+ * 「最近会话」入口：三道横线（☰）按钮 + 折叠菜单。
+ *
+ * 菜单里按更新时间倒序列出最近会话，点一条就回放那一段对话；
+ * 当前会话会标出来，避免切错。
+ */
 @Composable
-private fun ModeChip(
-    label: String,
-    selected: Boolean,
-    modifier: Modifier = Modifier,
+private fun SessionMenuButton(
+    sessions: List<ChatSessionStore.Session>,
+    currentSessionId: String?,
+    enabled: Boolean,
+    onOpenSession: (String) -> Unit,
 ) {
     val colors = MaterialTheme.colorScheme
-    Box(modifier = modifier, contentAlignment = Alignment.Center) {
-        Text(
-            label,
-            fontSize = 11.sp,
-            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-            color = if (selected) colors.primary else colors.onSurfaceVariant,
-        )
+    var expanded by remember { mutableStateOf(false) }
+    Box {
+        Box(
+            modifier = Modifier
+                .size(26.dp)
+                .clip(RoundedCornerShape(9.dp))
+                .clickable(enabled = enabled) { expanded = true },
+            contentAlignment = Alignment.Center,
+        ) {
+            Canvas(Modifier.size(13.dp, 10.dp)) {
+                val tint = colors.onSurfaceVariant.copy(alpha = if (enabled) 1f else 0.35f)
+                val stroke = 1.5.dp.toPx()
+                listOf(0.10f, 0.50f, 0.90f).forEach { fraction ->
+                    drawLine(
+                        color = tint,
+                        start = Offset(0f, size.height * fraction),
+                        end = Offset(size.width, size.height * fraction),
+                        strokeWidth = stroke,
+                        cap = StrokeCap.Round,
+                    )
+                }
+            }
+        }
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+            modifier = Modifier.width(248.dp),
+        ) {
+            Text(
+                "最近会话",
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Medium,
+                color = colors.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp),
+            )
+            if (sessions.isEmpty()) {
+                Text(
+                    "还没有会话，发出第一条消息会自动保存",
+                    fontSize = 11.sp,
+                    color = colors.onSurfaceVariant.copy(alpha = 0.8f),
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                )
+            } else {
+                sessions.forEach { session ->
+                    val current = session.id == currentSessionId
+                    DropdownMenuItem(
+                        text = {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        session.title,
+                                        fontSize = 12.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        fontWeight = if (current) FontWeight.SemiBold else FontWeight.Normal,
+                                        color = if (current) colors.primary else colors.onSurface,
+                                    )
+                                    Text(
+                                        sessionTimeLabel(session.updatedAt),
+                                        fontSize = 10.sp,
+                                        color = colors.onSurfaceVariant,
+                                    )
+                                }
+                                if (current) {
+                                    Text("当前", fontSize = 10.sp, color = colors.primary)
+                                }
+                            }
+                        },
+                        onClick = {
+                            expanded = false
+                            onOpenSession(session.id)
+                        },
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** 新建会话：一枚和「☰」同组的加号按钮。 */
+@Composable
+private fun NewSessionButton(enabled: Boolean, onClick: () -> Unit) {
+    val colors = MaterialTheme.colorScheme
+    Box(
+        modifier = Modifier
+            .size(26.dp)
+            .clip(RoundedCornerShape(9.dp))
+            .clickable(enabled = enabled, onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Canvas(Modifier.size(13.dp)) {
+            val tint = colors.onSurfaceVariant.copy(alpha = if (enabled) 1f else 0.35f)
+            val stroke = 1.5.dp.toPx()
+            drawLine(
+                color = tint,
+                start = Offset(center.x, 0f),
+                end = Offset(center.x, size.height),
+                strokeWidth = stroke,
+                cap = StrokeCap.Round,
+            )
+            drawLine(
+                color = tint,
+                start = Offset(0f, center.y),
+                end = Offset(size.width, center.y),
+                strokeWidth = stroke,
+                cap = StrokeCap.Round,
+            )
+        }
+    }
+}
+
+/** 会话列表里的相对时间：刚刚 / N 分钟前 / N 小时前 / 昨天 / M月d日。 */
+private fun sessionTimeLabel(at: Long): String {
+    val diff = (System.currentTimeMillis() - at).coerceAtLeast(0L)
+    return when {
+        diff < 60_000L -> "刚刚"
+        diff < 3_600_000L -> "${diff / 60_000L} 分钟前"
+        diff < 86_400_000L -> "${diff / 3_600_000L} 小时前"
+        diff < 172_800_000L -> "昨天"
+        else -> java.text.SimpleDateFormat("M月d日", java.util.Locale.CHINA)
+            .format(java.util.Date(at))
     }
 }
 
@@ -1237,6 +1400,7 @@ private fun LogRow(
     selectionActive: Boolean,
     onSelectionChange: (Boolean) -> Unit,
     onLongPress: () -> Unit,
+    onRowGesture: (Long, Boolean) -> Unit = { _, _ -> },
     onCopy: (String) -> Unit,
     onAddToChat: (String) -> Unit,
 ) {
@@ -1253,174 +1417,296 @@ private fun LogRow(
             r
         }
     }
+    // ★ 选中范围用**字符下标**（含首含尾），不是标点块下标：
+    //   - 整句没有标点时，块级手柄一次都拖不动；
+    //   - substring(first, last) 少算一位，复制时最后一个字永远丢。
     var selStart by remember { mutableStateOf<Int?>(null) }
     var selEnd by remember { mutableStateOf<Int?>(null) }
+    // 菜单贴着"正在拖的那一端"浮：拖右手柄时菜单跟着右手柄走，而不是钉在句首。
+    var anchorChar by remember { mutableStateOf<Int?>(null) }
     var layout by remember { mutableStateOf<androidx.compose.ui.text.TextLayoutResult?>(null) }
+    // ★ 文字在窗口里的位置：菜单位置要用「窗口坐标」算，才能贴着选中的那行浮出来。
+    var textInWindow by remember { mutableStateOf(Offset.Zero) }
 
     LaunchedEffect(selectionActive) {
-        if (!selectionActive) { selStart = null; selEnd = null }
+        if (!selectionActive) { selStart = null; selEnd = null; anchorChar = null }
     }
 
-    val selRange: IntRange? = if (selStart != null && selEnd != null) {
-        val a = ranges.getOrNull(selStart!!)?.first ?: 0
-        val b = (ranges.getOrNull(selEnd!!)?.last ?: (entry.text.length - 1)) + 1
-        a until b.coerceAtMost(entry.text.length)
+    val selection: IntRange? = if (selStart != null && selEnd != null && entry.text.isNotEmpty()) {
+        val a = minOf(selStart!!, selEnd!!).coerceIn(0, entry.text.length - 1)
+        val b = maxOf(selStart!!, selEnd!!).coerceIn(0, entry.text.length - 1)
+        a..b
     } else null
-    val selectedText = selRange?.let { entry.text.substring(it.first, it.last) }?.trim().orEmpty()
+    val selectedText = selection
+        ?.let { entry.text.substring(it.first, it.last + 1) }
+        ?.trim()
+        .orEmpty()
+    // 菜单锚点：优先跟着正在拖的那一端，落选就退回选中范围开头。
+    val menuAnchorIndex: Int? = selection?.let { r ->
+        anchorChar?.takeIf { it in r } ?: r.first
+    }
 
     // ★ 手势协程用 rememberUpdatedState 读最新选择范围：
-    //   直接捕获 selRange 会在重组后一直读到旧快照 → 手柄"只能拖一次，下次不动"（实测）
-    val rangeNow = rememberUpdatedState(selRange)
+    //   直接捕获 selection 会在重组后一直读到旧快照 → 手柄"只能拖一次，下次不动"（实测）
+    val rangeNow = rememberUpdatedState(selection)
     val layoutNow = rememberUpdatedState(layout)
 
-    fun chunkAt(offset: androidx.compose.ui.geometry.Offset): Int? {
+    /** 屏幕坐标 → 字符下标。末尾之后的位置夹到最后一个字，否则永远选不上末字。 */
+    fun charAt(offset: androidx.compose.ui.geometry.Offset): Int? {
         val l = layoutNow.value ?: return null
         if (entry.text.isEmpty()) return null
-        val charOffset = l.getOffsetForPosition(offset).coerceIn(0, entry.text.length - 1)
-        return ranges.indexOfFirst { charOffset in it }.takeIf { it >= 0 }
+        return l.getOffsetForPosition(offset).coerceIn(0, entry.text.length - 1)
+    }
+
+    /** 长按/单击命中某个标点块时，用整块作为初始选择。 */
+    fun chunkBoundsAt(offset: androidx.compose.ui.geometry.Offset): IntRange? {
+        val index = charAt(offset) ?: return null
+        return ranges.firstOrNull { index in it }
     }
 
     val annotated = androidx.compose.ui.text.buildAnnotatedString {
         append(entry.text)
-        if (selRange != null && selRange.first < entry.text.length) {
+        if (selection != null) {
             addStyle(
                 androidx.compose.ui.text.SpanStyle(
                     background = androidx.compose.ui.graphics.Color(0xFF2B5FA8),
                     color = androidx.compose.ui.graphics.Color(0xFFFFFFFF),
                 ),
-                selRange.first, selRange.last + 1,
+                selection.first, selection.last + 1,
             )
         }
     }
 
     Box(Modifier.fillMaxWidth()) {
         val bubbleShape = RoundedCornerShape(16.dp, 16.dp, 4.dp, 16.dp)
-        val bodyModifier = Modifier
-            .widthIn(max = if (isUser) 280.dp else 300.dp)
-            .let { m ->
-                if (isUser) {
-                    m.background(colors.primary.copy(alpha = 0.20f), bubbleShape)
-                        .padding(horizontal = 12.dp, vertical = 8.dp)
-                } else m
-            }
-            .pointerInput(Unit) {
-                awaitEachGesture {
-                    val down = awaitFirstDown(requireUnconsumed = false)
-                    // 判断按下的是哪根手柄
-                    var handle: Int? = null
-                    val r = rangeNow.value
-                    val l = layoutNow.value
-                    if (r != null && l != null && entry.text.isNotEmpty()) {
-                        val a = l.getBoundingBox(r.first)
-                        val b = l.getBoundingBox(r.last.coerceAtMost(entry.text.length - 1))
-                        val radius = 30.dp.toPx()
-                        val dl = (down.position - Offset(a.left, a.bottom)).getDistance()
-                        val dr = (down.position - Offset(b.right, b.bottom)).getDistance()
-                        if (minOf(dl, dr) < radius) handle = if (dl <= dr) 0 else 1
+        // ★ 手势挂在**含 padding 的外层 Box** 上：手柄圆点画在文字下方，
+        //   如果只挂 Text，点在圆点上时收不到事件 → 手柄拖不动（实测）。
+        //   手势坐标以整个气泡为原点，文字布局坐标从 padding 之后开始，
+        //   所以命中/取字符前统一减去 pad。
+        val rowGestureHandler = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
+        val gestureModifier = Modifier.pointerInput(Unit) {
+            awaitEachGesture {
+                val downRaw = awaitFirstDown(requireUnconsumed = false)
+                onRowGesture(entry.id, true)
+                try {
+                val pad = if (isUser) Offset(12.dp.toPx(), 8.dp.toPx()) else Offset.Zero
+                val down = Offset(downRaw.position.x - pad.x, downRaw.position.y - pad.y)
+                // 判断按下的是哪根手柄
+                var handle: Int? = null
+                val r = rangeNow.value
+                val l = layoutNow.value
+                if (r != null && l != null && entry.text.isNotEmpty()) {
+                    val a = l.getBoundingBox(r.first)
+                    val b = l.getBoundingBox(r.last.coerceAtMost(entry.text.length - 1))
+                    val radius = 30.dp.toPx()
+                    val dot = 5.dp.toPx()
+                    val dl = (down - Offset(a.left, a.bottom - dot)).getDistance()
+                    val dr = (down - Offset(b.right, b.bottom - dot)).getDistance()
+                    if (minOf(dl, dr) < radius) handle = if (dl <= dr) 0 else 1
+                }
+                if (handle != null) {
+                    // ★ 拖动手柄：按字符移动（含末字），并吃掉事件避免列表滚动。
+                    while (true) {
+                        val ev = awaitPointerEvent()
+                        ev.changes.forEach { it.consume() }
+                        val raw = ev.changes.firstOrNull()?.position
+                        if (raw != null) {
+                            val pos = Offset(raw.x - pad.x, raw.y - pad.y)
+                            val c = charAt(pos)
+                            val s0 = selStart
+                            val e0 = selEnd
+                            if (c != null && s0 != null && e0 != null) {
+                                if (handle == 0) {
+                                    selStart = minOf(c, e0)
+                                } else {
+                                    selEnd = maxOf(c, s0)
+                                }
+                                anchorChar = c
+                            }
+                        }
+                        if (ev.changes.any { it.changedToUpIgnoreConsumed() }) break
                     }
-                    if (handle != null) {
-                        // ★ 拖动手柄：每帧都读最新范围，拖多少次都有效
+                    onSelectionChange(true)
+                } else {
+                    // 单击 / 长按（靠超时唤醒，按住不动不会有新事件）
+                    val tapped = withTimeoutOrNull(450L) {
                         while (true) {
                             val ev = awaitPointerEvent()
-                            val pos = ev.changes.firstOrNull()?.position
-                            if (pos != null) {
-                                val c = chunkAt(pos)
-                                if (c != null) {
-                                    val s0 = selStart ?: c
-                                    val e0 = selEnd ?: c
-                                    if (handle == 0) {
-                                        selStart = minOf(c, e0); selEnd = e0
-                                    } else {
-                                        selEnd = maxOf(c, s0); selStart = s0
-                                    }
-                                }
+                            if (ev.changes.any { it.changedToUpIgnoreConsumed() }) {
+                                // 选中态下点在本文上 = 调整选择；
+                                // 消费抬起，父级 onTap 不会清掉选择。
+                                if (selStart != null) ev.changes.forEach { it.consume() }
+                                break
                             }
-                            if (ev.changes.any { it.changedToUpIgnoreConsumed() }) break
                         }
-                        onSelectionChange(true)
-                    } else {
-                        // 单击 / 长按（靠超时唤醒，按住不动不会有新事件）
-                        val tapped = withTimeoutOrNull(450L) {
-                            while (true) {
-                                val ev = awaitPointerEvent()
-                                if (ev.changes.any { it.changedToUpIgnoreConsumed() }) break
-                            }
-                            true
-                        }
-                        if (tapped != null) {
-                            if (selStart != null) {
-                                chunkAt(down.position)?.let { c -> selStart = c; selEnd = c }
-                                onSelectionChange(true)
-                            }
-                        } else {
-                            // 落在文字边缘/空白处时兜底选第一块，别让长按"没反应"
-                            val c = chunkAt(down.position) ?: 0
-                            selStart = c; selEnd = c
-                            // 通知父级"这是长按"，父级在松手时就不会清掉选择
-                            onLongPress()
+                        true
+                    }
+                    if (tapped != null) {
+                        if (selStart != null) {
+                            val c = chunkBoundsAt(down)
+                            if (c != null) { selStart = c.first; selEnd = c.last; anchorChar = c.first }
                             onSelectionChange(true)
+                        }
+                    } else {
+                        // 落在文字边缘/空白处时兜底选第一块，别让长按"没反应"
+                        val c = chunkBoundsAt(down) ?: ranges.firstOrNull()
+                        if (c != null) { selStart = c.first; selEnd = c.last; anchorChar = c.first }
+                        // 通知父级"这是长按"，父级在松手时就不会清掉选择
+                        onLongPress()
+                        onSelectionChange(true)
+                        // ★ 消费长按后的抬起：否则父级 onTap 会把刚选中的内容清掉
+                        while (true) {
+                            val ev = awaitPointerEvent()
+                            ev.changes.forEach { it.consume() }
+                            if (ev.changes.any { it.changedToUpIgnoreConsumed() }) break
                         }
                     }
                 }
+                } finally {
+                    // 延迟置回：父级 onTap 和这次 up 在同一个事件里派发，
+                    // 先让父级读到"点在行内"，再允许点击空白清除选择。
+                    rowGestureHandler.postDelayed({ onRowGesture(entry.id, false) }, 200L)
+                }
             }
+        }
+        val bubbleModifier = if (isUser) {
+            Modifier
+                .widthIn(max = 280.dp)
+                .background(colors.primary.copy(alpha = 0.20f), bubbleShape)
+                .then(gestureModifier)
+                .padding(horizontal = 12.dp, vertical = 8.dp)
+        } else {
+            Modifier.widthIn(max = 300.dp).then(gestureModifier)
+        }
 
-        Box(Modifier.align(if (isUser) Alignment.TopEnd else Alignment.TopStart)) {
+        Box(
+            Modifier
+                .align(if (isUser) Alignment.TopEnd else Alignment.TopStart)
+                .then(bubbleModifier),
+        ) {
             Text(
                 text = annotated,
                 fontSize = 14.sp,
                 color = textColor,
                 lineHeight = 21.sp,
+                modifier = Modifier.onGloballyPositioned {
+                    textInWindow = it.positionInWindow()
+                },
                 onTextLayout = { layout = it },
-                modifier = bodyModifier,
             )
-            if (selRange != null && layout != null) {
+            if (selection != null && layout != null) {
                 Canvas(Modifier.matchParentSize()) {
                     val l = layoutNow.value ?: return@Canvas
-                    val a = l.getBoundingBox(selRange.first)
-                    val b = l.getBoundingBox(selRange.last.coerceAtMost(entry.text.length - 1))
+                    val r = rangeNow.value ?: return@Canvas
+                    val a = l.getBoundingBox(r.first)
+                    val b = l.getBoundingBox(r.last.coerceAtMost(entry.text.length - 1))
                     val hc = androidx.compose.ui.graphics.Color(0xFF4A90E2)
                     val w = 2.dp.toPx()
                     drawLine(hc, Offset(a.left, a.top), Offset(a.left, a.bottom), w)
                     drawLine(hc, Offset(b.right, b.top), Offset(b.right, b.bottom), w)
-                    val r = 5.dp.toPx()
-                    drawCircle(hc, r, Offset(a.left, a.bottom + r))
-                    drawCircle(hc, r, Offset(b.right, b.bottom + r))
+                    val dot = 5.dp.toPx()
+                    // ★ 圆点画在文字行内（bottom-dot），不能画到气泡外面：
+                    //   气泡的 pointerInput 只覆盖自身布局，画到外面的圆点摸不到。
+                    drawCircle(hc, dot, Offset(a.left, a.bottom - dot))
+                    drawCircle(hc, dot, Offset(b.right, b.bottom - dot))
                 }
             }
         }
 
-        // ★ 半透明菜单浮在文字上方。
-        //   ★ 关键：外面套一个 size(0) 的 Box —— 否则菜单虽然用负 offset 画到文字上方，
-        //   它**仍然参与父 Box 的测量**，下面的文字会被顶下去（用户反馈"复制时下面下移"）。
-        if (selRange != null) {
-            Box(
-                Modifier
-                    .align(if (isUser) Alignment.TopEnd else Alignment.TopStart)
-                    .zIndex(2f),
+        // ★ 菜单用 Popup 浮在选中文字上方（跟手拖动也会跟着走）。
+        //   之前用 graphicsLayer 平移在气泡里画：位置永远钉在整条消息的顶部，
+        //   长消息里选中哪一句，菜单都跑到上面去（用户反馈"菜单没有跟随"）；
+        //   而且画到气泡外的部分点不到。
+        val firstBox = menuAnchorIndex?.let { layout?.getBoundingBox(it) }
+        if (selection != null && firstBox != null) {
+            val density = LocalDensity.current
+            val anchor = IntOffset(
+                (textInWindow.x + firstBox.left).toInt(),
+                (textInWindow.y + firstBox.top).toInt(),
+            )
+            val gap = with(density) { 8.dp.roundToPx() }
+            Popup(
+                popupPositionProvider = remember(anchor, gap) {
+                    SelectionMenuPositionProvider(anchor.x, anchor.y, gap)
+                },
+                onDismissRequest = {
+                    selStart = null
+                    selEnd = null
+                    onSelectionChange(false)
+                },
+                properties = PopupProperties(
+                    focusable = false,
+                    dismissOnBackPress = true,
+                    dismissOnClickOutside = false,
+                ),
             ) {
-            Surface(
-                color = androidx.compose.ui.graphics.Color(0x802A2A2A),   // 50% 透明
-                shape = RoundedCornerShape(16.dp),
-                shadowElevation = 4.dp,
-                modifier = Modifier
-                    // ★ 用 graphicsLayer 平移而不是 offset：
-                    //   offset 会改变绘制位置但不改变布局（好），
-                    //   但外层 size(0) 的 Box 又会把菜单裁掉（坏）。
-                    //   graphicsLayer 纯视觉位移，既不占位也不被裁。
-                    .graphicsLayer { translationY = -44.dp.toPx() }
-                    .widthIn(max = 330.dp),
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                Surface(
+                    // ★ 深灰底：聊天区是纯黑，菜单必须一眼能分辨出来。
+                    color = Color(0xFF35373D),
+                    shape = RoundedCornerShape(16.dp),
+                    shadowElevation = 8.dp,
+                    border = BorderStroke(1.dp, Color(0x33FFFFFF)),
+                    modifier = Modifier.widthIn(max = 330.dp),
                 ) {
-                    MenuChip("复制") { onCopy(selectedText); selStart = null; selEnd = null; onSelectionChange(false) }
-                    MenuChip("添加到输入框") { onAddToChat(selectedText); selStart = null; selEnd = null; onSelectionChange(false) }
-                    MenuChip("全选") { selStart = 0; selEnd = ranges.lastIndex; onSelectionChange(true) }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                    ) {
+                        MenuChip("复制") { onCopy(selectedText); selStart = null; selEnd = null; onSelectionChange(false) }
+                        MenuChip("添加到输入框") { onAddToChat(selectedText); selStart = null; selEnd = null; onSelectionChange(false) }
+                        MenuChip("全选") {
+                            if (entry.text.isNotEmpty()) {
+                                selStart = 0
+                                selEnd = entry.text.length - 1
+                                anchorChar = 0
+                            }
+                            onSelectionChange(true)
+                        }
+                    }
                 }
             }
-            }
         }
+    }
+}
+
+/**
+ * 空文本工具条：输入框里长按不该弹出系统"粘贴"浮窗
+ * （华为/部分 ROM 上它一碰就消失，还会跟长按说话抢手势）。
+ */
+private object NoopTextToolbar : TextToolbar {
+    override val status: TextToolbarStatus = TextToolbarStatus.Hidden
+
+    override fun showMenu(
+        rect: Rect,
+        onCopyRequested: (() -> Unit)?,
+        onPasteRequested: (() -> Unit)?,
+        onCutRequested: (() -> Unit)?,
+        onSelectAllRequested: (() -> Unit)?,
+    ) = Unit
+
+    override fun hide() = Unit
+}
+
+/**
+ * 选中文字菜单的定位：横向以选中字为中心（贴边时夹回屏幕），
+ * 纵向优先放在选中行上方；上方放不下就放到下方。
+ */
+private class SelectionMenuPositionProvider(
+    private val anchorX: Int,
+    private val anchorTop: Int,
+    private val gap: Int,
+) : PopupPositionProvider {
+    override fun calculatePosition(
+        anchorBounds: IntRect,
+        windowSize: IntSize,
+        layoutDirection: LayoutDirection,
+        popupContentSize: IntSize,
+    ): IntOffset {
+        val maxX = (windowSize.width - popupContentSize.width - gap).coerceAtLeast(gap)
+        val x = (anchorX - popupContentSize.width / 2).coerceIn(gap, maxX)
+        val above = anchorTop - popupContentSize.height - gap
+        val y = if (above >= gap) above else anchorTop + gap
+        return IntOffset(x, y)
     }
 }
 
@@ -1500,14 +1786,23 @@ private fun InputBar(
     onStopSpeaking: () -> Unit,
     onStartVoice: () -> Boolean,
     onFinishVoice: () -> Unit,
+    onInputFocused: () -> Unit = {},
 ) {
     val colors = MaterialTheme.colorScheme
     val focusReq = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
     var recording by remember { mutableStateOf(false) }
+    // 松手后短时间内强制隐藏"正在听"动画：语音状态层可能还在 LISTENING/RECOGNIZING，
+    // 但用户已经松手，输入框不该继续转圈。
+    var suppressListeningUi by remember { mutableStateOf(false) }
     // 是否已进入"文本输入态"（聚焦中）。false 时罩层挡着，TextField 收不到触摸。
     var textMode by remember { mutableStateOf(false) }
     val handler = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
+    val showStop = speaking || running || justSent
+    // 回车发送：空文本 / 任务进行中不误发。
+    val submit = {
+        if (!showStop && value.text.isNotBlank()) onSend()
+    }
 
     // 进入文本态后主动聚焦并弹键盘（requestFocus 后等一帧让重组生效）
     LaunchedEffect(textMode) {
@@ -1530,7 +1825,7 @@ private fun InputBar(
     //   输入框就要显示「正在听…」+ 流光边框。
     //   但排除 WAKE_WAIT/ASLEEP（常驻待命也在开麦，那不算"在听"）——
     //   这正是之前"输入框一直显示正在听"的坑，靠 sessionListening 区分。
-    val live = recording || sessionListening
+    val live = recording || (sessionListening && !suppressListeningUi)
     // 只在实际聆听时创建动画；进入休眠后立即销毁，避免隐藏边框继续空转。
     val phase = if (live) {
         val spin = rememberInfiniteTransition(label = "rec")
@@ -1550,28 +1845,49 @@ private fun InputBar(
 
     Row(verticalAlignment = Alignment.Bottom) {
         Box(Modifier.weight(1f)) {
-            OutlinedTextField(
-                value = value,                    // ★ 录音时不清空用户已输入的字
-                onValueChange = onValueChange,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .focusRequester(focusReq)
-                    .onFocusChanged { state ->
-                        // 失焦就退回非文本态（罩层回来），下次单击重新判定
-                        if (!state.isFocused && textMode) textMode = false
+            // ★ 输入框不要系统"粘贴"浮窗：华为的浮窗一碰鼠标/手指就消失，
+            //   还会和输入框上的长按手势互相抢事件。系统文本工具条换成空实现。
+            CompositionLocalProvider(LocalTextToolbar provides NoopTextToolbar) {
+                OutlinedTextField(
+                    value = value,                    // ★ 录音时不清空用户已输入的字
+                    onValueChange = onValueChange,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusRequester(focusReq)
+                        .onFocusChanged { state ->
+                            // 失焦就退回非文本态（罩层回来），下次单击重新判定
+                            if (!state.isFocused && textMode) textMode = false
+                            if (state.isFocused) onInputFocused()
+                        }
+                        // 硬件键盘回车发送；Shift+回车保留换行。
+                        // ★ 用 onPreviewKeyEvent：TextField 自己会先消费 Enter
+                        //   （插入换行），onKeyEvent 已经轮不到。
+                        .onPreviewKeyEvent { event ->
+                            if (event.type == KeyEventType.KeyDown &&
+                                (event.key == Key.Enter || event.key == Key.NumPadEnter) &&
+                                !event.isShiftPressed
+                            ) {
+                                submit()
+                                true
+                            } else {
+                                false
+                            }
+                        },
+                    placeholder = { Text("点一下输入，长按说话", fontSize = 13.sp) },
+                    maxLines = 3,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                    keyboardActions = KeyboardActions(onSend = { submit() }),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = if (live) {
+                        OutlinedTextFieldDefaults.colors(
+                            unfocusedBorderColor = Color.Transparent,
+                            focusedBorderColor = Color.Transparent,
+                        )
+                    } else {
+                        OutlinedTextFieldDefaults.colors()
                     },
-                placeholder = { Text("点一下输入，长按说话", fontSize = 13.sp) },
-                maxLines = 3,
-                shape = RoundedCornerShape(14.dp),
-                colors = if (live) {
-                    OutlinedTextFieldDefaults.colors(
-                        unfocusedBorderColor = Color.Transparent,
-                        focusedBorderColor = Color.Transparent,
-                    )
-                } else {
-                    OutlinedTextFieldDefaults.colors()
-                },
-            )
+                )
+            }
 
             if (live) {
                 // 在听时：一层淡底 + "正在听…"，盖在输入框上但看得见边框
@@ -1657,9 +1973,12 @@ private fun InputBar(
                                             }
                                         }
                                     } finally {
-                                        // ★ 无论松手、超时还是协程被取消，都必须通知语音层收状态
-                                        handler.post { onFinishVoice() }
+                                        // ★ 无论松手、超时还是协程被取消，都必须通知语音层收状态。
+                                        //   先关本地录音态并抑制动画，避免识别期间继续转圈。
                                         recording = false
+                                        suppressListeningUi = true
+                                        handler.post { onFinishVoice() }
+                                        handler.postDelayed({ suppressListeningUi = false }, 1_500L)
                                     }
                                 }
                             }
@@ -1670,12 +1989,11 @@ private fun InputBar(
         }
 
         Spacer(Modifier.width(8.dp))
-        val showStop = speaking || running || justSent
         Button(
             onClick = when {
                 speaking -> onStopSpeaking       // 播报中：闭嘴 + 停任务
                 running || justSent -> onStop    // 任务中：中止任务
-                else -> onSend
+                else -> submit
             },
             enabled = showStop || value.text.isNotBlank(),
             modifier = Modifier.size(56.dp),

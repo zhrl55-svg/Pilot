@@ -145,7 +145,7 @@ class Speaker(context: Context) {
      * 实际播报。
      * @param isNav true = 导航播报（独占、播完释放锁）
      */
-    private fun speakInternal(text: String, isNav: Boolean, forceSystem: Boolean = false, maxChars: Int = 60) {
+    private fun speakInternal(text: String, isNav: Boolean, forceSystem: Boolean = false, maxChars: Int = 2_000) {
         val t = text.trim()
         if (t.isEmpty()) {
             if (isNav) onNavSpoken()
@@ -181,7 +181,8 @@ class Speaker(context: Context) {
             else -> system ?: SystemTts(appContext).also { system = it }
         }
 
-        // 播报只说重点。UI 上的日志可以很长，念出来超过 10 秒就没人听了。
+        // 播报完整回答（老板要求：长文本不能只念前 60 个字）。
+        // 保留一个很宽的上限，只防异常长文本把 TTS 请求撑爆。
         val spoken = if (t.length > maxChars) t.take(maxChars) + "……" else t
 
         // ★ 通知导航界面「正在播报」（显示喇叭动画）

@@ -217,10 +217,19 @@ class AgentLoop(
             }
 
             IntentGate.Kind.CHAT -> {
-                Dbg.i(TAG, "intent gate: 闲聊，跳过本次输入")
-                emit(AgentEvent.Observe("「$goal」不是操作指令，没有动屏幕。"))
-                emit(AgentEvent.Finished("这条听起来是交流，没有执行设备操作"))
-                return
+                if (settings.mode == AssistantMode.AGENT) {
+                    // Agent 模式的执行决定来自模型（AgentIntentRouter 已判 execute）。
+                    // 关键词闲聊分类只适合做兜底，不能反过来否决模型的决定——
+                    // 否则「听说最近…要会晤」这类需要核实的句子会被这里
+                    // 直接回一句「没有执行设备操作」，实际什么都没做。
+                    Dbg.i(TAG, "intent gate: 关键词判闲聊，但 Agent 已决定执行，继续")
+                    emit(AgentEvent.Observe("Agent 已决定继续核实或执行"))
+                } else {
+                    Dbg.i(TAG, "intent gate: 闲聊，跳过本次输入")
+                    emit(AgentEvent.Observe("「$goal」不是操作指令，没有动屏幕。"))
+                    emit(AgentEvent.Finished("这条听起来是交流，没有执行设备操作"))
+                    return
+                }
             }
 
             IntentGate.Kind.TASK -> Unit

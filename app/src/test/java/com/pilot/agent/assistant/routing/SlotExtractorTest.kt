@@ -21,6 +21,12 @@ class SlotExtractorTest {
     }
 
     @Test
+    fun `volume set reads a chinese percentage`() {
+        val args = extract("音量调到百分之八十", "volume", "set")
+        assertEquals(80, args.optInt("percent"))
+    }
+
+    @Test
     fun `volume set ignores a number that is not a percentage`() {
         val args = extract("音量调到 60 分", "volume", "set")
         assertTrue(args.optString("percent").isBlank())

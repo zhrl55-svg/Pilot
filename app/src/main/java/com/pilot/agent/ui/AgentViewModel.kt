@@ -21,9 +21,9 @@ import com.pilot.agent.assistant.AssistantFastPath
 import com.pilot.agent.assistant.FastPathPlan
 import com.pilot.agent.assistant.exec.FastPathTrace
 import com.pilot.agent.assistant.exec.ResultFormatter
+import com.pilot.agent.chat.ChatSessionStore
 import com.pilot.agent.runtime.AgentRuntime
 import com.pilot.agent.tool.ToolGroup
-import com.pilot.agent.tool.ToolInvocation
 import com.pilot.agent.tool.ToolPolicy
 import com.pilot.agent.tool.ToolStatus
 import com.pilot.agent.voice.VoiceInput
@@ -34,6 +34,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaType
+import java.util.UUID
 
 data class LogEntry(val id: Long, val kind: Kind, val text: String) {
     enum class Kind { USER, THINK, ACT, OBSERVE, DONE, ERROR }
@@ -61,9 +62,6 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     var settings by mutableStateOf(AgentSettings.load())
         private set
 
-    var mode by mutableStateOf(settings.mode)
-        private set
-
     val logs = mutableStateListOf<LogEntry>()
 
     /**
@@ -74,6 +72,19 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
      * 这里把历史存下来，按设置的轮数注入到请求里。
      */
     private val chatHistory = ArrayDeque<Pair<String, String>>()
+
+    /**
+     * 最近会话（按更新时间倒序），供首页「☰」菜单切换。
+     *
+     * 第一条可见消息出现时自动建会话，之后每次 USER/DONE/ERROR 变化都会
+     * 把快照落盘；重启 App 会接着上次的会话。
+     */
+    var sessions by mutableStateOf<List<ChatSessionStore.Session>>(emptyList())
+        private set
+
+    /** 当前显示的会话 id；null = 还没有产生消息的新会话。 */
+    var currentSessionId by mutableStateOf<String?>(null)
+        private set
 
     /**
      * 对话区只显示"人说的话"和"AI 说的话"。
@@ -226,15 +237,6 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
 
     fun reloadSettings() {
         settings = AgentSettings.load()
-        mode = settings.mode
-    }
-
-    fun selectMode(value: AssistantMode) {
-        if (value == mode) return
-        val next = AgentSettings.load().copy(mode = value)
-        AgentSettings.save(next)
-        settings = next
-        mode = value
     }
 
     fun selectReasoningEffort(value: String) {
@@ -471,6 +473,12 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     private var seq = 0L
 
     init {
+        // 先恢复最近会话，再启动状态轮询；聊天区一有内容 LazyColumn 会自动滚到底。
+        sessions = ChatSessionStore.loadAll()
+        ChatSessionStore.activeSessionId()
+            ?.let { id -> sessions.firstOrNull { it.id == id } }
+            ?.let { restoreSession(it) }
+
         viewModelScope.launch {
             AgentRuntime.events.collect { handle(it) }
         }
@@ -1079,28 +1087,6 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * 查询类：行情、天气、火车余票这类要信息的需求。走 QueryEngine，不碰屏幕。
-     * 查不到就退回端侧模型答（哪怕答得不好，也比一声不吭强）。
-     */
-    private fun query(text: String) {
-        viewModelScope.launch {
-            add(LogEntry.Kind.THINK, "查一下…")
-            val answer = withContext(Dispatchers.IO) {
-                com.pilot.agent.query.QueryEngine.handle(text)
-            }
-            if (answer.isNullOrBlank()) {
-                add(LogEntry.Kind.OBSERVE, "没有对应的数据源，交给模型回答")
-                chat(text)
-            } else {
-                add(LogEntry.Kind.DONE, answer)
-                val spokenSummary = com.pilot.agent.query.QueryEngine.speechSummary(answer)
-                if (spokenSummary != null) AgentRuntime.speaker.speakExpanded(spokenSummary)
-                else AgentRuntime.speaker.speak(answer)
-            }
-        }
-    }
-
-    /**
      * 闲聊/提问走这里：**交给模型回答**，不碰屏幕。
      *
      * ★ 老板 11-10：「你是谁这样的问题不要走规则，模型交给模型回答」
@@ -1148,13 +1134,12 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             val body = org.json.JSONObject().apply {
                 put("model", s.model)
                 put("stream", false)
-                if (s.mode == AssistantMode.AGENT) {
-                    put(
-                        "reasoning_effort",
-                        s.reasoningEffort.takeIf { it in AgentSettings.REASONING_EFFORTS }
-                            ?: AgentSettings.DEFAULT_REASONING_EFFORT,
-                    )
-                }
+                // 自动路由后思考强度始终生效，首页状态行显示的就是它。
+                put(
+                    "reasoning_effort",
+                    s.reasoningEffort.takeIf { it in AgentSettings.REASONING_EFFORTS }
+                        ?: AgentSettings.DEFAULT_REASONING_EFFORT,
+                )
                 put("messages", org.json.JSONArray().apply {
                     put(org.json.JSONObject().apply {
                         put("role", "system")
@@ -1228,76 +1213,21 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Handles file, screenshot, status, and memory intent before screen control.
+     * 自动路由的第一步：规则选能力 → 确定性抽参（必要时端侧模型补值）→ 本机执行。
      *
-     * @return true when the local tool layer owns this request.
-     */
-    private fun tryRunLocalTool(
-        text: String,
-        allowConfirmation: Boolean,
-        matchedTool: ToolInvocation? = null,
-    ): Boolean {
-        val invocation = matchedTool ?: AgentRuntime.localTools.match(text) ?: return false
-        addUserMessageIfNeeded(AgentRuntime.localTools.displayTextFor(text, invocation))
-        add(LogEntry.Kind.THINK, "调用本机工具…")
-        running = true
-        justSent = true
-        activeTaskLabel = "本机工具"
-        publishNotificationStatus()
-        viewModelScope.launch {
-            val result = withContext(Dispatchers.IO) {
-                AgentRuntime.localTools.execute(invocation) { question, risk ->
-                    if (allowConfirmation) askToolConfirmation(question, risk)
-                    else false
-                }
-            }
-            running = false
-            justSent = false
-            activeTaskLabel = ""
-            publishNotificationStatus()
-            val kind = if (result.status == ToolStatus.SUCCESS) LogEntry.Kind.DONE
-            else LogEntry.Kind.ERROR
-            add(kind, result.message)
-            AgentRuntime.speaker.speak(result.spoken)
-            refreshStatus()
-        }
-        return true
-    }
-
-    /**
-     * P4 查询兜底：意图门判成 TASK、但查询工具确实能接时，交给 QueryEngine，
-     * 避免「查询被当成任务去点屏幕」。
+     * 有规则、参数能抽全的指令直接本机执行，不调云端、不进 Agent；
+     * 没有规则、补不出参数或没有执行器时返回 false，由调用方交给 Agent。
      *
-     * 反方向的误伤也要挡住：能解析成 App / 系统页的句子（「打开设置」）
-     * 优先走操作链路。
-     */
-    private fun isQueryFallback(g: String): Boolean {
-        if (!com.pilot.agent.query.QueryEngine.canHandle(g)) return false
-        if (com.pilot.agent.action.ActionCatalog.resolve(g) != null) return false
-        val appIndex = AgentRuntime.appIndex
-        if (appIndex.built && appIndex.resolve(g) != null) return false
-        return true
-    }
-
-    /**
-     * 助理快路径：规则选能力 → 确定性抽参（必要时端侧模型补值）→ 本机执行。
-     *
-     * 只在**助理模式**下生效（Agent 模式由模型主导决策）；开关默认关。
-     * 决策与执行都放到后台：确定性路径不碰模型，需要补值的路径会先跑 0.3B，
-     * 补不出来就回落到 [dispatchWithoutFastPath]，原有链路一行不改。
-     *
-     * @param matchedTool run() 里已经算好的遗留匹配结果，回落时直接复用
+     * 决策与执行都放到后台：确定性路径不碰模型，需要补值的路径会先跑 0.3B。
      */
     private fun tryRunFastPath(
         text: String,
         allowConfirmation: Boolean,
-        matchedTool: ToolInvocation?,
     ): Boolean {
-        if (mode != AssistantMode.ASSISTANT) return false
         if (!AssistantFastPath.isEnabled()) return false
         val plan = AssistantFastPath.plan(getApplication(), text, "ui") ?: return false
 
-        // 需要端侧模型补值：先认领，后台补；补不出来再回落原链路。
+        // 需要端侧模型补值：先认领，后台补；补不出来就交给 Agent。
         if (plan.invocation == null) {
             add(LogEntry.Kind.THINK, "端侧理解参数…")
             running = true
@@ -1314,8 +1244,8 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                     justSent = false
                     activeTaskLabel = ""
                     publishNotificationStatus()
-                    // 端侧没补出来 —— 交回原链路，行为和没有快路径时完全一致。
-                    dispatchWithoutFastPath(text, matchedTool)
+                    // 端侧没补出来 —— 自动路由交给 Agent，不再回退遗留匹配器。
+                    dispatchToAgent(text)
                     return@launch
                 }
                 val result = withContext(Dispatchers.IO) {
@@ -1385,52 +1315,30 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         return answer
     }
 
-    fun run(goal: String, matchedTool: ToolInvocation? = null) {
+    fun run(goal: String) {
         val g = goal.trim()
         if (g.isEmpty() || running) return
         reloadSettings()
-        val preferExtension = AgentRuntime.localTools.prefersAgentExtension(g)
-        val invocation = if (preferExtension) null else matchedTool ?: AgentRuntime.localTools.match(g)
+        // 展示层复用遗留匹配器的等价文案（SSH 等命令），但不再执行它。
+        val displayTool = AgentRuntime.localTools.match(g)
         // 语音回调、文字发送和本地工具都从这里进入。统一在同一处追加，
         // 避免操作指令被上游和 run() 各写一次而在聊天框显示两遍。
-        addUserMessageIfNeeded(AgentRuntime.localTools.displayTextFor(g, invocation))
-        if (mode == AssistantMode.ASSISTANT && preferExtension) {
-            val reply = "浏览器会话、MCP 和用户脚本需要切换到 Agent 模式。"
-            add(LogEntry.Kind.DONE, reply)
-            AgentRuntime.speaker.speak(reply)
-            return
-        }
-        dispatchRequest(g, invocation)
+        addUserMessageIfNeeded(AgentRuntime.localTools.displayTextFor(g, displayTool))
+        dispatchRequest(g)
     }
 
-    private fun dispatchRequest(
-        g: String,
-        invocation: ToolInvocation?,
-    ) {
-        // 助理快路径优先：规则选能力 → 确定性抽参 → 本机执行，不调云端。
-        // 接管了就返回，后面的链路不再执行，避免同一个请求被执行两遍。
-        if (tryRunFastPath(g, allowConfirmation = true, matchedTool = invocation)) return
-        dispatchWithoutFastPath(g, invocation)
+    /**
+     * 自动路由：快路径有规则就本机直执行；没有规则直接交给 Agent，
+     * 由模型决定回答还是执行。不再让遗留匹配器插在中间。
+     */
+    private fun dispatchRequest(g: String) {
+        if (tryRunFastPath(g, allowConfirmation = true)) return
+        dispatchToAgent(g)
     }
 
-    /** 原有链路：遗留本地工具 → 意图门 → 助理/Agent 分支。 */
-    private fun dispatchWithoutFastPath(
-        g: String,
-        invocation: ToolInvocation?,
-    ) {
-        if (tryRunLocalTool(g, allowConfirmation = true, matchedTool = invocation)) return
-
+    private fun dispatchToAgent(g: String) {
         val kind = IntentGate.classify(g)
-        Dbg.i(TAG, "dispatch intent=${kind.name.lowercase()} mode=${mode.storageValue}")
-        if (mode == AssistantMode.ASSISTANT) {
-            when (kind) {
-                IntentGate.Kind.QUERY -> query(g)
-                IntentGate.Kind.CHAT -> chat(g)
-                IntentGate.Kind.TASK ->
-                    if (isQueryFallback(g)) query(g) else startAgent(g, AssistantMode.ASSISTANT)
-            }
-            return
-        }
+        Dbg.i(TAG, "dispatch intent=${kind.name.lowercase()} route=auto->agent")
         routeAgentRequest(g, kind)
     }
 
@@ -1726,6 +1634,86 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     fun clearChat() {
         logs.clear()
         chatHistory.clear()
+        val id = currentSessionId
+        if (id != null) {
+            // 清屏 = 连最近会话里的记录一起删，避免清完还能从「☰」里翻出来。
+            sessions = sessions.filterNot { it.id == id }
+            ChatSessionStore.saveAll(sessions)
+        }
+        currentSessionId = null
+        ChatSessionStore.saveActiveSessionId(null)
+    }
+
+    /** 新建会话：当前会话已经随消息落盘，这里只清界面和上下文。 */
+    fun newSession() {
+        if (running || justSent) return
+        logs.clear()
+        chatHistory.clear()
+        currentSessionId = null
+        ChatSessionStore.saveActiveSessionId(null)
+    }
+
+    /** 打开最近会话：回放聊天记录，并把上下文问答接回去。 */
+    fun openSession(id: String) {
+        if (running || justSent) return
+        if (id == currentSessionId) return
+        val session = sessions.firstOrNull { it.id == id } ?: return
+        restoreSession(session)
+    }
+
+    private fun restoreSession(session: ChatSessionStore.Session) {
+        logs.clear()
+        chatHistory.clear()
+        session.messages.takeLast(200).forEach { message ->
+            val kind = runCatching { LogEntry.Kind.valueOf(message.kind) }.getOrNull()
+                ?: return@forEach
+            if (kind != LogEntry.Kind.USER && kind != LogEntry.Kind.DONE && kind != LogEntry.Kind.ERROR) {
+                return@forEach
+            }
+            logs += LogEntry(seq++, kind, message.text)
+        }
+        session.history.takeLast(40).forEach { (q, a) -> chatHistory.addLast(q to a) }
+        currentSessionId = session.id
+        ChatSessionStore.saveActiveSessionId(session.id)
+    }
+
+    /**
+     * 把当前可见对话 + 上下文问答写进最近会话。
+     *
+     * 只在 USER/DONE/ERROR 变化时调用：THINK/ACT/OBSERVE 是过程日志，
+     * 既不上屏也不该触发落盘（一次 agent 任务会刷很多条）。
+     */
+    private fun syncCurrentSession() {
+        val visible = chatLogs.map { ChatSessionStore.Message(it.kind.name, it.text) }
+        if (visible.isEmpty()) return
+        val now = System.currentTimeMillis()
+        val existing = sessions.firstOrNull { it.id == currentSessionId }
+        val title = visible.firstOrNull { it.kind == LogEntry.Kind.USER.name }
+            ?.text?.replace('\n', ' ')?.trim()?.take(24)?.ifBlank { null }
+            ?: existing?.title
+            ?: "新会话"
+        val session = if (existing == null) {
+            ChatSessionStore.Session(
+                id = UUID.randomUUID().toString(),
+                title = title,
+                createdAt = now,
+                updatedAt = now,
+                messages = visible,
+                history = chatHistory.toList(),
+            )
+        } else {
+            existing.copy(
+                title = title,
+                updatedAt = now,
+                messages = visible,
+                history = chatHistory.toList(),
+            )
+        }
+        sessions = (sessions.filterNot { it.id == session.id } + session)
+            .sortedByDescending { it.updatedAt }
+        currentSessionId = session.id
+        ChatSessionStore.saveAll(sessions)
+        ChatSessionStore.saveActiveSessionId(session.id)
     }
 
     private fun handle(ev: AgentEvent) {
@@ -1745,7 +1733,10 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 justSent = false
                 activeTaskLabel = ""
                 publishNotificationStatus()
-                if (text.startsWith("最近的通知")) AgentRuntime.speaker.speakLocal(text)
+                // 搜索类结果只念标题摘要，长正文留在屏幕上；普通回答完整播报。
+                val spoken = com.pilot.agent.query.QueryEngine.speechSummary(text)
+                if (spoken != null) AgentRuntime.speaker.speak(spoken)
+                else if (text.startsWith("最近的通知")) AgentRuntime.speaker.speakLocal(text)
                 else AgentRuntime.speaker.speak(text)
                 refreshStatus()
             }
@@ -1790,6 +1781,9 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     private fun add(kind: LogEntry.Kind, text: String) {
         logs += LogEntry(seq++, kind, text)
         if (logs.size > 200) logs.removeAt(0)
+        if (kind == LogEntry.Kind.USER || kind == LogEntry.Kind.DONE || kind == LogEntry.Kind.ERROR) {
+            syncCurrentSession()
+        }
     }
 
     /**

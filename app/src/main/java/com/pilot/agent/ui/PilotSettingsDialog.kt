@@ -79,7 +79,6 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.pilot.agent.agent.AgentSettings
-import com.pilot.agent.agent.AssistantMode
 import com.pilot.agent.tool.ToolGroup
 import com.pilot.agent.tool.ToolPolicy
 import kotlinx.coroutines.delay
@@ -476,9 +475,9 @@ private fun SettingsHome(
         item {
             SettingsCategoryCard(
                 page = SettingsPage.AGENT,
-                status = "${draft.mode.label} · ${draft.maxTurns} 步 · " +
+                status = "自动路由 · ${draft.maxTurns} 步 · " +
                     "${vm.userScripts.size} 个脚本 · ${vm.mcpServers.size} 个 MCP",
-                statusActive = draft.mode == AssistantMode.AGENT,
+                statusActive = true,
                 onClick = { onOpen(SettingsPage.AGENT) },
             )
         }
@@ -1000,15 +999,10 @@ private fun AgentSettingsPage(vm: AgentViewModel, draft: SettingsDraft) {
     SettingsPageList {
         item {
             SettingsSectionCard(
-                title = "运行模式",
-                description = "助理自动处理规则、查询和聊天；Agent 增加多步执行、浏览器、MCP 与用户脚本。",
+                title = "自动路由",
+                description = "有规则的确定性指令（音量、电量、提醒等）本机直执行；" +
+                    "没有规则的请求交给 Agent，由模型决定回答还是执行。",
             ) {
-                SegmentChoice(
-                    value = draft.mode.storageValue,
-                    options = AssistantMode.entries.map { it.storageValue to it.label },
-                    onSelect = { draft.mode = AssistantMode.fromStorage(it) },
-                )
-                InfoLine(draft.mode.description)
                 SettingsTextField(
                     label = "Agent 最大执行步数（${AgentSettings.MIN_AGENT_TURNS}–" +
                         "${AgentSettings.MAX_AGENT_TURNS}，默认 ${AgentSettings.DEFAULT_MAX_TURNS}）",

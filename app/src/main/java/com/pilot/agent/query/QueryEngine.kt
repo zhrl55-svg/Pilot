@@ -23,6 +23,7 @@ object QueryEngine {
         trainTool,
         StockTool(),
         NewsSearchTool(),
+        NearbySearchTool(),
         WebSearchTool(),
         WebPageTool(),
     )
@@ -53,7 +54,16 @@ object QueryEngine {
                 append("余票会变化，以 12306 购票页为准。")
             }
         }
-        if (!answer.contains("的最新新闻（共") && !answer.startsWith("网页搜索：")) return null
+        if (answer.startsWith("附近搜索：")) {
+            val names = Regex("(?m)^\\s*\\d+\\.\\s*(.+)$").findAll(answer)
+                .map { it.groupValues[1].trim().take(24) }
+                .filter { it.isNotBlank() }
+                .take(3)
+                .toList()
+            if (names.isEmpty()) return null
+            return "附近找到 ${names.size} 个：${names.joinToString("，")}。完整结果在屏幕上。"
+        }
+        if (!answer.contains("的新闻，范围：") && !answer.startsWith("网页搜索：")) return null
         val titles = Regex("(?m)^\\s*\\d+\\.\\s*(.+)$").findAll(answer)
             .map { it.groupValues[1].trim().take(36) }
             .filter { it.isNotBlank() }

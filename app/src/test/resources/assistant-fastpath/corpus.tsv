@@ -9,6 +9,7 @@
 app-open-settings	打开设置	LOCAL	app_launch	open	app=设置	0	-
 app-open-wechat	启动微信	LOCAL	app_launch	open	app=微信	0	-
 vol-set-60	音量调到 60%	LOCAL	volume	set	percent=60	0	-
+vol-set-chinese-80	音量调到百分之八十	LOCAL	volume	set	percent=80	0	-
 vol-up-a-bit	声音大一点	LOCAL	volume	adjust	percent=*	0	-
 vol-up	调大音量	LOCAL	volume	adjust	percent=*	0	-
 vol-status	音量状态	LOCAL	volume	status	-	0	-
@@ -71,6 +72,7 @@ vol-set-30	把声音调到 30	LOCAL	volume	set	percent=30	0	-
 neg-volume-discussion	讨论一下音量调节的原理	CLOUD	-	-	-	-	no-match
 neg-volume-bare	音量	CLOUD	-	-	-	-	no-match
 neg-volume-howto	怎么实现音量控制功能	CLOUD	-	-	-	-	no-match
+neg-news-chat	听说最近中美俄三国首脑要会晤	CLOUD	-	-	-	-	no-match
 media-resume	继续播放	LOCAL	media	resume	-	0	-
 media-previous	上一首	LOCAL	media	previous	-	0	-
 media-list	查看播放列表	LOCAL	media	list	-	0	-

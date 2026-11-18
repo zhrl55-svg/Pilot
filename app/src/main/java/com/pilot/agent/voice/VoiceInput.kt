@@ -679,26 +679,24 @@ class VoiceInput(
         if ("music" in AudioGate.activeHolders()) {
             AudioFocusManager.pauseMusicForVoice()
         }
-        // 立刻切聆听：用户接下来的话不能丢
+        // 立刻切聆听：用户接下来的话不能丢。但**先不发声、不回应**——
+        // 等声纹通过再播「我在」和提示音，旁人喊唤醒词不该得到任何反馈。
         mode = Mode.LISTEN
         dndRequested = false
         vad?.reset()
-        wakeAuthorized = true
+        wakeAuthorized = false
         // ★ 唤醒进来的聆听同样要看门狗。原来只有点按钮才 arm，
         //   唤醒后一句话没说（误唤醒最常见的情况）就永远停在 LISTEN：
         //   界面一直「正在聆听」，也不进活跃期、不休眠（11-12 真机反馈）。
         armListenWatchdog()
         emitState(State.LISTENING)
-        main.post { onWake(word) }
-        playBeep()
-        Dbg.i(TAG, "唤醒「$word」，进入聆听")
 
         val s = AgentSettings.load()
         // ★ 还没有模板 → 这句唤醒词就是第一句，直接拿它注册。
         //   原来的注册流程要念 3 遍固定口令，太重，而且口令必须和唤醒词一致
         //   用户很难记住——改成"第一次说话就认下主人"，门槛降到零。
+        //   注册完成后再回应唤醒。
         if (!gate.hasTemplate()) {
-            // 唤醒词那句直接注册（比后面那句干净，没有指令混在里面）
             val snapshot0 = ring.snapshot()
             worker.execute {
                 val ok = gate.enrollIfAbsent(snapshot0)
@@ -706,10 +704,18 @@ class VoiceInput(
                     Dbg.i(TAG, "首句注册成功（用唤醒词注册的），已认下主人")
                     main.post { onEnrolled() }
                 }
+                main.post {
+                    wakeAuthorized = true
+                    acknowledgeWake(word)
+                }
             }
             return
         }
-        if (!s.requireVoiceprint) return
+        if (!s.requireVoiceprint) {
+            wakeAuthorized = true
+            acknowledgeWake(word)
+            return
+        }
         // ★ 声纹取的是环形缓冲里最近 1.5 秒——但 KWS 命中时"小派"可能已经说完了，
         //   窗口里剩下的可能是后面的静默/杂音，判出来的分数没有意义（实测 0.20）。
         //   所以把窗口临时拉长到 3 秒再取，覆盖整个唤醒词。
@@ -718,6 +724,10 @@ class VoiceInput(
             val score = gate.verify(snapshot)
             if (score == null) {
                 Dbg.w(TAG, "声纹校验不可用（${gate.lastError}），放行")
+                main.post {
+                    wakeAuthorized = true
+                    acknowledgeWake(word)
+                }
                 return@execute
             }
             val pass = score >= s.voiceprintThreshold
@@ -726,13 +736,25 @@ class VoiceInput(
                 "声纹 ${"%.2f".format(score)} 阈值 ${s.voiceprintThreshold} → ${if (pass) "通过" else "拒绝"}",
             )
             main.post { onVoiceprint(score, pass) }
-            if (!pass) {
-                wakeAuthorized = false
+            if (pass) {
+                main.post {
+                    wakeAuthorized = true
+                    acknowledgeWake(word)
+                }
+            } else {
+                // 保持 wakeAuthorized=false；不播提示音、不回应「我在」。
                 // 给"用户已经在说指令"留出时间（声纹只要 ~90ms，
                 // 但唤醒词后半句可能还在路上），再判断要不要收回聆听。
                 main.postDelayed({ rejectWakeIfSilent() }, VOICEPRINT_REJECT_GRACE_MS)
             }
         }
+    }
+
+    /** 声纹通过（或无需声纹）后才回应唤醒：提示音 + onWake。 */
+    private fun acknowledgeWake(word: String) {
+        main.post { onWake(word) }
+        playBeep()
+        Dbg.i(TAG, "唤醒「$word」，声纹通过，进入聆听")
     }
 
     private fun recognize(pcm: ShortArray) {
