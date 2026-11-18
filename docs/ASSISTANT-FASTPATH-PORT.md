@@ -420,5 +420,26 @@ adb shell "run-as com.pilot.agent cat files/assistant_fastpath.log"
   可再收紧。
 - `media/play` 与「按歌名播放」暂不在快路径内，避免重复实现 Netease 检索流水线。
 
+### P2 真机冒烟（2026-11-18，华为 P40 / HarmonyOS 4）
+
+设备：华为 P40 Pro，debug 包（`0.1.0-debug`，与开发构建同签名，可覆盖安装）。
+开关通过改 `shared_prefs/pilot.xml` 打开（设置页也有同名开关）。
+
+| 输入 | 结果 | 证据 |
+|---|---|---|
+| 「电量还剩多少」 | 快路径接管 → `device/battery` → SUCCESS | `handled: capability=device/battery status=SUCCESS` |
+| 「你可以加个电量显示功能」 | 快路径**不接管**（话题排除词）→ 遗留匹配器接手 | `no-route: reason=no-match` |
+| 「读一下 /sdcard/Download/a.txt」 | 接管 → `file_read` → 文件不存在，工具如实报错 | `handled: capability=file_read/read status=DENIED` |
+| 「把 hello 写入 /sdcard/Download/minis_fastpath_smoke.txt」 | 接管 → `file_write` → **无 UI 无人确认 → 拒绝**，文件未生成 | `handled: capability=file_write/write status=DENIED`，`ls` 确认文件不存在 |
+
+读轨迹：`adb shell "run-as com.pilot.agent cat files/assistant_fastpath.log"`
+
+**关掉开关**（回到今天的行为）：设置页「运行模式 → 助理快路径」关闭，或
+
+```bash
+adb shell "run-as com.pilot.agent sed -i 's|<boolean name=\"assistant_fast_path\" value=\"true\" />||' shared_prefs/pilot.xml"
+```
+
+
 
 
