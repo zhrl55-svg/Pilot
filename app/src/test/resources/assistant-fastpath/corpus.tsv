@@ -27,6 +27,7 @@ mem-write-car	帮我记住 我的车在 B2 层	LOCAL	memory_write	write	content=
 mem-search	你还记得我喜欢喝什么吗	LOCAL	memory_get	search	keywords=*	0	-
 file-read	读一下 /sdcard/Download/a.txt	LOCAL	file_read	read	path=/sdcard/Download/a.txt	0	-
 file-write	把 hello 写入 /sdcard/Download/a.txt	LOCAL	file_write	write	path=/sdcard/Download/a.txt;content=hello	1	-
+file-write-time-content	保存到 /sdcard/Download/p5_matrix.txt 内容 明天开会	LOCAL	file_write	write	path=/sdcard/Download/p5_matrix.txt	1	-
 screenshot	截个屏	LOCAL	screenshot	take	-	0	-
 neg-topic-device	我们可以加个电量显示功能	CLOUD	-	-	-	-	no-match
 neg-discussion-write	讨论一下把日志写入文件的方案	CLOUD	-	-	-	-	no-match

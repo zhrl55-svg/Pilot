@@ -137,13 +137,17 @@ class AssistantRouter(
             // 含糊的时间以前会弹确认卡让用户纠正。现在只有破坏性操作才问：
             // 「记笔记：明天买牛奶」里的「明天」在正文里，不是时间，
             // 为它弹卡纯属摩擦。解析出的时间会写在回执里，看得见就能改。
+            //
+            // 但不能因此关掉模型补值：「保存到 /x.txt 内容 明天开会」里的
+            // 「明天」只是正文的一部分，content 照样要交给端侧模型补。
+            // 否则 plan 会以 no-executor 直接回落（P5 验收抓到）。
             return RouteDecision.Local(
                 route = best.route,
                 capability = capability.id,
                 action = action.name,
                 args = extraction.args,
                 needsConfirmation = needsConfirmation,
-                needsModelExtraction = false,
+                needsModelExtraction = capability.needsLlm && extraction.missing.isNotEmpty(),
                 missingSlots = extraction.missing,
                 score = best.score,
                 ranked = ranked,

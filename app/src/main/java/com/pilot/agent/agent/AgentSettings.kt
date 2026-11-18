@@ -78,9 +78,10 @@ data class AgentSettings(
     /**
      * 助理快路径（端侧直执行）：规则选能力 → 确定性抽参 → 本机执行，不调云端。
      *
-     * 默认**关**：新路径不能默认改变现有行为，真机验收通过后再打开。
+     * P5 真机验收（2026-11-18）通过后默认打开（决策 D3）。快路径只接管已翻
+     * ROUTE 的能力，任何一步不成立都回落原链路，所以默认开不会改变失败行为。
      */
-    val assistantFastPath: Boolean = false,
+    val assistantFastPath: Boolean = true,
 ) {
     val cloudReady: Boolean get() = apiKey.isNotBlank() && baseUrl.isNotBlank()
 
@@ -211,7 +212,7 @@ data class AgentSettings(
                 musicFallbackUrl = p.getString(K_MUSIC_FALLBACK_URL, null)
                     ?: DEFAULT_MUSIC_FALLBACK_URL,
                 neteaseCookie = p.getString(K_NETEASE_COOKIE, null) ?: "",
-                assistantFastPath = p.getBoolean(K_ASSISTANT_FAST_PATH, false),
+                assistantFastPath = p.getBoolean(K_ASSISTANT_FAST_PATH, true),
             )
         }
 

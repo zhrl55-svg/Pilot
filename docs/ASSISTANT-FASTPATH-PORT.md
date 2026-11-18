@@ -28,7 +28,7 @@
 |---|---|---|
 | D1 | v1 能力集 | 11 个：`app_launch / volume / device / media / reminder / scheduled_task / memory_write / memory_get / file_read / file_write / screenshot`，见 §2.2 |
 | D2 | JSON 数据模型 | 路由层原样移植 `org.json`；单测用 `testImplementation("org.json:json:20240303")` 跑纯 JVM（不引入 Robolectric） |
-| D3 | 默认开关 | `assistant_fastpath_enabled` 默认 **false**；P5 真机验收通过后再打开 |
+| D3 | 默认开关 | `assistant_fast_path` 默认 **false**；P5 真机验收通过后再打开（**2026-11-18 P5 已通过，默认改为 true**，见 §15.6） |
 | D4 | P4 收敛策略 | 逐能力「接管」+ 影子模式 + 每能力 owner 开关；查询类不迁；`scheduled_task` / `ssh` 保留遗留 matcher（见 §5） |
 | D5 | 执行契约 | 路由只做决策，执行统一走现有 `ToolInvocation` + `LocalToolRuntime.execute`，不新增第二套执行器 |
 | D6 | Agent 模式 | `AgentLoop` / `CloudPlanner` 一行不改 |
@@ -622,6 +622,79 @@ $ADB shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent --es fastpath
 
 当前设备上的归属：`device`、`memory_get`、`scheduled_task`、`file_read`、
 `file_write` = `ROUTE`；其余 = `LEGACY`（可在设置页点按提升）。
+
+## 15. P5 产出（真机验收 + 文档）
+
+验收环境：华为 P40 / ELS-AN00 / HarmonyOS 4，debug 构建；开关打开；
+归属与 P4 结束态一致（5 个 `ROUTE`，其余 `LEGACY`）。
+
+### 15.1 路由 + 补值矩阵（`fastpath_fill_test`，只决策不执行）
+
+| 句子 | 期望 | 实际（设备日志） |
+|---|---|---|
+| 保存到 /sdcard/Download/p5_matrix.txt 内容 明天开会 | file_write/write，模型补 content | ✅ `missing=[content] → args content=明天开会` |
+| 读一下 /sdcard/Download/minis_fastpath_model.txt | file_read/read | ✅ `args path=…` |
+| 电量还剩多少 | device/battery | ✅ |
+| 我说过什么 | memory_get/search | ✅ `keywords=什么` |
+| 我的定时任务 | scheduled_task/list | ✅ |
+| 你可以加个电量显示功能 | 不接管（topic-mention） | ✅ `no-route` |
+| 你是谁 | 不接管（CHAT） | ✅ `no-route` |
+| 打开这个网页并总结正文 | 不接管 | ✅ `owner=LEGACY route=app_launch/open`（兜底交原链路） |
+
+### 15.2 执行矩阵（三入口）
+
+| 入口 | 句子 | 结果 | 证据 |
+|---|---|---|---|
+| 广播 | 电量还剩多少 | `SUCCESS` | `handled: device/battery` |
+| 广播 | 读一下 /sdcard/Download/minis_fastpath_model.txt | `SUCCESS` | `handled: file_read/read len=62` |
+| 广播 | 我的定时任务 | `SUCCESS` | `handled: scheduled_task/list` |
+| 广播 | 把 hello2 写入 /sdcard/Download/p5_deny.txt | `DENIED`（无 UI 无人确认），文件未生成 | `handled: file_write/write status=DENIED` + `ls` 不存在 |
+| 广播 | 保存到 … 内容 明天开会 | 快路径**不跑模型**（无界面保持确定性），`model-fill-needed` 后回落；文件未生成 | trace + `ls` 不存在 |
+| 聊天 UI | battery（英文关键词，便于 adb 输入） | `SUCCESS`，只读不弹确认 | `source=ui → handled: device/battery` |
+| 聊天 UI | 保存到 … 内容 hello | 弹写入确认 → 确认后 `SUCCESS` | `source=ui → model-fill-ok → handled`，文件内容 `hello` |
+| 广播（查询） | 上证指数多少 | 快路径不接管 → `QueryEngine` 股票通道 | `no-route` + `PilotQuery: 用 stock 处理查询` |
+| 聊天 UI（闲聊） | batterylevel（无匹配） | 不接管 → 原链路模型回答（行为与无快路径一致） | `no-route` + 正常回复 |
+
+语音入口与聊天 UI 共用 `MainActivity` 的发送回调 → `vm.run()` → `dispatchRequest`，
+不另设分支。
+
+### 15.3 验收抓到的缺陷（已修）
+
+「保存到 /x.txt 内容 明天开会」在 plan 阶段被 **含糊时间分支** 截胡：
+`明天` 被时间解析器标成 `ambiguous`，该分支固定 `needsModelExtraction=false`，
+content 永远没人补，plan 以 `no-executor` 回落 —— 确认框不出现。
+
+修复：含糊时间分支保留 `capability.needsLlm && missing.isNotEmpty()` 的补值机会
+（`AssistantRouter.kt`）。回归：`AssistantRouterTest` 2 例 + corpus 新增
+`file-write-time-content` 行。
+
+### 15.4 回归
+
+- 单测：`./gradlew testDebugUnitTest` → **57 例全绿**（含语料 40 行）。
+- Agent 模式零改动：分支对 `agent/AgentLoop.kt`、`CloudPlanner` 无 diff；
+  仅 `AgentSettings`（开关字段）与 `LocalToolRuntime`（公开 `files`/`devices`）。
+- 遗留链路：所有负例 `no-route` 后行为与关闭快路径时一致（查询/闲聊/话题句已验）。
+- 双执行：三入口均只出现一次 `enter` + 一次 `handled`（或明确回落），无双执行。
+
+### 15.5 调试命令补充
+
+```bash
+# 只决策 + 补值，不执行（安全自检任意句子）
+adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent \
+    --es fastpath_fill_test '保存到 /sdcard/Download/a.txt 内容 hello'"
+
+# 读 trace
+adb shell "run-as com.pilot.agent cat files/assistant_fastpath.log"
+```
+
+### 15.6 决策落地
+
+- **D3 执行**：`assistant_fast_path` 默认值改为 `true`（`AgentSettings`）。
+  显式关过的用户保留 `false`（key 已存在时以存储值为准）。
+- **回滚**：设置页关闭开关即可；不需要回退代码。快路径任何一步失败都会回落
+  原链路，关闭后行为与移植前完全一致。
+- **未提升的能力**：`app_launch` / `volume` / `media` / `reminder` / `memory_write`
+  / `screenshot` 仍是 `LEGACY`。按 runbook 在真机观察影子日志无分歧后再逐个提升。
 
 #### 手动验证端侧补值（修正后的句子）
 
