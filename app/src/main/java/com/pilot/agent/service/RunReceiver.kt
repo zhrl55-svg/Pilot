@@ -58,6 +58,52 @@ class RunReceiver : BroadcastReceiver() {
             return
         }
 
+        // 快路径 / 遗留链路两侧对照：同一句话，两边各判一次，**都不执行**。
+        //   用来做影子对照 —— 快路径认不认、抽成什么样，遗留匹配器接不接。
+        //   adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent \
+        //       --es fastpath_compare '记住我喜欢喝咖啡'"
+        val compareText = intent.getStringExtra("fastpath_compare")
+        if (!compareText.isNullOrBlank()) {
+            Thread {
+                val fast = runCatching {
+                    val router = com.pilot.agent.assistant.routing.AssistantRouter()
+                    val routes = com.pilot.agent.assistant.routing.RouteStore.get(context).snapshot()
+                    when (val d = router.route(compareText, routes)) {
+                        is com.pilot.agent.assistant.routing.RouteDecision.Local ->
+                            "fast=${d.capability}/${d.action} args=${d.args} " +
+                                "missing=${d.missingSlots} needsLlm=${d.needsModelExtraction} " +
+                                "confirm=${d.needsConfirmation}"
+                        is com.pilot.agent.assistant.routing.RouteDecision.Cloud ->
+                            "fast=cloud(${d.reason})"
+                    }
+                }.getOrElse { "fast=error(${it.javaClass.simpleName})" }
+                val legacy = runCatching {
+                    AgentRuntime.localTools.match(compareText)
+                }.getOrNull()
+                val legacyText = legacy?.let {
+                    "legacy=${it.name} group=${it.group} summary=${it.summary}"
+                } ?: "legacy=none"
+                Dbg.i(TAG, "对照「$compareText」$fast | $legacyText")
+            }.apply { name = "fastpath-compare"; isDaemon = true }.start()
+            return
+        }
+
+        // 记忆维护：删除匹配关键词的长期记忆。
+        //   DELETE 组在无界面场景一律拒绝确认，所以清理测试数据只能走这里。
+        //   adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent \
+        //       --es memory_forget '影子对照样本'"
+        val forgetKeyword = intent.getStringExtra("memory_forget")
+        if (!forgetKeyword.isNullOrBlank()) {
+            Thread {
+                val removed = runCatching {
+                    AgentRuntime.localTools.memory.forget(forgetKeyword)
+                }.getOrNull()
+                Dbg.i(TAG, "记忆维护：删除「$forgetKeyword」→ ${removed?.size ?: 0} 条")
+                removed?.forEach { Dbg.i(TAG, "  已删除 #${it.id} ${it.content}") }
+            }.apply { name = "memory-forget"; isDaemon = true }.start()
+            return
+        }
+
         // 端侧补值自检：走完整 plan → complete 流程，但**不执行**工具。
         //   adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent \
         //       --es fastpath_fill_test '保存到 /sdcard/Download/a.txt 内容 hello'"

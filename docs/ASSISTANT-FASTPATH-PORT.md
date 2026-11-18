@@ -707,6 +707,102 @@ adb shell "run-as com.pilot.agent cat files/assistant_fastpath.log"
 
 预期：`model-fill-needed` → `model-fill-ok` → 弹出写入确认 → 确认后文件落盘。
 
+## 16. screenshot / memory_write 影子对照（P5 续，2026-11-18）
+
+### 16.1 方法
+
+新增两个调试钩子（`RunReceiver`）：
+
+```bash
+# 两侧判定对照：同一句话，快路径怎么判、遗留匹配器接不接，都打出来（都不执行）
+adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent \
+    --es fastpath_compare '记住我喜欢喝咖啡'"
+
+# 记忆维护：DELETE 组在无界面场景一律拒绝确认，清理测试数据只能走这里
+adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent \
+    --es memory_forget '关键词'"
+```
+
+对照流程：先 `fastpath_owner '<cap>=SHADOW'`（影子只记不执行，行为不变），
+再逐句对照；最后效果级验证 —— 同一句分别让两边写一次记忆，直接读
+`databases/pilot_memory.db` 比对落库内容。
+
+### 16.2 screenshot 对照
+
+| 句子 | 快路径 | 遗留匹配器 | 结论 |
+|---|---|---|---|
+| 截个屏 | `screenshot/take` | none | 快路径更宽（遗留不认）|
+| 截一张屏 | `screenshot/take` | none | 同上 |
+| screen shot | `screenshot/take` | none | 同上 |
+| 截图 | `screenshot/take` | `take_screenshot` | 一致（同一工具 `FileTools.takeScreenshot`）|
+| 截屏一下 | `screenshot/take` | `take_screenshot` | 一致 |
+| 打开截屏设置 / 关闭截屏设置 | 不接管 | none | 一致 |
+| 截图功能怎么实现 | 不接管 | **take_screenshot** | **分歧（遗留更糟）** |
+| 怎么给截图加个悬浮窗 | 不接管 | **take_screenshot** | 同上 |
+| 我们讨论一下截屏的原理 | 不接管 | **take_screenshot** | 同上 |
+
+效果级验证：`screenshot=ROUTE` 时 `handled: capability=screenshot/take status=SUCCESS`。
+
+**结论**：共同命中的句子两侧执行同一个函数，结果等价；提升只会让
+「截个屏 / 截一张屏 / screen shot」这三种说法从"丢给 agent"变成直接截屏。
+
+**但有个结构性问题**：讨论句（"截图功能怎么实现"）遗留匹配器**会真的截屏**，
+快路径拒绝后仍会回落给遗留匹配器 → 照样截屏。也就是说**提升 screenshot
+修不掉这个问题**，要修得给遗留匹配器也加排除词（属于遗留链路的改动，本阶段未动）。
+
+### 16.3 memory_write 对照
+
+| 句子 | 快路径 | 遗留匹配器 | 结论 |
+|---|---|---|---|
+| 记住我喜欢喝咖啡 | content=我喜欢喝咖啡 | `memory_remember` | 一致 |
+| 帮我记住 我的车在 B2 层 | content=我的车在 B2 层 | `memory_remember` | 一致 |
+| 请记住明天下午三点开会 | content=明天下午三点开会 | `memory_remember` | 一致 |
+| 记一下 猫叫 mia | content=猫叫 mia | **none** | 快路径更宽 |
+| 存进记忆 我的生日是3月4日 | content=我的生日是3月4日 | **none** | 快路径更宽 |
+| 别忘了 带充电器 | content=带充电器 | **none** | 快路径更宽 |
+| 你记住我说的 / 帮我记住 | 不接管 | none | 一致 |
+| 怎么实现记忆功能 | 不接管 | none | 一致 |
+| 别忘了说 | 不接管（no-args）| none | **原先分歧，已修** |
+
+效果级验证（同一句分别走两边，直接读库）：
+
+```
+legacy 侧：记住 影子对照样本甲 → memories.content = "影子对照样本甲"
+fast   侧：记住 影子对照样本乙 → memories.content = "影子对照样本乙"
+```
+
+两侧抽出的正文格式完全一致（同样去掉触发词、同样 trim）。
+
+**修掉的一处分歧**：遗留匹配器要求记忆正文 ≥ 2 个字符（`content.length >= 2`），
+快路径原来只判非空 → 「别忘了说」这种一个字的尾巴快路径会写、遗留不写。
+现在快路径也要求 ≥ 2 字（`SlotExtractor` 的 memory_write 分支），两侧一致。
+
+**结论**：共同命中的句子两侧语义等价，快路径额外接住「记一下 / 存进记忆 / 别忘了」
+三种说法。提升后行为只会更好（多认几种说法，写入内容一样）。
+
+### 16.4 顺带查出的三个问题（不属于本次提升范围）
+
+1. **讨论句误截屏**（见 16.2）：遗留匹配器对含「截图 / 截屏」的任何句子都会截屏，
+   快路径的排除词救不了 —— 因为拒绝即回落。
+2. **`memory_get` 已经是 ROUTE，但语义和遗留不一致**：「你记得什么」快路径走
+   `memory_get/search`（用 keywords="什么" 去搜），遗留走 `memory_list`（列全部）。
+   今天这句的输出已经不是遗留的行为了。要么给 `memory_get` 加一个 `list` 动作，
+   要么把「你记得什么」这类问法排除掉。
+3. **`MemoryStore.forget()` 是模糊匹配删除**：清理测试记忆时，
+   「忘掉 影子对照样本」把一条无关的旧记忆「頻据」一起删了（已按原内容补回，
+   但 id/时间戳变了）。这个钩子是遗留链路的既有行为，本次未改。
+
+### 16.5 提升建议
+
+| 能力 | 建议 | 理由 |
+|---|---|---|
+| `screenshot` | 可提升 ROUTE | 共同命中时同一工具、同一结果；额外认领三种说法；无确认卡（READ 组）|
+| `memory_write` | 可提升 ROUTE | 共同命中时抽出的正文逐句一致；负例两侧一致（修完 ≥2 字规则后）；额外认领三种说法 |
+
+两个能力都不建议**今天直接开**：先在真机上按 §16.1 的语料各跑 5~10 句，
+确认日志里没有新的分歧，再逐个切 ROUTE。切完记得把 `routes.json` 里的归属
+固化下来（设置页可点按循环）。
+
 
 
 

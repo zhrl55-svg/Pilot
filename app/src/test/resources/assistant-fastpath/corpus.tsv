@@ -46,3 +46,20 @@ neg-chat	你是谁	CLOUD	-	-	-	-	no-match
 neg-query-weather	今天天气怎么样	CLOUD	-	-	-	-	no-match
 neg-memory-no-args	帮我记住	CLOUD	-	-	-	-	no-match
 neg-app-no-args	打开	CLOUD	-	-	-	-	no-match
+shot-take	截个屏	LOCAL	screenshot	take	-	0	-
+shot-take-one	截一张屏	LOCAL	screenshot	take	-	0	-
+shot-plain	截图	LOCAL	screenshot	take	-	0	-
+shot-verb	截屏一下	LOCAL	screenshot	take	-	0	-
+shot-en	screen shot	LOCAL	screenshot	take	-	0	-
+neg-shot-settings	打开截屏设置	CLOUD	-	-	-	-	no-match
+neg-shot-settings-off	关闭截屏设置	CLOUD	-	-	-	-	no-match
+neg-shot-discussion	截图功能怎么实现	CLOUD	-	-	-	-	no-match
+neg-shot-long	怎么给截图加个悬浮窗	CLOUD	-	-	-	-	no-match
+neg-shot-weak	我们讨论一下截屏的原理	CLOUD	-	-	-	-	no-match
+mem-write-please	请记住明天下午三点开会	LOCAL	memory_write	write	content=*	0	-
+mem-write-down	记一下 猫叫 mia	LOCAL	memory_write	write	content=*	0	-
+mem-write-store	存进记忆 我的生日是3月4日	LOCAL	memory_write	write	content=*	0	-
+mem-write-dont-forget	别忘了 带充电器	LOCAL	memory_write	write	content=*	0	-
+app-open-memory-settings	打开记忆设置	LOCAL	app_launch	open	app=记忆设置	0	-
+neg-memory-discussion	怎么实现记忆功能	CLOUD	-	-	-	-	no-match
+neg-memory-one-char	别忘了说	CLOUD	-	-	-	-	no-args

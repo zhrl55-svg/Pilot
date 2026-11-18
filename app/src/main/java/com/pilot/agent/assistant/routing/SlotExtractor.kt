@@ -54,7 +54,12 @@ class SlotExtractor(
             "memory_write" -> extractAfterTrigger(
                 raw,
                 listOf("记住", "牢记", "记下来", "记一下", "存进记忆", "别忘了", "remember that", "remember"),
-            )?.let { args.put("content", it) }
+            )
+                // ★ 至少两个字符 —— 与遗留匹配器（`LocalToolRuntime.matchMemory`）对齐。
+                //   「别忘了说」这种一个字的尾巴遗留侧不写记忆；快路径也不该写，
+                //   否则提升 memory_write 之后会凭空多出「说」这种垃圾记忆。
+                ?.takeIf { it.length >= 2 }
+                ?.let { args.put("content", it) }
             "memory_get" -> extractAfterTrigger(
                 raw,
                 listOf(
