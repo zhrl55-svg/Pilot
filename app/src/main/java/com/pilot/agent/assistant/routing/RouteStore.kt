@@ -222,10 +222,16 @@ class RouteStore internal constructor(
         }
     }
 
-    /** 补齐缺失能力：没写的能力一律 LEGACY（不改变行为）。 */
+    /**
+     * 补齐缺失能力：存储里没写的能力用**出厂默认**（[DefaultOwners.all]）。
+     *
+     * 以前这里一律回 LEGACY：那时出厂默认全是 LEGACY，两者等价。现在出厂默认
+     * 里有已验证接管的能力，新增能力（存储里还没有键）就该按出厂默认接管，
+     * 而不是白扔一次验证结果。用户显式写过的值一律优先。
+     */
     private fun normalizeOwners(owners: Map<String, FastPathOwner>): Map<String, FastPathOwner> =
-        DefaultOwners.all.mapValues { (capability, _) ->
-            owners[capability] ?: FastPathOwner.LEGACY
+        DefaultOwners.all.mapValues { (capability, fallback) ->
+            owners[capability] ?: fallback
         }
 
     private fun ownersJson(owners: Map<String, FastPathOwner>): JSONObject = JSONObject().apply {

@@ -12,7 +12,13 @@ package com.pilot.agent.assistant.routing
  */
 object DefaultRoutes {
 
-    const val SEED_VERSION = 1
+    /**
+     * 种子版本。
+     *
+     * v2：新增 `tool.memory-list`（memory_get/list）——「你记得什么」列全部，
+     * 和遗留链路的 memory_list 对齐（v1 走搜索，结果不一样）。
+     */
+    const val SEED_VERSION = 2
 
     private fun r(
         id: String,
@@ -283,6 +289,16 @@ object DefaultRoutes {
                 "我说过", "我的记忆", "之前说过", "查记忆",
                 "还记得", "你记得", "记不记得", "记忆里",
                 "what did i say", "my memory",
+            ),
+        ),
+        // 「你记得什么」问的是全部，不是搜关键词 —— 与遗留的 memory_list 对齐。
+        // 关键词比 search 那条更长（"你记得什么" vs "你记得"），打分上稳赢。
+        r(
+            "tool.memory-list", "记忆列表", "memory", "memory_get", "list",
+            priority = 126,
+            keywords = listOf(
+                "列出你记住", "你记住了什么", "查看长期记忆", "列出长期记忆",
+                "记忆列表", "你记得什么",
             ),
         ),
 

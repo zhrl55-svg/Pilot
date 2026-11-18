@@ -39,4 +39,26 @@ class AssistantRouterTest {
         assertTrue(!decision.needsModelExtraction)
         assertTrue(decision.missingSlots.isEmpty())
     }
+
+    @Test
+    fun `asking what you remember means listing all of it`() {
+        // 遗留链路这里走 memory_list（列全部）。快路径之前一律当搜索
+        // （keywords="什么"），结果和遗留不一致 —— memory_get 当时已是 ROUTE。
+        listOf("你记得什么", "列出你记住", "查看长期记忆").forEach { text ->
+            val decision = router.route(text, DefaultRoutes.all)
+            assertTrue("「$text」应当本地接管", decision is RouteDecision.Local)
+            decision as RouteDecision.Local
+            assertEquals("memory_get", decision.capability)
+            assertEquals("「$text」应当列全部而不是搜索", "list", decision.action)
+        }
+    }
+
+    @Test
+    fun `asking about something specific still searches`() {
+        val decision = router.route("你还记得我喜欢喝什么吗", DefaultRoutes.all)
+        assertTrue(decision is RouteDecision.Local)
+        decision as RouteDecision.Local
+        assertEquals("memory_get", decision.capability)
+        assertEquals("search", decision.action)
+    }
 }

@@ -63,3 +63,6 @@ mem-write-dont-forget	别忘了 带充电器	LOCAL	memory_write	write	content=*	
 app-open-memory-settings	打开记忆设置	LOCAL	app_launch	open	app=记忆设置	0	-
 neg-memory-discussion	怎么实现记忆功能	CLOUD	-	-	-	-	no-match
 neg-memory-one-char	别忘了说	CLOUD	-	-	-	-	no-args
+mem-list-what	你记得什么	LOCAL	memory_get	list	-	0	-
+mem-list-all	列出你记住	LOCAL	memory_get	list	-	0	-
+mem-list-longform	查看长期记忆	LOCAL	memory_get	list	-	0	-

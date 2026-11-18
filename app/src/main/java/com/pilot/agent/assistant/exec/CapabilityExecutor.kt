@@ -46,7 +46,7 @@ class CapabilityExecutor(
             "reminder" -> reminder(decision.action, userText)
             "scheduled_task" -> scheduledTask(decision.action, args, userText)
             "memory_write" -> memoryWrite(args)
-            "memory_get" -> memoryGet(userText)
+            "memory_get" -> memoryGet(decision.action, userText)
             "file_read" -> fileRead(args)
             "file_write" -> fileWrite(args)
             "screenshot" -> screenshot()
@@ -352,21 +352,47 @@ class CapabilityExecutor(
         }
     }
 
-    private fun memoryGet(userText: String): ToolInvocation? = ToolInvocation(
-        name = "memory_search",
-        group = ToolGroup.READ,
-        summary = "搜索长期记忆",
-        confirmation = "允许搜索长期记忆吗？",
-    ) { _, _ ->
-        val items = tools.memory.search(userText, 5)
-        if (items.isEmpty()) {
-            ToolResult.success("我没有找到相关长期记忆。")
-        } else {
-            ToolResult.success(
-                tools.memory.formatList(items),
-                "我找到 ${items.size} 条相关记忆：${items.joinToString("；") { it.content }.take(300)}",
-            )
+    /**
+     * 查记忆：`search` 搜相关条目，`list` 列全部。
+     *
+     * `list` 对齐遗留链路的 `memory_list`：同一批话术（"你记得什么" /
+     * "列出你记住" …）在遗留侧走的是列全部，快路径之前一律当搜索，
+     * 结果和用户预期不一致。
+     */
+    private fun memoryGet(action: String, userText: String): ToolInvocation? = when (action) {
+        "list" -> ToolInvocation(
+            name = "memory_list",
+            group = ToolGroup.READ,
+            summary = "查看长期记忆",
+            confirmation = "允许查看长期记忆吗？",
+        ) { _, _ ->
+            val items = tools.memory.all()
+            if (items.isEmpty()) {
+                ToolResult.success("还没有保存长期记忆。")
+            } else {
+                ToolResult.success(
+                    tools.memory.formatList(items),
+                    "你让我记住 ${items.size} 条内容。",
+                )
+            }
         }
+        "search" -> ToolInvocation(
+            name = "memory_search",
+            group = ToolGroup.READ,
+            summary = "搜索长期记忆",
+            confirmation = "允许搜索长期记忆吗？",
+        ) { _, _ ->
+            val items = tools.memory.search(userText, 5)
+            if (items.isEmpty()) {
+                ToolResult.success("我没有找到相关长期记忆。")
+            } else {
+                ToolResult.success(
+                    tools.memory.formatList(items),
+                    "我找到 ${items.size} 条相关记忆：${items.joinToString("；") { it.content }.take(300)}",
+                )
+            }
+        }
+        else -> null
     }
 
     // ── files ────────────────────────────────────────────────────────

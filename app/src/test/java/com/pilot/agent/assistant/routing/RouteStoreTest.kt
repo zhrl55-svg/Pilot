@@ -66,11 +66,24 @@ class RouteStoreTest {
     }
 
     @Test
-    fun `owners default to legacy for every capability`() {
+    fun `owners follow the shipped defaults`() {
+        // 出厂默认 = 已过真机影子对照的能力接管（见 DefaultOwners）。
         val store = RouteStore(tempDir())
         CapabilityRegistry.all.forEach { capability ->
-            assertEquals(FastPathOwner.LEGACY, store.ownerFor(capability.id))
+            assertEquals(
+                "「${capability.id}」的默认归属",
+                DefaultOwners.all[capability.id],
+                store.ownerFor(capability.id),
+            )
         }
+        // 明确留着的四个：遗留匹配器不接、由下游规划器处理，提升等于换执行路径。
+        listOf("app_launch", "volume", "media", "reminder").forEach {
+            assertEquals(FastPathOwner.LEGACY, store.ownerFor(it))
+        }
+        listOf("device", "memory_get", "memory_write", "screenshot", "file_read", "file_write", "scheduled_task")
+            .forEach {
+                assertEquals(FastPathOwner.ROUTE, store.ownerFor(it))
+            }
     }
 
     @Test
@@ -83,7 +96,7 @@ class RouteStoreTest {
         val reloaded = RouteStore(dir)
         assertEquals(FastPathOwner.SHADOW, reloaded.ownerFor("device"))
         assertEquals(FastPathOwner.ROUTE, reloaded.ownerFor("memory_get"))
-        assertEquals(FastPathOwner.LEGACY, reloaded.ownerFor("file_write"))
+        assertEquals(FastPathOwner.LEGACY, reloaded.ownerFor("volume"))
     }
 
     @Test

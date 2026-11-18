@@ -88,7 +88,22 @@ class RunReceiver : BroadcastReceiver() {
             return
         }
 
-        // 记忆维护：删除匹配关键词的长期记忆。
+        // 记忆维护（按 id 精确删除）：清理测试数据用这个。
+        //   adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent \
+        //       --es memory_delete_id 7"
+        // ★ 不要用 memory_forget 做清理 —— 它是模糊匹配，
+        //   实测「忘掉 shadow-probe-S」把一条无关的中文记忆一起删了。
+        val deleteId = intent.getStringExtra("memory_delete_id")
+        if (!deleteId.isNullOrBlank()) {
+            Thread {
+                val id = deleteId.trim().toLongOrNull()
+                val ok = id != null && AgentRuntime.localTools.deleteMemoryFromUi(id)
+                Dbg.i(TAG, "记忆维护：删除 #$deleteId → ${if (ok) "已删除" else "未找到"}")
+            }.apply { name = "memory-delete-id"; isDaemon = true }.start()
+            return
+        }
+
+        // 记忆维护：按关键词删除（模糊，谨慎使用）。
         //   DELETE 组在无界面场景一律拒绝确认，所以清理测试数据只能走这里。
         //   adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent \
         //       --es memory_forget '影子对照样本'"

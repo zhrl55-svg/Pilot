@@ -139,6 +139,10 @@ object CapabilityRegistry {
                     "search", true,
                     slots = arrayOf(slot("keywords", SlotType.QUERY, required = false)),
                 ),
+                // 「你记得什么」问的是「全部」，不是「搜某个词」。
+                // 遗留链路有独立的 memory_list 工具；快路径补上同样的动作，
+                // 否则这句话会被当成搜索（keywords="什么"），结果和遗留不一致。
+                "list" to action("list", true),
             ),
         ),
         LocalCapability(

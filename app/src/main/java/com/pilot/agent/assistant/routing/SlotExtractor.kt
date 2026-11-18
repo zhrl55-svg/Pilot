@@ -60,14 +60,19 @@ class SlotExtractor(
                 //   否则提升 memory_write 之后会凭空多出「说」这种垃圾记忆。
                 ?.takeIf { it.length >= 2 }
                 ?.let { args.put("content", it) }
-            "memory_get" -> extractAfterTrigger(
-                raw,
-                listOf(
-                    "我说过", "我的记忆", "之前说过", "查记忆",
-                    "还记得", "你记得", "记不记得", "记忆里",
-                    "what did i say", "my memory",
-                ),
-            )?.let { args.put("keywords", it) }
+            // 「列全部」不需要关键词槽；「搜什么」才要。
+            "memory_get" -> if (route.action == "list") {
+                Unit
+            } else {
+                extractAfterTrigger(
+                    raw,
+                    listOf(
+                        "我说过", "我的记忆", "之前说过", "查记忆",
+                        "还记得", "你记得", "记不记得", "记忆里",
+                        "what did i say", "my memory",
+                    ),
+                )?.let { args.put("keywords", it) }
+            }
             "screenshot" -> Unit
             else -> Unit
         }

@@ -693,8 +693,9 @@ adb shell "run-as com.pilot.agent cat files/assistant_fastpath.log"
   显式关过的用户保留 `false`（key 已存在时以存储值为准）。
 - **回滚**：设置页关闭开关即可；不需要回退代码。快路径任何一步失败都会回落
   原链路，关闭后行为与移植前完全一致。
-- **未提升的能力**：`app_launch` / `volume` / `media` / `reminder` / `memory_write`
-  / `screenshot` 仍是 `LEGACY`。按 runbook 在真机观察影子日志无分歧后再逐个提升。
+- **未提升的能力**：`app_launch` / `volume` / `media` / `reminder` 仍是 `LEGACY`。
+  这四个在遗留链路里匹配器不接、由下游规划器处理，提升等于换执行路径，
+  评估要点见 §16.7。（`memory_write` / `screenshot` 已于 §16.6 提升。）
 
 #### 手动验证端侧补值（修正后的句子）
 
@@ -780,28 +781,89 @@ fast   侧：记住 影子对照样本乙 → memories.content = "影子对照�
 **结论**：共同命中的句子两侧语义等价，快路径额外接住「记一下 / 存进记忆 / 别忘了」
 三种说法。提升后行为只会更好（多认几种说法，写入内容一样）。
 
-### 16.4 顺带查出的三个问题（不属于本次提升范围）
+### 16.4 顺带查出的三个问题
 
 1. **讨论句误截屏**（见 16.2）：遗留匹配器对含「截图 / 截屏」的任何句子都会截屏，
-   快路径的排除词救不了 —— 因为拒绝即回落。
-2. **`memory_get` 已经是 ROUTE，但语义和遗留不一致**：「你记得什么」快路径走
+   快路径的排除词救不了 —— 因为拒绝即回落。**仍未修**（要改遗留匹配器）。
+2. **`memory_get` 语义和遗留不一致** —— **已修**（见 16.6）：「你记得什么」快路径走
    `memory_get/search`（用 keywords="什么" 去搜），遗留走 `memory_list`（列全部）。
-   今天这句的输出已经不是遗留的行为了。要么给 `memory_get` 加一个 `list` 动作，
-   要么把「你记得什么」这类问法排除掉。
-3. **`MemoryStore.forget()` 是模糊匹配删除**：清理测试记忆时，
-   「忘掉 影子对照样本」把一条无关的旧记忆「頻据」一起删了（已按原内容补回，
-   但 id/时间戳变了）。这个钩子是遗留链路的既有行为，本次未改。
+   现在快路径补了 `memory_get/list` 动作，六种问法逐句对齐遗留。
+3. **`MemoryStore.forget()` 是模糊匹配删除**：清理测试记忆时两次误伤 ——
+   「忘掉 影子对照样本」和「忘掉 shadow-probe-S」（**ASCII 查询**）都把一条无关的
+   旧记忆「頻据」一起删了（两次都已按原内容补回，id/时间戳变了）。
+   这是遗留链路的既有行为，本次未改；新增了按 id 精确删除的维护钩子
+   `memory_delete_id`，以后清理测试数据用这个。
 
-### 16.5 提升建议
+### 16.5 提升结论
 
-| 能力 | 建议 | 理由 |
+| 能力 | 结论 | 理由 |
 |---|---|---|
-| `screenshot` | 可提升 ROUTE | 共同命中时同一工具、同一结果；额外认领三种说法；无确认卡（READ 组）|
-| `memory_write` | 可提升 ROUTE | 共同命中时抽出的正文逐句一致；负例两侧一致（修完 ≥2 字规则后）；额外认领三种说法 |
+| `screenshot` | 已提升 ROUTE | 共同命中时同一工具、同一结果；额外认领三种说法；无确认卡（READ 组）|
+| `memory_write` | 已提升 ROUTE | 共同命中时抽出的正文逐句一致；负例两侧一致（修完 ≥2 字规则后）；额外认领三种说法 |
 
-两个能力都不建议**今天直接开**：先在真机上按 §16.1 的语料各跑 5~10 句，
-确认日志里没有新的分歧，再逐个切 ROUTE。切完记得把 `routes.json` 里的归属
-固化下来（设置页可点按循环）。
+### 16.6 提升记录（2026-11-18）
+
+**先修 `memory_get` 的 list/search 分歧**（它当时已经是 ROUTE，行为已经偏离遗留）：
+
+- `CapabilityRegistry`：`memory_get` 增加 `list` 动作（只读）。
+- `DefaultRoutes`：新增 `tool.memory-list`（seed v2），关键词照搬遗留的
+  `memory_list` 话术：「列出你记住 / 你记住了什么 / 查看长期记忆 / 列出长期记忆 /
+  记忆列表 / 你记得什么」。关键词比 search 那条长（"你记得什么" vs "你记得"），
+  打分稳赢；`你还记得我喜欢喝什么吗` 仍走 search。
+- `CapabilityExecutor`：`memory_get` 按动作分发，`list` 走 `MemoryStore.all()` +
+  `formatList`，与遗留 `memory_list` 的措辞一致。
+- `SlotExtractor`：`list` 不抽关键词槽（"列全部"不需要搜索词）。
+
+真机对照（六句全部与遗留一致）：
+
+| 句子 | 快路径 | 遗留 |
+|---|---|---|
+| 你记得什么 / 列出你记住 / 查看长期记忆 | `memory_get/list` | `memory_list` |
+| 你还记得我喜欢喝什么吗 | `memory_get/search` keywords=我喜欢喝什么吗 | `memory_search` |
+| 我说过什么 / 查记忆 | `memory_get/search` | none（快路径更宽）|
+
+**再提升 screenshot 与 memory_write**（真机跑真实入口，非自检钩子）：
+
+| 输入 | 结果 |
+|---|---|
+| 截个屏 / 截一张屏 / 截图 / screen shot | `handled: screenshot/take SUCCESS` ×4 |
+| 打开截屏设置 | `no-route` → 回落原链路 |
+| 截图功能怎么实现 | `no-route` → 回落遗留（遗留仍会截屏，见 16.4-1）|
+| 记住 shadow-probe-S1 | `handled: memory_write/write SUCCESS` |
+| 记一下 shadow-probe-S2 | `handled: memory_write/write SUCCESS`（遗留不认「记一下」）|
+| 别忘了说 | `no-route: no-args`（与遗留一致：遗留也不写）|
+| 你记住我说的 | `no-route`（一致）|
+
+**出厂默认值同步**（`DefaultOwners.all`）：
+
+| 归属 | 能力 |
+|---|---|
+| ROUTE | `device` / `memory_get` / `memory_write` / `screenshot` / `file_read` / `file_write` / `scheduled_task` |
+| LEGACY | `app_launch` / `volume` / `media` / `reminder` |
+
+两点要记住：
+
+1. 这份默认值只决定**新装**。老机器以 `files/assistant/routes.json` 里存的为准
+   （`normalizeOwners` 现在对"存储里没有的能力"回落到出厂默认，而不是一律 LEGACY）。
+2. 剩下 4 个 LEGACY 的原因不变：遗留匹配器不接它们、由下游规划器处理，
+   提升 = 换执行路径，得单独评估（见 §16.7）。
+
+### 16.7 下一批：app_launch / volume / media / reminder
+
+这四个在遗留链路里**匹配器不接**（`legacy=none`），今天由 Agent 循环的
+`HeuristicPlanner` / `ActionCatalog` / `MusicPlayer` / `ReminderManager` 处理。
+提升 = 把执行权从"agent 规划 + 点屏幕"换成"规则直达 + 直接调系统 API"，
+属于行为改变而非等价替换，要单独评估：
+
+| 能力 | 提升前必须确认的事 |
+|---|---|
+| `volume` | set/adjust 是无确认的即时状态变化（LOW）；缺百分比时不接管 |
+| `media` | `play` 没有执行器（检索流水线在 AgentLoop），必然回落；只影响 pause/resume/next/previous/stop/status/list |
+| `reminder` | `cancel` 属 DELETE 组要确认；`schedule` 的时间解析换成 `ReminderManager` 那套，与 agent 不是同一套解析器 |
+| `app_launch` | READ 组**不弹确认**；索引未建 / 无障碍未连时是"没找到「X」"的报错，而 agent 会继续找图标点进去 |
+
+做法同 §16.1：先 `fastpath_owner '<cap>=SHADOW'`，用 5 正 + 5 反语料跑对照，
+再逐个切 ROUTE。
 
 
 
