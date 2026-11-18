@@ -371,4 +371,54 @@ adb shell "run-as com.pilot.agent cat files/assistant_fastpath.log"
   `neg-volume-no-args`（音量没数值 → `no-args`）；原「写个方案」「把整段话保存下来」
   「帮我记住」「打开」实际是 `no-match`（根本没命中路由），已改成实际原因。
 
+## 12. P2 产出（执行接线 + 安全 + 诊断）
+
+新增：
+
+| 文件 | 作用 |
+|---|---|
+| `assistant/AssistantFastPath.kt` | 编排：开关 → 扩展意图排除 → 路由 → 安全闸 → 执行器 → 返回计划 |
+| `assistant/exec/CapabilityExecutor.kt` | 能力 → `ToolInvocation`（落到 Pilot 已有执行器，不新写工具） |
+| `assistant/exec/CapabilitySafety.kt` | 逐词/子序列校验、破坏性命令闸、破坏性必确认 |
+| `assistant/exec/ResultFormatter.kt` | 「✅ 动作 + 参数 + 结果」与播报摘要 |
+| `assistant/exec/FastPathTrace.kt` | 诊断轨迹 `files/assistant_fastpath.log` |
+
+改动：
+
+| 文件 | 改动 |
+|---|---|
+| `agent/AgentSettings.kt` | 新增 `assistantFastPath`（SharedPreferences `assistant_fast_path`，**默认关**） |
+| `ui/AgentViewModel.kt` | `dispatchRequest` 最前面接快路径（仅助理模式）；复用 `askToolConfirmation` |
+| `ui/PilotSettingsDialog.kt` | 设置页新增「助理快路径（端侧直执行）」开关 |
+| `service/RunReceiver.kt` | 广播/语音入口接快路径（无 UI → 需要确认的一律拒绝） |
+| `tool/LocalToolRuntime.kt` | `files` / `devices` 改为公开，快路径复用同一份实例 |
+| `PilotApp.kt` | 后台预热路由表（首次读 `routes.json` 是文件 IO，不能上主线程） |
+
+### 执行覆盖矩阵（P2）
+
+| capability / action | 执行器 | 状态 |
+|---|---|---|
+| `app_launch/open` | `ActionCatalog` → `AppLaunchIndex` + `DeviceActions.launchComponent` | ✅ |
+| `volume/set` `adjust` `status` | `SystemOps` | ✅ |
+| `device/battery` `storage` `info` | `DeviceTools` | ✅ |
+| `media/pause` `resume` `next` `previous` `stop` `status` `list` | `MusicPlayer` | ✅ |
+| `media/play` | — | ❌ 检索流水线在 AgentLoop，交回原链路 |
+| `reminder/schedule` `list` `cancel` | `ReminderManager.handle` | ✅ |
+| `scheduled_task/create` `list` `cancel` | `ScheduledTaskManager` | ✅ |
+| `memory_write/write` | `MemoryStore.remember` | ✅ |
+| `memory_get/search` | `MemoryStore.search` | ✅ |
+| `file_read/read` | `FileTools.readFile` | ✅ |
+| `file_write/write` | `FileTools.writeFile(overwrite=true)` | ✅（覆盖=破坏性 → 确认） |
+| `screenshot/take` | `FileTools.takeScreenshot` | ✅（需无障碍服务） |
+
+**没有执行器的能力一律交回原链路**，绝不猜着执行。
+
+### 已知取舍
+
+- 确认由 `ToolGroup`/`ToolPolicy` 决定：`file_write` 落在 WRITE 组（默认每次询问）；
+  若用户把 WRITE 组策略设成「允许」，覆盖文件就不再询问 —— P4 的 owner 机制落地后
+  可再收紧。
+- `media/play` 与「按歌名播放」暂不在快路径内，避免重复实现 Netease 检索流水线。
+
+
 

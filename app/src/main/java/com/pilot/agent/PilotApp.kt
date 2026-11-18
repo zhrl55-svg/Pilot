@@ -24,6 +24,9 @@ class PilotApp : Application() {
         // ASR/LLM 加载前会通过 ModelStore.awaitReady() 等它结束，
         // 避免读到半个 onnx 触发 native abort。
         Thread {
+            // 助理快路径的路由表先预热：首次读 routes.json 是文件 IO，
+            // 不能放到主线程（决策发生在 UI 线程）。
+            runCatching { com.pilot.agent.assistant.routing.RouteStore.get(this) }
             ModelStore.ensure(this)
             // 模型搬完再建 App 入口索引：扫一遍全部已安装 App 的 exported Activity，
             // 之后「打开微信扫一扫」这类请求就能直接 startActivity，不用点屏幕。

@@ -75,6 +75,12 @@ data class AgentSettings(
     val musicFallbackUrl: String = DEFAULT_MUSIC_FALLBACK_URL,
     /** 扫码登录后拿到的 cookie，存本地不落服务器 */
     val neteaseCookie: String = "",
+    /**
+     * 助理快路径（端侧直执行）：规则选能力 → 确定性抽参 → 本机执行，不调云端。
+     *
+     * 默认**关**：新路径不能默认改变现有行为，真机验收通过后再打开。
+     */
+    val assistantFastPath: Boolean = false,
 ) {
     val cloudReady: Boolean get() = apiKey.isNotBlank() && baseUrl.isNotBlank()
 
@@ -147,6 +153,7 @@ data class AgentSettings(
         private const val K_MUSIC_URL = "music_base_url"
         private const val K_MUSIC_FALLBACK_URL = "music_fallback_url"
         private const val K_NETEASE_COOKIE = "netease_cookie"
+        private const val K_ASSISTANT_FAST_PATH = "assistant_fast_path"
 
         /**
          * v2 迁移：把「待命」默认改成**开**（进 App 就开麦）。
@@ -204,6 +211,7 @@ data class AgentSettings(
                 musicFallbackUrl = p.getString(K_MUSIC_FALLBACK_URL, null)
                     ?: DEFAULT_MUSIC_FALLBACK_URL,
                 neteaseCookie = p.getString(K_NETEASE_COOKIE, null) ?: "",
+                assistantFastPath = p.getBoolean(K_ASSISTANT_FAST_PATH, false),
             )
         }
 
@@ -242,6 +250,7 @@ data class AgentSettings(
                 .putString(K_MUSIC_URL, s.musicBaseUrl)
                 .putString(K_MUSIC_FALLBACK_URL, s.musicFallbackUrl)
                 .putString(K_NETEASE_COOKIE, s.neteaseCookie)
+                .putBoolean(K_ASSISTANT_FAST_PATH, s.assistantFastPath)
                 .apply()
             runCatching { SecretVault.put(K_WEB_SEARCH_KEY, s.webSearchApiKey) }
         }

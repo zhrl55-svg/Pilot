@@ -9,6 +9,9 @@ import com.pilot.agent.Dbg
 import kotlinx.coroutines.runBlocking
 import okhttp3.MediaType.Companion.toMediaType
 import com.pilot.agent.agent.AgentSettings
+import com.pilot.agent.assistant.AssistantFastPath
+import com.pilot.agent.assistant.exec.FastPathTrace
+import com.pilot.agent.assistant.exec.ResultFormatter
 import com.pilot.agent.runtime.AgentRuntime
 
 /**
@@ -172,6 +175,41 @@ class RunReceiver : BroadcastReceiver() {
 
         if (goal.isEmpty()) {
             Dbg.w(TAG, "触发请求缺少 goal / asr_test / llm_test")
+            return
+        }
+
+        // 助理快路径：规则选能力 → 确定性抽参 → 本机执行，不调云端。
+        // 接管了就不走下面的遗留匹配器，避免同一个请求被执行两遍。
+        val fastPlan = AssistantFastPath.plan(context, goal, "broadcast")
+        if (fastPlan != null) {
+            Thread {
+                val result = runCatching {
+                    runBlocking {
+                        AgentRuntime.localTools.execute(fastPlan.invocation) { question, _ ->
+                            Dbg.w(TAG, "快路径无人确认，已拒绝：$question")
+                            false
+                        }
+                    }
+                }.getOrNull()
+                if (result != null) {
+                    val reply = ResultFormatter.format(
+                        fastPlan.capability,
+                        fastPlan.action,
+                        fastPlan.args,
+                        result,
+                    )
+                    FastPathTrace.handled(
+                        context,
+                        fastPlan.capability,
+                        fastPlan.action,
+                        result.status.name,
+                        reply.text.length,
+                    )
+                    AgentRuntime.speaker.speak(reply.spoken)
+                } else {
+                    Dbg.e(TAG, "快路径没有返回结果")
+                }
+            }.apply { name = "fast-path"; isDaemon = true }.start()
             return
         }
 

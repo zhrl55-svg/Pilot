@@ -17,6 +17,9 @@ import com.pilot.agent.agent.AgentSettings
 import com.pilot.agent.agent.AssistantMode
 import com.pilot.agent.agent.IntentGate
 import com.pilot.agent.agent.Risk
+import com.pilot.agent.assistant.AssistantFastPath
+import com.pilot.agent.assistant.exec.FastPathTrace
+import com.pilot.agent.assistant.exec.ResultFormatter
 import com.pilot.agent.runtime.AgentRuntime
 import com.pilot.agent.tool.ToolGroup
 import com.pilot.agent.tool.ToolInvocation
@@ -1260,6 +1263,49 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         return true
     }
 
+    /**
+     * 助理快路径：规则选能力 → 确定性抽参 → 本机执行。
+     *
+     * 只在**助理模式**下生效（Agent 模式由模型主导决策）；开关默认关。
+     * 决策是同步的（路由是纯计算），执行放到后台线程。
+     */
+    private fun tryRunFastPath(text: String, allowConfirmation: Boolean): Boolean {
+        if (mode != AssistantMode.ASSISTANT) return false
+        if (!AssistantFastPath.isEnabled()) return false
+        val plan = AssistantFastPath.plan(getApplication(), text, "ui") ?: return false
+        add(LogEntry.Kind.THINK, "调用本机能力…")
+        running = true
+        justSent = true
+        activeTaskLabel = "本机能力"
+        publishNotificationStatus()
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                AgentRuntime.localTools.execute(plan.invocation) { question, risk ->
+                    if (allowConfirmation) askToolConfirmation(question, risk)
+                    else false
+                }
+            }
+            running = false
+            justSent = false
+            activeTaskLabel = ""
+            publishNotificationStatus()
+            val reply = ResultFormatter.format(plan.capability, plan.action, plan.args, result)
+            val kind = if (result.status == ToolStatus.SUCCESS) LogEntry.Kind.DONE
+            else LogEntry.Kind.ERROR
+            add(kind, reply.text)
+            FastPathTrace.handled(
+                getApplication(),
+                plan.capability,
+                plan.action,
+                result.status.name,
+                reply.text.length,
+            )
+            AgentRuntime.speaker.speak(reply.spoken)
+            refreshStatus()
+        }
+        return true
+    }
+
     private suspend fun askToolConfirmation(question: String, risk: Risk): Boolean {
         val id = System.nanoTime()
         val deferred = CompletableDeferred<Boolean>()
@@ -1299,6 +1345,9 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         g: String,
         invocation: ToolInvocation?,
     ) {
+        // 助理快路径优先：规则选能力 → 确定性抽参 → 本机执行，不调云端。
+        // 接管了就返回，后面的链路不再执行，避免同一个请求被执行两遍。
+        if (tryRunFastPath(g, allowConfirmation = true)) return
         if (tryRunLocalTool(g, allowConfirmation = true, matchedTool = invocation)) return
 
         val kind = IntentGate.classify(g)

@@ -158,6 +158,7 @@ private class SettingsDraft(initial: AgentSettings) {
     var mode by mutableStateOf(initial.mode)
     var reasoningEffort by mutableStateOf(initial.reasoningEffort)
     var preferOnDevice by mutableStateOf(initial.preferOnDevice)
+    var assistantFastPath by mutableStateOf(initial.assistantFastPath)
     var allowSkillReplay by mutableStateOf(initial.allowSkillReplay)
     var maxChatTurns by mutableStateOf(initial.chatContextTurns.toString())
 
@@ -192,6 +193,7 @@ private class SettingsDraft(initial: AgentSettings) {
             it in AgentSettings.REASONING_EFFORTS
         } ?: AgentSettings.DEFAULT_REASONING_EFFORT,
         preferOnDevice = preferOnDevice,
+        assistantFastPath = assistantFastPath,
         allowSkillReplay = allowSkillReplay,
         chatContextTurns = maxChatTurns.toIntOrNull()?.coerceIn(0, 20) ?: 4,
         wakeWords = wakeWords.trim().ifEmpty { AgentSettings.DEFAULT_WAKE_WORDS },
@@ -1032,6 +1034,17 @@ private fun AgentSettingsPage(vm: AgentViewModel, draft: SettingsDraft) {
                     subtitle = "相同任务优先回放成功过的界面步骤",
                     checked = draft.allowSkillReplay,
                     onCheckedChange = { draft.allowSkillReplay = it },
+                )
+                HorizontalDivider(color = SettingsLine.copy(alpha = 0.55f))
+                SettingsToggleRow(
+                    title = "助理快路径（端侧直执行）",
+                    subtitle = "规则选能力 → 确定性抽参 → 本机执行，不调云端；不命中就照旧走原链路",
+                    checked = draft.assistantFastPath,
+                    onCheckedChange = { draft.assistantFastPath = it },
+                )
+                InfoLine(
+                    "开启后「查电量 / 读文件 / 记一件事」这类明确指令由本机直接完成。" +
+                        "覆盖文件等破坏性操作仍会先确认。诊断日志：files/assistant_fastpath.log",
                 )
             }
         }

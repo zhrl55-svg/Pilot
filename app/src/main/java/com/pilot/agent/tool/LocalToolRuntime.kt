@@ -21,8 +21,10 @@ class LocalToolRuntime(
     private val appContext = context.applicationContext
     private val permissions = ToolPermissionStore(appContext)
     private val audit = ToolAuditLog(appContext)
-    private val files = FileTools(appContext, readerProvider)
-    private val devices = DeviceTools(appContext)
+    /** 文件工具。助理快路径的 file_* 能力复用同一份实例。 */
+    val files = FileTools(appContext, readerProvider)
+    /** 设备状态工具。助理快路径的 device 能力复用同一份实例。 */
+    val devices = DeviceTools(appContext)
     private val ssh = SshTool()
     val memory = MemoryStore(appContext)
 
