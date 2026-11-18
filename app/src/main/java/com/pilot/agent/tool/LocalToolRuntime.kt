@@ -155,6 +155,9 @@ class LocalToolRuntime(
     private fun matchScreenshot(text: String): ToolInvocation? {
         if (!text.contains("截图") && !text.contains("截屏")) return null
         if (text.contains("打开截屏设置") || text.contains("关闭截屏")) return null
+        // ★ 「截图功能怎么实现」「怎么给截图加个悬浮窗」不是在要截图，是在聊截图。
+        //   这个匹配器只看关键词在不在句子里，所以讨论/疑问句必须在这里挡掉。
+        if (LegacyIntentGuard.isQuestionOrDiscussion(text)) return null
         return invocation(
             name = "take_screenshot",
             group = ToolGroup.READ,
@@ -197,6 +200,10 @@ class LocalToolRuntime(
 
     private fun matchDevice(text: String): ToolInvocation? {
         val lower = text.lowercase(Locale.ROOT)
+        // ★ 「我们可以加个电量显示功能」是在聊，不是要查电量。
+        //   只挡讨论/需求句（DISCUSSION_CUES）；问句（"网络怎么样"）照常回答 ——
+        //   遗留的关键词里本来就有「网络怎么样」「定位开了吗」这类问法。
+        if (LegacyIntentGuard.isDiscussion(text)) return null
         return when {
             listOf("电量", "剩余电", "电池还有", "电池状态").any(text::contains) ->
                 invocation("device_battery", ToolGroup.READ, "查询电量") { _, _ ->
@@ -305,9 +312,16 @@ class LocalToolRuntime(
     }
 
     private fun matchFiles(text: String): ToolInvocation? {
+        // ★ 疑问句不是指令：「怎么删除文件」「怎么打开文件」是在问，不是要动手。
+        //   下面这几个匹配器会删文件、移动文件、分享文件、拉起系统面板，
+        //   误触发的代价很高，所以问句一律不放行。
+        //   读/写匹配器不放行疑问句 —— 「读取文件」本来就常出现在问句里
+        //   （"读取文件的功能是什么"），但它们只碰自己沙盒范围内的文件，风险低。
+        val isQuestion = LegacyIntentGuard.isQuestion(text)
         Regex("(?:复制)(?:文件|文件夹)?[：:\\s]*(.+?)\\s*(?:到|至)\\s*(.+)").find(text)?.let { match ->
             val source = stripFileWords(match.groupValues[1])
             val destination = stripFileWords(match.groupValues[2])
+            if (isQuestion) return null
             return invocation(
                 "copy_file",
                 ToolGroup.WRITE,
@@ -318,6 +332,7 @@ class LocalToolRuntime(
         Regex("(?:移动|挪动)(?:文件|文件夹)?[：:\\s]*(.+?)\\s*(?:到|至)\\s*(.+)").find(text)?.let { match ->
             val source = stripFileWords(match.groupValues[1])
             val destination = stripFileWords(match.groupValues[2])
+            if (isQuestion) return null
             return invocation(
                 "move_file",
                 ToolGroup.WRITE,
@@ -327,6 +342,7 @@ class LocalToolRuntime(
         }
         Regex("(?:删除|删掉)(?:文件或文件夹|文件|文件夹|目录)[：:\\s]*(.+)").find(text)?.let { match ->
             val path = stripFileWords(match.groupValues[1])
+            if (isQuestion) return null
             return invocation(
                 "delete_file",
                 ToolGroup.DELETE,
@@ -336,6 +352,7 @@ class LocalToolRuntime(
         }
         Regex("(?:分享|发送)(?:文件|这个文件)[：:\\s]*(.+)").find(text)?.let { match ->
             val path = stripFileWords(match.groupValues[1])
+            if (isQuestion) return null
             return invocation(
                 "share_file",
                 ToolGroup.SHARE,
@@ -345,6 +362,7 @@ class LocalToolRuntime(
         }
         Regex("(?:打开)(?:文件|这个文件)[：:\\s]*(.+)").find(text)?.let { match ->
             val path = stripFileWords(match.groupValues[1])
+            if (isQuestion) return null
             return invocation(
                 "open_file",
                 ToolGroup.SHARE,
@@ -354,6 +372,9 @@ class LocalToolRuntime(
         }
         Regex("(?:读取文件|读一下文件|看一下文件|查看文件|读取)[：:\\s]*(.+)").find(text)?.let { match ->
             val path = stripFileWords(match.groupValues[1])
+            // 抽取到的"路径"得真的像路径：「讨论一下读取文件的功能」里
+            // 抓到的是「的功能」，不是路径 —— 交回助理链路回答问题。
+            if (!LegacyIntentGuard.looksLikePath(path)) return null
             return invocation("read_file", ToolGroup.READ, "读取文件") { _, _ ->
                 files.readFile(path)
             }
@@ -362,6 +383,7 @@ class LocalToolRuntime(
             .find(text)?.let { match ->
                 val path = stripFileWords(match.groupValues[1])
                 val content = match.groupValues[2]
+                if (!LegacyIntentGuard.looksLikePath(path)) return null
                 val overwrite = text.contains("覆盖")
                 return invocation(
                     "write_file",
@@ -378,6 +400,9 @@ class LocalToolRuntime(
             .find(text)?.let { match ->
                 val content = match.groupValues[1].trim()
                 val path = stripFileWords(match.groupValues[2])
+                // 「讨论一下把日志写入文件的方案」里，写入后面跟着的是「的方案」——
+                // 不是路径。交给助理链路去回答，别拿它去写文件。
+                if (!LegacyIntentGuard.looksLikePath(path)) return null
                 val overwrite = text.contains("覆盖")
                 return invocation(
                     "write_file",
