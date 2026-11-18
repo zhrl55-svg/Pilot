@@ -7,6 +7,7 @@ import com.pilot.agent.assistant.exec.CapabilitySafety
 import com.pilot.agent.assistant.exec.FastPathTrace
 import com.pilot.agent.assistant.llm.SlotFiller
 import com.pilot.agent.assistant.routing.AssistantRouter
+import com.pilot.agent.assistant.routing.FastPathOwner
 import com.pilot.agent.assistant.routing.RouteDecision
 import com.pilot.agent.assistant.routing.RouteStore
 import com.pilot.agent.runtime.AgentRuntime
@@ -99,6 +100,18 @@ object AssistantFastPath {
                 FastPathTrace.declined(context, routed.reason, trimmed)
                 return null
             }
+        }
+
+        // P4：执行权归属。LEGACY / SHADOW 都不接管 —— 影子模式只把两侧决策记下来。
+        val owner = RouteStore.get(context).ownerFor(decision.capability)
+        if (owner != FastPathOwner.ROUTE) {
+            val legacy = AgentRuntime.localTools.match(trimmed)?.name ?: "none"
+            FastPathTrace.line(
+                context,
+                "owner=$owner route=${decision.capability}/${decision.action} " +
+                    "legacy=$legacy 「${trimmed.take(24)}」",
+            )
+            return null
         }
 
         // 安全闸：值必须来自用户原话，破坏性命令不执行。

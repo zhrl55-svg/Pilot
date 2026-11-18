@@ -1265,6 +1265,21 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * P4 查询兜底：意图门判成 TASK、但查询工具确实能接时，交给 QueryEngine，
+     * 避免「查询被当成任务去点屏幕」。
+     *
+     * 反方向的误伤也要挡住：能解析成 App / 系统页的句子（「打开设置」）
+     * 优先走操作链路。
+     */
+    private fun isQueryFallback(g: String): Boolean {
+        if (!com.pilot.agent.query.QueryEngine.canHandle(g)) return false
+        if (com.pilot.agent.action.ActionCatalog.resolve(g) != null) return false
+        val appIndex = AgentRuntime.appIndex
+        if (appIndex.built && appIndex.resolve(g) != null) return false
+        return true
+    }
+
+    /**
      * 助理快路径：规则选能力 → 确定性抽参（必要时端侧模型补值）→ 本机执行。
      *
      * 只在**助理模式**下生效（Agent 模式由模型主导决策）；开关默认关。
@@ -1411,7 +1426,8 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             when (kind) {
                 IntentGate.Kind.QUERY -> query(g)
                 IntentGate.Kind.CHAT -> chat(g)
-                IntentGate.Kind.TASK -> startAgent(g, AssistantMode.ASSISTANT)
+                IntentGate.Kind.TASK ->
+                    if (isQueryFallback(g)) query(g) else startAgent(g, AssistantMode.ASSISTANT)
             }
             return
         }

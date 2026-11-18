@@ -21,8 +21,29 @@ class RouteStore internal constructor(
     private val file = File(rootDir, "routes.json")
     private val lock = Any()
     private val _routes = MutableStateFlow<List<AssistantRoute>>(emptyList())
+    private val _owners = MutableStateFlow<Map<String, FastPathOwner>>(DefaultOwners.all)
 
     val routes: StateFlow<List<AssistantRoute>> = _routes.asStateFlow()
+
+    /** 能力 → 执行权归属（LEGACY / SHADOW / ROUTE）。 */
+    val owners: StateFlow<Map<String, FastPathOwner>> = _owners.asStateFlow()
+
+    fun ownerFor(capability: String): FastPathOwner =
+        _owners.value[capability] ?: FastPathOwner.LEGACY
+
+    /**
+     * 切换某个能力的执行权归属。
+     *
+     * 这是 P4 的逐能力接管入口：先 SHADOW 对照，分歧为 0 再 ROUTE。
+     */
+    fun setOwner(capability: String, owner: FastPathOwner) {
+        require(CapabilityRegistry.get(capability) != null) {
+            "Unknown capability: $capability"
+        }
+        synchronized(lock) {
+            writeAll(_routes.value, ownerOverrides = _owners.value + (capability to owner))
+        }
+    }
 
     init {
         ensureLoaded()
@@ -77,6 +98,7 @@ class RouteStore internal constructor(
         put("schemaVersion", SCHEMA_VERSION)
         put("defaultsVersion", DefaultRoutes.SEED_VERSION)
         put("routes", JSONArray().also { arr -> _routes.value.forEach { arr.put(it.toJson()) } })
+        put("owners", ownersJson(_owners.value))
     }.toString(2)
 
     /**
@@ -93,8 +115,16 @@ class RouteStore internal constructor(
         if (parsed.size > MAX_ROUTES) {
             throw IllegalArgumentException("At most $MAX_ROUTES routes are allowed")
         }
+        val importedOwners = runCatching {
+            JSONObject(json.trim()).optJSONObject("owners")
+        }.getOrNull()?.let { parseOwners(it) }
         synchronized(lock) {
-            writeAll(parsed, seedVersion = DefaultRoutes.SEED_VERSION, force = true)
+            writeAll(
+                parsed,
+                seedVersion = DefaultRoutes.SEED_VERSION,
+                force = true,
+                ownerOverrides = importedOwners,
+            )
         }
         return parsed.size
     }
@@ -151,8 +181,10 @@ class RouteStore internal constructor(
                 runCatching { validate(route) }.isSuccess
             }.take(MAX_ROUTES)
             val seedVersion = doc.optInt("defaultsVersion", 0)
+            val owners = doc.optJSONObject("owners")?.let { parseOwners(it) } ?: DefaultOwners.all
             val withNewDefaults = DefaultRoutes.migrate(valid, seedVersion).take(MAX_ROUTES)
             _routes.value = withNewDefaults
+            _owners.value = normalizeOwners(owners)
             if (withNewDefaults.size != loaded.size || seedVersion < DefaultRoutes.SEED_VERSION) {
                 writeAll(withNewDefaults, DefaultRoutes.SEED_VERSION, force = true)
             }
@@ -180,18 +212,41 @@ class RouteStore internal constructor(
         }
     }
 
+    /** owners 只认已知能力；未知键忽略（可能是旧版本/手写错误）。 */
+    private fun parseOwners(o: JSONObject): Map<String, FastPathOwner> = buildMap {
+        val keys = o.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            if (CapabilityRegistry.get(key) == null) continue
+            put(key, DefaultOwners.parse(o.optString(key)))
+        }
+    }
+
+    /** 补齐缺失能力：没写的能力一律 LEGACY（不改变行为）。 */
+    private fun normalizeOwners(owners: Map<String, FastPathOwner>): Map<String, FastPathOwner> =
+        DefaultOwners.all.mapValues { (capability, _) ->
+            owners[capability] ?: FastPathOwner.LEGACY
+        }
+
+    private fun ownersJson(owners: Map<String, FastPathOwner>): JSONObject = JSONObject().apply {
+        normalizeOwners(owners).forEach { (capability, owner) -> put(capability, owner.name) }
+    }
+
     private fun writeAll(
         routes: List<AssistantRoute>,
         seedVersion: Int = DefaultRoutes.SEED_VERSION,
         force: Boolean = false,
+        ownerOverrides: Map<String, FastPathOwner>? = null,
     ) {
         rootDir.mkdirs()
+        val owners = normalizeOwners(ownerOverrides ?: _owners.value)
         val doc = JSONObject().apply {
             put("schemaVersion", SCHEMA_VERSION)
             put("defaultsVersion", seedVersion)
             put("routes", JSONArray().also { arr -> routes.forEach { arr.put(it.toJson()) } })
+            put("owners", ownersJson(owners))
         }
-        if (!force && routes == _routes.value && file.isFile) return
+        if (!force && routes == _routes.value && owners == _owners.value && file.isFile) return
         val tmp = File(rootDir, "routes.json.tmp")
         tmp.writeText(doc.toString(2))
         if (file.exists()) {
@@ -203,10 +258,11 @@ class RouteStore internal constructor(
             tmp.delete()
         }
         _routes.value = routes
+        _owners.value = owners
     }
 
     companion object {
-        const val SCHEMA_VERSION = 1
+        const val SCHEMA_VERSION = 2
         const val MAX_ROUTES = 200
         const val MAX_KEYWORDS = 20
         const val MAX_PATTERNS = 20

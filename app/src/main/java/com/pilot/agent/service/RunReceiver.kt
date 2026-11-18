@@ -40,6 +40,24 @@ class RunReceiver : BroadcastReceiver() {
 
         val goal = intent.getStringExtra("goal")?.trim().orEmpty()
 
+        // P4 调试：设置某个能力的执行权归属（LEGACY / SHADOW / ROUTE）
+        //   adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent \
+        //       --es fastpath_owner 'device=SHADOW'"
+        val ownerSpec = intent.getStringExtra("fastpath_owner")
+        if (!ownerSpec.isNullOrBlank()) {
+            val capability = ownerSpec.substringBefore('=').trim()
+            val owner = com.pilot.agent.assistant.routing.DefaultOwners
+                .parse(ownerSpec.substringAfter('=', ""))
+            runCatching {
+                com.pilot.agent.assistant.routing.RouteStore.get(context)
+                    .setOwner(capability, owner)
+                Dbg.i(TAG, "快路径归属：$capability=$owner")
+            }.onFailure {
+                Dbg.w(TAG, "设置快路径归属失败：${it.message}")
+            }
+            return
+        }
+
         // 从服务器侧写入网易云 cookie（扫码/验证码在电脑上完成，不用在 App 里走一遍）
         //   adb shell am broadcast -a com.pilot.agent.RUN -p com.pilot.agent.debug \
         //       --es set_netease_cookie "MUSIC_U=xxx; __csrf=yyy"

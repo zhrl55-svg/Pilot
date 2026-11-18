@@ -482,6 +482,97 @@ content），所以模型路径主要覆盖规则漏掉的说法（例如「内�
 
 模型可用、延迟可控（首字 286ms），补值路径的预算与 Minis 的实测一致。
 
+## 14. P4 产出（收敛去重：owner / 影子 / 查询兜底）
+
+### 14.1 执行权归属
+
+新增 `assistant/routing/FastPathOwner.kt`：
+
+```kotlin
+enum class FastPathOwner { LEGACY, SHADOW, ROUTE }
+```
+
+`RouteStore` 的 `routes.json` 升到 schema v2，新增 `owners` 对象；
+**默认全部 `LEGACY`** —— 打开总开关不改变任何行为，只有显式提升的能力才接管。
+
+`AssistantFastPath.plan()` 在路由后先查归属：
+
+| owner | 行为 | 轨迹 |
+|---|---|---|
+| `LEGACY` | 不接管，遗留匹配器执行 | `owner=LEGACY route=… legacy=…` |
+| `SHADOW` | 不接管，遗留匹配器执行；**记录两侧决策** | `owner=SHADOW route=… legacy=…` |
+| `ROUTE` | 快路径接管并执行 | 正常 `handled:` |
+
+`SHADOW` 的轨迹行同时给出 route 的 capability/action 与 legacy 的工具名，
+分歧（例如 route=`device/battery`、legacy=`device_info`）就是回归信号。
+
+### 14.2 怎么提升一个能力（现场 runbook）
+
+```bash
+ADB="adb -s <serial>"
+
+# 1) 投影子
+$ADB shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent --es fastpath_owner 'device=SHADOW'"
+
+# 2) 跑该能力的 10 句语料（5 正 + 5 反），读两侧是否一致
+$ADB shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent --es goal '电量还剩多少'"
+$ADB shell "run-as com.pilot.agent cat files/assistant_fastpath.log"
+
+# 3) 分歧为 0 → 切 ROUTE
+$ADB shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent --es fastpath_owner 'device=ROUTE'"
+```
+
+也可以在设置页「快路径接管范围」里点按循环：遗留 → 影子 → 接管 → 遗留。
+
+### 14.3 查询兜底
+
+`AgentViewModel.dispatchWithoutFastPath`：意图门判成 `TASK` 时，若
+`QueryEngine.canHandle(g)` 为真且这句话解析不成 App / 系统页
+（`ActionCatalog` / `AppLaunchIndex` 都为 null），交给 `QueryEngine`。
+防止「查询被当成任务去点屏幕」，同时不抢「打开 X」这类操作。
+
+### 14.4 已完成的三个前置补丁（复查）
+
+- `prefersAgentExtension` 前置排除：P2 已接（浏览器/MCP/脚本意图不进快路径）。
+- 截图排除词：「打开截屏设置 / 关闭截屏设置 / 截屏设置」在 P1 seed 里。
+- memory 句首锚定：P1 seed 用 `patterns`（`^(?:请|帮我|麻烦)?(?:记住|…)`）而不是裸关键词。
+
+### 14.5 验证
+
+- 单测：`RouteStoreTest` 新增 5 例（默认 LEGACY、持久化、未知能力拒绝、导入导出携带）；
+  助理相关单测合计 **51 例**。
+- 设备验证见下方「P4 真机影子对照」。
+
+#### P4 真机影子对照（P40，2026-11-18）
+
+| 句子 | route | legacy | 结论 |
+|---|---|---|---|
+| 电量还剩多少 | `device/battery` | `device_battery` | 一致 → 提升 `ROUTE` |
+| 你还记得我喜欢喝什么吗 | `memory_get/search` | `memory_search` | 一致 → 提升 `ROUTE` |
+| 我的定时任务 | `scheduled_task/list` | `list_scheduled_tasks` | 一致 → 提升 `ROUTE` |
+| 读一下 /sdcard/Download/1.txt | `file_read/read` | `none` | 遗留匹配器不接这句（旧行为是交给模型/规划器）→ 快路径是纯增量，提升 `ROUTE` |
+| 音量状态 / 暂停音乐 / 我的提醒 | `volume/status`、`media/pause`、`reminder/list` | `none` | 这三类由下游规划器/管理器负责，匹配器层无可比对象 → 暂留 `LEGACY`，按 runbook 观察后再提升 |
+| 打开设置 | `app_launch/open` | `none` | 同上（`HeuristicPlanner`/`ActionCatalog` 在下游） |
+
+`legacy=none` 的含义：**遗留匹配器对这一句没有意见**，不是分歧。这类能力的
+影子对照要看「提升前后的实际行为」，而不是匹配器名字。
+
+当前设备上的归属：`device`、`memory_get`、`scheduled_task`、`file_read`、
+`file_write` = `ROUTE`；其余 = `LEGACY`（可在设置页点按提升）。
+
+#### 手动验证端侧补值（修正后的句子）
+
+```text
+保存到 /sdcard/Download/minis_fastpath_model.txt 内容 hello
+```
+
+（之前文档里写的「内容 hello 保存在 /tmp/a.txt」不会命中 file_write 路由 ——
+`保存在` 不是路由关键词；而且 `/tmp` 不在 Pilot 允许的写入范围内。）
+
+预期：`model-fill-needed` → `model-fill-ok` → 弹出写入确认 → 确认后文件落盘。
+
+
+
 
 
 

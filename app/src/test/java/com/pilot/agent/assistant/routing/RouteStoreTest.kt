@@ -64,4 +64,47 @@ class RouteStoreTest {
         val count = target.importJson(json)
         assertEquals(store.snapshot().size, count)
     }
+
+    @Test
+    fun `owners default to legacy for every capability`() {
+        val store = RouteStore(tempDir())
+        CapabilityRegistry.all.forEach { capability ->
+            assertEquals(FastPathOwner.LEGACY, store.ownerFor(capability.id))
+        }
+    }
+
+    @Test
+    fun `owner changes survive a reload`() {
+        val dir = tempDir()
+        val store = RouteStore(dir)
+        store.setOwner("device", FastPathOwner.SHADOW)
+        store.setOwner("memory_get", FastPathOwner.ROUTE)
+
+        val reloaded = RouteStore(dir)
+        assertEquals(FastPathOwner.SHADOW, reloaded.ownerFor("device"))
+        assertEquals(FastPathOwner.ROUTE, reloaded.ownerFor("memory_get"))
+        assertEquals(FastPathOwner.LEGACY, reloaded.ownerFor("file_write"))
+    }
+
+    @Test
+    fun `an unknown capability cannot own a route`() {
+        val store = RouteStore(tempDir())
+        val error = runCatching {
+            store.setOwner("not_a_capability", FastPathOwner.ROUTE)
+        }.exceptionOrNull()
+        assertTrue(error is IllegalArgumentException)
+    }
+
+    @Test
+    fun `owner state is part of export and import`() {
+        val store = RouteStore(tempDir())
+        store.setOwner("volume", FastPathOwner.ROUTE)
+        val json = store.exportJson()
+        assertTrue(json.contains("\"volume\""))
+        assertTrue(json.contains("ROUTE"))
+
+        val target = RouteStore(tempDir())
+        target.importJson(json)
+        assertEquals(FastPathOwner.ROUTE, target.ownerFor("volume"))
+    }
 }

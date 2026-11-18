@@ -1051,6 +1051,62 @@ private fun AgentSettingsPage(vm: AgentViewModel, draft: SettingsDraft) {
 
         item {
             SettingsSectionCard(
+                title = "快路径接管范围",
+                description = "每个能力单独决定执行权：遗留（不接管）/ 影子（只对照，不执行）/ 接管。" +
+                    "默认全部「遗留」；影子对照无分歧后再点成「接管」。",
+            ) {
+                val ctx = LocalContext.current
+                var owners by remember {
+                    mutableStateOf(com.pilot.agent.assistant.routing.RouteStore.get(ctx).owners.value)
+                }
+                com.pilot.agent.assistant.routing.CapabilityRegistry.all.forEach { capability ->
+                    val owner = owners[capability.id]
+                        ?: com.pilot.agent.assistant.routing.FastPathOwner.LEGACY
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(9.dp))
+                            .clickable {
+                                val next = when (owner) {
+                                    com.pilot.agent.assistant.routing.FastPathOwner.LEGACY ->
+                                        com.pilot.agent.assistant.routing.FastPathOwner.SHADOW
+                                    com.pilot.agent.assistant.routing.FastPathOwner.SHADOW ->
+                                        com.pilot.agent.assistant.routing.FastPathOwner.ROUTE
+                                    com.pilot.agent.assistant.routing.FastPathOwner.ROUTE ->
+                                        com.pilot.agent.assistant.routing.FastPathOwner.LEGACY
+                                }
+                                runCatching {
+                                    com.pilot.agent.assistant.routing.RouteStore.get(ctx)
+                                        .setOwner(capability.id, next)
+                                }
+                                owners = com.pilot.agent.assistant.routing.RouteStore.get(ctx).owners.value
+                            }
+                            .padding(vertical = 7.dp, horizontal = 4.dp),
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                capability.label,
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurface,
+                            )
+                            Text(capability.id, fontSize = 9.sp, color = SettingsMuted)
+                        }
+                        val (ownerText, ownerColor) = when (owner) {
+                            com.pilot.agent.assistant.routing.FastPathOwner.LEGACY -> "遗留" to SettingsMuted
+                            com.pilot.agent.assistant.routing.FastPathOwner.SHADOW ->
+                                "影子" to Color(0xFFE0B34C)
+                            com.pilot.agent.assistant.routing.FastPathOwner.ROUTE ->
+                                "接管" to Color(0xFF59D6A8)
+                        }
+                        Text(ownerText, fontSize = 11.sp, color = ownerColor)
+                    }
+                }
+            }
+        }
+
+        item {
+            SettingsSectionCard(
                 title = "浏览器会话",
                 description = "Agent 使用可见 WebView，保留登录 Cookie；只允许 HTTP/HTTPS，本地文件访问已关闭。",
             ) {
