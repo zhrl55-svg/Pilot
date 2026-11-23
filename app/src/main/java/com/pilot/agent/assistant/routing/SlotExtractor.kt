@@ -73,6 +73,15 @@ class SlotExtractor(
                     ),
                 )?.let { args.put("keywords", it) }
             }
+            "memory_forget" -> extractAfterTrigger(
+                raw,
+                listOf("忘掉", "忘记", "删掉", "删除", "别记着", "不用记", "forget"),
+            )?.trim()
+                ?.removePrefix("关于")
+                ?.removePrefix("的")
+                ?.trim()
+                ?.takeIf { it.length >= 2 }
+                ?.let { args.put("content", it) }
             "screenshot" -> Unit
             else -> Unit
         }

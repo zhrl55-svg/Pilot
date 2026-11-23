@@ -48,6 +48,7 @@ class CapabilityExecutor(
             "scheduled_task" -> scheduledTask(decision.action, args, userText)
             "memory_write" -> memoryWrite(args)
             "memory_get" -> memoryGet(decision.action, userText)
+            "memory_forget" -> memoryForget(args)
             "file_read" -> fileRead(args)
             "file_write" -> fileWrite(args, userText)
             "screenshot" -> screenshot()
@@ -586,6 +587,32 @@ class CapabilityExecutor(
             }
         }
         else -> null
+    }
+
+    /**
+     * 删记忆：用户明确说「忘掉…」才会走到这里，属于破坏性操作（DELETE 组）。
+     * 结果必须报出删了几条、删了什么 —— 模糊匹配可能一次带走多条。
+     */
+    private fun memoryForget(args: JSONObject): ToolInvocation? {
+        val keyword = args.optString("content").trim()
+        if (keyword.isBlank()) return null
+        return ToolInvocation(
+            name = "memory_forget",
+            group = ToolGroup.DELETE,
+            summary = "删除长期记忆",
+            confirmation = "要忘掉与「$keyword」相关的长期记忆吗？",
+            explicitAuthorized = true,
+        ) { _, _ ->
+            val removed = tools.memory.forget(keyword)
+            if (removed.isEmpty()) {
+                ToolResult.success("没有找到与「$keyword」相关的长期记忆。")
+            } else {
+                ToolResult.success(
+                    "已忘掉 ${removed.size} 条：${removed.joinToString("；") { it.content }.take(200)}",
+                    "忘掉了 ${removed.size} 条相关记忆。",
+                )
+            }
+        }
     }
 
     // ── files ────────────────────────────────────────────────────────

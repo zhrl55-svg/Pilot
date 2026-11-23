@@ -146,6 +146,16 @@ object CapabilityRegistry {
             ),
         ),
         LocalCapability(
+            "memory_forget", "删除记忆",
+            mapOf(
+                // 破坏性：模糊匹配可能一次带走多条，路由层按 HIGH 风险先确认。
+                "forget" to action(
+                    "forget", false, CapabilityRisk.HIGH,
+                    slot("content", SlotType.VERBATIM_TEXT),
+                ),
+            ),
+        ),
+        LocalCapability(
             "file_read", "读文件",
             mapOf(
                 "read" to action("read", true, slots = arrayOf(slot("path", SlotType.PATH))),

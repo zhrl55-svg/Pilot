@@ -45,6 +45,8 @@ object DefaultOwners {
         "device",
         "memory_get",
         "memory_write",
+        // 对齐遗留链路 memory_forget：行为一致，快路径另外补了 HIGH 风险确认。
+        "memory_forget",
         "screenshot",
         "file_read",
         "file_write",

@@ -140,7 +140,10 @@ class RouteStoreTest {
                 reloaded.ownerFor(capability.id),
             )
         }
-        assertTrue("迁移后应写回版本号", file.readText().contains("\"ownersVersion\": 1"))
+        assertTrue(
+            "迁移后应写回版本号",
+            file.readText().contains("\"ownersVersion\": ${RouteStore.OWNERS_VERSION}"),
+        )
     }
 
     @Test

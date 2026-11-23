@@ -21,7 +21,8 @@ object DefaultRoutes {
     // 3：内置路由匹配字段随版本刷新（见 migrate）；2 → 3 时同步了提醒口语词表
     // 4：life.reminder 增加起床类关键词/模式（「明早7点叫我起床」）。
     //    必须 bump，否则已装机的 routes.json 仍是旧词表，新词条不生效（真机踩到）。
-    const val SEED_VERSION = 4
+    // 5：新增 tool.memory-forget —— 「忘掉我的车牌」原来无路由，只能落到 Agent 乱猜。
+    const val SEED_VERSION = 5
 
     private fun r(
         id: String,
@@ -320,6 +321,18 @@ object DefaultRoutes {
                 "列出你记住", "你记住了什么", "查看长期记忆", "列出长期记忆",
                 "记忆列表", "你记得什么",
             ),
+        ),
+        // 「忘掉/删除某条记忆」原来没有任何内置路由，只能落到 Agent 去猜，
+        // 后台还会被「无人确认」拒掉。补成快路径能力。
+        r(
+            "tool.memory-forget", "删除记忆", "memory", "memory_forget", "forget",
+            priority = 132,
+            keywords = listOf("删除记忆", "删掉记忆", "忘掉记忆", "清除记忆", "forget memory"),
+            patterns = listOf(
+                """^(?:请|帮我|麻烦)?\s*(?:忘掉|忘记|删掉|删除|别记着|不用记)\s*(?:关于|和)?\s*.{2,}$""",
+            ),
+            exclude = listOf("删除文件", "删除提醒", "删除定时"),
+            examples = listOf("忘掉我的车牌", "删除关于我的车的记忆", "别记着我爱吃辣"),
         ),
 
         // ── files ─────────────────────────────────────────────────────

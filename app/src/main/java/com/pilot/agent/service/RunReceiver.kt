@@ -390,15 +390,26 @@ internal fun dispatchBackgroundGoal(
     // 助理快路径：规则选能力 → 确定性抽参 → 本机执行，不调云端。
     // 接管了就不走下面的遗留匹配器，避免同一个请求被执行两遍。
     // 需要端侧模型补值的请求在无界面场景不处理（保持确定性），照旧走原链路。
+    Dbg.i(TAG, "dispatch plan begin goal=$goal caller=$callerLabel")
     val fastPlan = AssistantFastPath.plan(context, goal, callerLabel)
+    Dbg.i(
+        TAG,
+        "dispatch plan result=${fastPlan?.let { "${it.capability}/${it.action}" } ?: "null"}",
+    )
     val fastInvocation = fastPlan?.invocation
     if (fastPlan != null && fastInvocation != null) {
-        // 破坏性能力（HIGH / 路由强制确认）在后台没有可点确认的人，一律不执行。
-        // 否则用户把对应工具组设成 ALLOW 后，后台广播就能静默覆盖文件/删除。
+        // 破坏性能力（HIGH / 路由强制确认）在后台默认不执行，
+        // 但用户原话已明确说出操作对象、执行器又标了 explicitAuthorized 的能力
+        // （记住/忘掉/建提醒/建定时）例外 —— 再让用户「去界面说一次」等于
+        // 把同一条明确指令说两遍，实测会被当成没听懂。文件覆盖/删除没有这个标记，
+        // 仍然保持后台拒绝。
         if (fastPlan.needsConfirmation) {
-            Dbg.w(TAG, "后台无人确认，拒绝破坏性快路径：${fastPlan.capability}/${fastPlan.action}")
-            AgentRuntime.speaker.speak("这个操作需要你先确认，请在界面里说一次。")
-            return
+            if (!fastInvocation.explicitAuthorized) {
+                Dbg.w(TAG, "后台无人确认，拒绝破坏性快路径：${fastPlan.capability}/${fastPlan.action}")
+                AgentRuntime.speaker.speak("这个操作需要你先确认，请在界面里说一次。")
+                return
+            }
+            Dbg.i(TAG, "后台执行已明确授权的破坏性操作：${fastPlan.capability}/${fastPlan.action}")
         }
         val capability = fastPlan.capability
         val action = fastPlan.action

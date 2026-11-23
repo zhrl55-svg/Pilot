@@ -22,6 +22,7 @@ object FastPathTrace {
     private const val FILE = "assistant_fastpath.log"
     private const val MAX_BYTES = 512L * 1024L
 
+    @Synchronized
     fun line(context: Context, message: String) {
         runCatching {
             val file = File(context.applicationContext.filesDir, FILE)

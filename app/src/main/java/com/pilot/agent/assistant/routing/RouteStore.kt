@@ -305,7 +305,7 @@ class RouteStore internal constructor(
     companion object {
         const val SCHEMA_VERSION = 2
         /** owners 迁移版本：旧版 routes.json 没有该字段，读出 0 时触发一次升级。 */
-        const val OWNERS_VERSION = 1
+        const val OWNERS_VERSION = 2
         const val MAX_ROUTES = 200
         const val MAX_KEYWORDS = 20
         const val MAX_PATTERNS = 20
