@@ -54,6 +54,8 @@ android {
     buildTypes {
         debug {
             isMinifyEnabled = false
+            // 本地 JVM 单测覆盖率（createDebugUnitTestCoverageReport 依赖此开关）。
+            enableUnitTestCoverage = true
             // 不加 applicationIdSuffix：debug/release 同包名 com.pilot.agent。
             //
             // 理由：高德 Android 平台 Key 注册的是**包名**，一个包名一个 Key。
@@ -153,6 +155,7 @@ dependencies {
     // android.jar 里的 org.json 只有桩；换成真实实现，路由层才能在 JVM 上跑。
     // 版本跟随本机 Gradle 缓存（20231013），避免离线构建时去下载。
     testImplementation("org.json:json:20231013")
+
 }
 
 /**
