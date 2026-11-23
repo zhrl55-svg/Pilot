@@ -82,9 +82,14 @@ object BackgroundLauncher {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 // 精确闹钟要 SCHEDULE_EXACT_ALARM/USE_EXACT_ALARM 权限，
                 // 拿不到就退到 inexact（延迟可能到几秒，可接受）。
-                val canExact = runCatching {
-                    am.canScheduleExactAlarms()
-                }.getOrDefault(false)
+                // canScheduleExactAlarms 是 API 31 才有的方法，低版本直接按「不能精确」处理。
+                val canExact = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    runCatching {
+                        am.canScheduleExactAlarms()
+                    }.getOrDefault(false)
+                } else {
+                    false
+                }
                 if (canExact) {
                     am.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi)
                 } else {

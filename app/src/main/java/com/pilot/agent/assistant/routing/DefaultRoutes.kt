@@ -19,7 +19,9 @@ object DefaultRoutes {
      * 和遗留链路的 memory_list 对齐（v1 走搜索，结果不一样）。
      */
     // 3：内置路由匹配字段随版本刷新（见 migrate）；2 → 3 时同步了提醒口语词表
-    const val SEED_VERSION = 3
+    // 4：life.reminder 增加起床类关键词/模式（「明早7点叫我起床」）。
+    //    必须 bump，否则已装机的 routes.json 仍是旧词表，新词条不生效（真机踩到）。
+    const val SEED_VERSION = 4
 
     private fun r(
         id: String,
@@ -235,9 +237,18 @@ object DefaultRoutes {
         r(
             "life.reminder", "创建提醒", "life", "reminder", "schedule",
             priority = 230,
-            keywords = listOf("提醒我", "提醒一下", "到点提醒", "记得提醒", "remind me", "reminder"),
+            keywords = listOf(
+                "提醒我", "提醒一下", "到点提醒", "记得提醒", "remind me", "reminder",
+                // 起床类口语（P1）：「明早7点叫我起床」原来没有任何路由，
+                // IntentGate 也判成 CHAT，最后落给云端模型乱点。
+                "叫我起床", "叫醒我", "喊我起床", "morning call", "wake me up", "wake me at",
+            ),
+            patterns = listOf(
+                """(?:明天|明早|今早|今晚|每天).{0,8}(?:点|:).{0,6}(?:叫我|叫醒|喊我)""",
+                """(?:wake\s+me(?:\s+up)?).{0,28}""",
+            ),
             exclude = listOf("闹钟", "alarm"),
-            examples = listOf("30分钟后提醒我开会", "remind me at 9 to call mom"),
+            examples = listOf("30分钟后提醒我开会", "明早7点叫我起床", "remind me at 9 to call mom"),
         ),
         r(
             "life.reminder-list", "提醒列表", "life", "reminder", "list",

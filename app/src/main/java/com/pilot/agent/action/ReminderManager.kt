@@ -32,7 +32,9 @@ object ReminderManager {
 
     fun handles(text: String): Boolean =
         text.contains("提醒我") || text.contains("记得提醒") ||
-            text.contains("我的提醒") || text.contains("取消提醒") || text.contains("删除提醒")
+            text.contains("我的提醒") || text.contains("取消提醒") || text.contains("删除提醒") ||
+            // 起床类口吻同样是本地提醒，别让它们落到模型去乱点屏幕
+            text.contains("叫我起床") || text.contains("叫醒我") || text.contains("喊我起床")
 
     /**
      * P1：快路径结构化入口。Router/SlotExtractor 已用 ChineseTimeParser 抽出绝对时间，
@@ -58,18 +60,11 @@ object ReminderManager {
     @Synchronized
     fun handle(context: Context, text: String): String {
         if (text.contains("我的提醒")) {
-            val all = load(context).sortedBy { it.at }
-            return if (all.isEmpty()) "现在没有待触发的提醒。" else buildString {
-                append("你的提醒：")
-                all.take(10).forEach { append("\n• ").append(it.title).append(" — ").append(formatTime(it.at)) }
-            }
+            return listText(context)
         }
         if (text.contains("取消提醒") || text.contains("删除提醒")) {
             val keyword = text.substringAfter("提醒").removePrefix("我").trim(' ', '：', ':', '，', ',', '。')
-            val target = load(context).firstOrNull { keyword.isBlank() || it.title.contains(keyword) }
-                ?: return "没有找到要取消的提醒。说“我的提醒”可以查看列表。"
-            cancel(context, target)
-            return "已取消提醒：${target.title}"
+            return cancel(context, keyword)
         }
         val parsed = parse(text) ?: return "我还不能确定提醒时间。请说“30 分钟后提醒我喝水”或“2 小时后提醒我开会”。"
         val (title, at) = parsed
@@ -84,6 +79,31 @@ object ReminderManager {
         save(context, load(context) + item)
         schedule(context, item)
         return "已设提醒：${item.title}，${formatTime(item.at)}。可以说“我的提醒”查看，或“取消提醒”。"
+    }
+
+    /** 列出待触发提醒。快路径 `reminder/list` 直接调用，不再靠关键词嗅探。 */
+    @Synchronized
+    fun listText(context: Context): String {
+        val all = load(context).sortedBy { it.at }
+        return if (all.isEmpty()) "现在没有待触发的提醒。" else buildString {
+            append("你的提醒：")
+            all.take(10).forEach { append("\n• ").append(it.title).append(" — ").append(formatTime(it.at)) }
+        }
+    }
+
+    /**
+     * 按 id 或标题关键词取消。
+     * 两者都为空时**不猜**（旧实现会直接取消最早一条），要求用户先查看列表。
+     */
+    @Synchronized
+    fun cancel(context: Context, idOrKeyword: String): String {
+        val clean = idOrKeyword.trim().trim(' ', '：', ':', '，', ',', '。')
+        if (clean.isBlank()) return "要取消哪条提醒？说“我的提醒”可以先看看列表。"
+        val target = load(context).firstOrNull { it.id == clean }
+            ?: load(context).firstOrNull { it.title.contains(clean, ignoreCase = true) }
+            ?: return "没有找到要取消的提醒。说“我的提醒”可以查看列表。"
+        cancel(context, target)
+        return "已取消提醒：${target.title}"
     }
 
     fun rescheduleAll(context: Context) {

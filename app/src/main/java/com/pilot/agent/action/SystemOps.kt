@@ -40,7 +40,11 @@ class SystemOps(private val ctx: Context) {
      *
      * @param deltaPercent 正数调大、负数调小
      */
-    fun adjustVolume(deltaPercent: Int, stream: Int = AudioManager.STREAM_MUSIC): String? {
+    fun adjustVolume(
+        deltaPercent: Int,
+        stream: Int = AudioManager.STREAM_MUSIC,
+        label: String = "音量",
+    ): String? {
         val am = audio ?: return null
         val max = am.getStreamMaxVolume(stream)
         val cur = am.getStreamVolume(stream)
@@ -48,13 +52,17 @@ class SystemOps(private val ctx: Context) {
         val target = (cur + Math.round(max * deltaPercent / 100f)).coerceIn(0, max)
         return runCatching {
             am.setStreamVolume(stream, target, 0)
-            Dbg.i(TAG, "音量 ${cur * 100 / max}% → ${target * 100 / max}%（请求 $deltaPercent%）")
-            levelMessage("音量", cur, target, max, target >= max, target <= 0)
+            Dbg.i(TAG, "$label ${cur * 100 / max}% → ${target * 100 / max}%（请求 $deltaPercent%）")
+            levelMessage(label, cur, target, max, target >= max, target <= 0)
         }.getOrNull()
     }
 
     /** 绝对设音量：用户说「音量 60%」「调到 60%」。 */
-    fun setVolume(percent: Int, stream: Int = AudioManager.STREAM_MUSIC): String? {
+    fun setVolume(
+        percent: Int,
+        stream: Int = AudioManager.STREAM_MUSIC,
+        label: String = "音量",
+    ): String? {
         val am = audio ?: return null
         val max = am.getStreamMaxVolume(stream)
         val cur = am.getStreamVolume(stream)
@@ -62,8 +70,8 @@ class SystemOps(private val ctx: Context) {
         val target = Math.round(max * percent.coerceIn(0, 100) / 100f).coerceIn(0, max)
         return runCatching {
             am.setStreamVolume(stream, target, 0)
-            Dbg.i(TAG, "音量 ${cur * 100 / max}% → ${target * 100 / max}%（绝对值 $percent%）")
-            levelMessage("音量", cur, target, max, target >= max, target <= 0)
+            Dbg.i(TAG, "$label ${cur * 100 / max}% → ${target * 100 / max}%（绝对值 $percent%）")
+            levelMessage(label, cur, target, max, target >= max, target <= 0)
         }.getOrNull()
     }
 

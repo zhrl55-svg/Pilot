@@ -6,6 +6,7 @@ import android.os.Handler
 import android.os.Looper
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
+import androidx.media3.common.util.UnstableApi
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
@@ -25,6 +26,7 @@ import java.util.concurrent.atomic.AtomicInteger
  * platform MediaPlayer on Huawei devices. The queue itself stays small because
  * Netease URLs are resolved only when a track is about to start.
  */
+@androidx.annotation.OptIn(markerClass = [UnstableApi::class])
 class MusicPlayer private constructor(private val context: Context) {
 
     enum class PlaybackMode { SEQUENCE, REPEAT_ALL, REPEAT_ONE }
@@ -126,6 +128,7 @@ class MusicPlayer private constructor(private val context: Context) {
         consecutiveErrors = 0
         return startCurrent()
     }
+
 
     private fun startCurrent(): Boolean {
         releasePlayer()

@@ -1364,8 +1364,23 @@ private fun PermissionSettingsPage(
         item {
             SettingsSectionCard(
                 title = "系统访问",
-                description = "应用使用统计用于理解前台应用；所有文件访问用于本地文件和沙箱目录。",
+                description = "应用使用统计用于理解前台应用；所有文件访问用于本地文件和沙箱目录；悬浮球用于后台显示运行状态。",
             ) {
+                PermissionActionRow(
+                    title = "状态悬浮球",
+                    state = if (Settings.canDrawOverlays(context)) "已授权" else "未授权",
+                    active = Settings.canDrawOverlays(context),
+                    action = if (Settings.canDrawOverlays(context)) "管理" else "开启",
+                ) {
+                    // P1：没有这个权限时悬浮球只会静默不显示，用户完全不知道去哪开。
+                    openSystemSettings(
+                        context,
+                        Intent(
+                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            android.net.Uri.parse("package:${context.packageName}"),
+                        ),
+                    )
+                }
                 PermissionActionRow(
                     title = "应用使用统计",
                     state = "系统权限",

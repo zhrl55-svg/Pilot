@@ -833,6 +833,39 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * P1：VoiceInput 是进程级单例，回调默认指向本 ViewModel。
+     *
+     * Activity 销毁后 viewModelScope 已经取消。若单例还保留旧的 onText，
+     * 前台服务仍能唤醒、麦克风也还在录，但指令会落进已取消的协程里静默丢失。
+     * 这里把回调切换成运行时级后台执行（复用广播入口的那条链），
+     * 保证「界面关了，语音照样能干活」。
+     */
+    override fun onCleared() {
+        val v = voice ?: AgentRuntime.voiceInput
+        v?.let { input ->
+            input.onText = { text ->
+                Dbg.i(TAG, "后台语音指令：$text")
+                com.pilot.agent.service.runBackgroundGoal(
+                    getApplication(),
+                    text,
+                    "voice-background",
+                )
+            }
+            // 其余回调都指向已销毁的 ViewModel，全部换成空实现/日志，
+            // 防止 Compose 状态在销毁后被无意义地写入。
+            input.onState = { }
+            input.onError = { msg -> Dbg.w(TAG, "后台语音错误：$msg") }
+            input.onWake = { word -> Dbg.i(TAG, "后台唤醒「$word」") }
+            input.onVoiceprint = { _, _ -> }
+            input.onEnrollSegment = { _, _ -> }
+            input.onEnrolled = { }
+            input.onEnrollDone = { }
+        }
+        voice = null
+        super.onCleared()
+    }
+
+    /**
      * 扫码登录网易云。
      *
      * 不登录只能播 30 秒试听，VIP 歌直接 `url: null`——实测「晴天」就是这样。
@@ -1296,10 +1329,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                     return@launch
                 }
                 val result = withContext(Dispatchers.IO) {
-                    AgentRuntime.localTools.execute(invocation) { question, risk ->
-                        if (allowConfirmation) askToolConfirmation(question, risk)
-                        else false
-                    }
+                    executeFastPath(completed, allowConfirmation)
                 }
                 finishFastPath(completed, result)
             }
@@ -1314,14 +1344,36 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         publishNotificationStatus()
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) {
-                AgentRuntime.localTools.execute(invocation) { question, risk ->
-                    if (allowConfirmation) askToolConfirmation(question, risk)
-                    else false
-                }
+                executeFastPath(plan, allowConfirmation)
             }
             finishFastPath(plan, result)
         }
         return true
+    }
+
+    /**
+     * P1：执行快路径调用。
+     *
+     * 破坏性能力（`plan.needsConfirmation` = HIGH 风险或路由强制确认）即使所在
+     * 工具组被用户设成 ALLOW，也必须在界面上再问一次——否则改一个开关就能让
+     * 覆盖文件 / 删除这类操作静默执行。组策略是 ASK 时仍由
+     * [com.pilot.agent.tool.LocalToolRuntime] 统一询问，不会重复弹两次。
+     */
+    private suspend fun executeFastPath(
+        plan: FastPathPlan,
+        allowConfirmation: Boolean,
+    ): com.pilot.agent.tool.ToolResult {
+        val invocation = plan.invocation
+            ?: return com.pilot.agent.tool.ToolResult.error("没有可执行的调用。")
+        val policyAllows = AgentRuntime.localTools.policyFor(invocation.group) == ToolPolicy.ALLOW
+        if (plan.needsConfirmation && policyAllows) {
+            val ok = allowConfirmation &&
+                askToolConfirmation(invocation.confirmation, invocation.risk())
+            if (!ok) return com.pilot.agent.tool.ToolResult.denied("已取消 ${invocation.summary}。")
+        }
+        return AgentRuntime.localTools.execute(invocation) { question, risk ->
+            if (allowConfirmation) askToolConfirmation(question, risk) else false
+        }
     }
 
     /** 快路径执行的收尾：恢复状态、回执、播报、刷新。 */
@@ -1380,7 +1432,49 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
      */
     private fun dispatchRequest(g: String) {
         if (tryRunFastPath(g, allowConfirmation = true)) return
+        if (tryRunLocalTool(g)) return
         dispatchToAgent(g)
+    }
+
+    /**
+     * 快路径没有规则、但本地工具匹配器认得的指令（文件复制/移动/删除/分享/打开/列目录、
+     * SSH、网络/定位/蓝牙/使用时长查询、记忆删除等）在这里兜底执行。
+     *
+     * 这些能力早就注册在 [com.pilot.agent.tool.LocalToolRuntime]，但自动路由只走
+     * 快路径或 Agent，导致它们永远执行不到。匹配器自带讨论/疑问句防护，
+     * 写/删类操作仍会经过工具策略确认。
+     */
+    private fun tryRunLocalTool(text: String): Boolean {
+        val invocation = AgentRuntime.localTools.match(text) ?: return false
+        add(LogEntry.Kind.THINK, "调用本机工具…")
+        running = true
+        justSent = true
+        activeTaskLabel = invocation.summary
+        publishNotificationStatus()
+        viewModelScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    AgentRuntime.localTools.execute(invocation) { question, risk ->
+                        askToolConfirmation(question, risk)
+                    }
+                }
+            }.getOrElse { error ->
+                Dbg.e(TAG, "本地工具执行失败：${invocation.name}", error)
+                com.pilot.agent.tool.ToolResult.error(
+                    "工具执行失败：${error.message?.take(120) ?: error.javaClass.simpleName}",
+                )
+            }
+            running = false
+            justSent = false
+            activeTaskLabel = ""
+            publishNotificationStatus()
+            val kind = if (result.status == ToolStatus.SUCCESS) LogEntry.Kind.DONE
+            else LogEntry.Kind.ERROR
+            add(kind, result.message.ifBlank { result.spoken })
+            AgentRuntime.speaker.speak(result.spoken)
+            refreshStatus()
+        }
+        return true
     }
 
     private fun dispatchToAgent(g: String) {
@@ -1775,6 +1869,14 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             }
             is AgentEvent.Finished -> {
                 val text = polish(ev.summary)
+                // P1：任务完成也要写进多轮上下文。旧实现只 add(DONE)，
+                // chatHistory 一直是空的，「刚才那个再说一遍」「我叫什么」全接不上。
+                // 必须在 add(DONE) 之前写：add() 会触发 syncCurrentSession 落盘。
+                val goal = activeTaskLabel.trim()
+                if (goal.isNotBlank() && goal != "本机能力") {
+                    chatHistory.addLast(goal to text)
+                    while (chatHistory.size > 40) chatHistory.removeFirst()
+                }
                 add(LogEntry.Kind.DONE, text)
                 running = false
                 justSent = false

@@ -54,7 +54,7 @@ class WeatherTool : QueryTool {
             }
         } else {
             currentAdcode()
-                ?: return@withContext "定位还没准备好，没法确定你在哪个城市。可以说“张掖天气”这样的具体城市。"
+                ?: return@withContext "没拿到你的位置，没法确定查哪个城市。可以说“北京天气”这样的具体城市。"
         }
 
         val base = fetch(key, adcode, "base")
@@ -119,7 +119,7 @@ class WeatherTool : QueryTool {
             .maxByOrNull { it.length }
     }
 
-    /** 没定位权限/没定位时，用缓存的 adcode（从逆地理编码拿）。 */
+    /** 没定位权限/没定位时返回 null，由调用方明确告知用户，而不是静默报别的城市。 */
     private fun currentAdcode(): String? {
         val ctx = PilotApp.instance
         val granted = ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.ACCESS_FINE_LOCATION) ==
@@ -127,18 +127,18 @@ class WeatherTool : QueryTool {
             ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.ACCESS_COARSE_LOCATION) ==
             PackageManager.PERMISSION_GRANTED
         if (!granted) {
-            Dbg.w(TAG, "没有定位权限，退回默认城市")
-            return DEFAULT_ADCODE
+            Dbg.w(TAG, "没有定位权限，无法确定城市")
+            return null
         }
-        val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return DEFAULT_ADCODE
+        val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return null
         val loc: Location? = listOf(LocationManager.NETWORK_PROVIDER, LocationManager.GPS_PROVIDER)
             .mapNotNull { runCatching { lm.getLastKnownLocation(it) }.getOrNull() }
             .filter { it.latitude != 0.0 && it.longitude != 0.0 }
             .maxByOrNull { it.time }
         val adcode = loc?.let { GeoCoder.adcodeOf(it.latitude, it.longitude) }
         if (adcode != null) return adcode
-        Dbg.w(TAG, "定位反查 adcode 失败，退回默认城市")
-        return DEFAULT_ADCODE
+        Dbg.w(TAG, "定位反查 adcode 失败")
+        return null
     }
 
     /** geo 接口这个 key 无权限，用 POI 搜索兜底拿 adcode。 */
@@ -176,8 +176,7 @@ class WeatherTool : QueryTool {
 
     private companion object {
         const val TAG = "PilotWeather"
-        // 默认城市：张掖（本机常驻地），定位不可用时兜底
-        const val DEFAULT_ADCODE = "620700"
+
 
         // 常用城市 adcode（高德 2026 版；完整表见 https://lbs.amap.com/api/webservice/download）
         val CITY_ADCODE = mapOf(

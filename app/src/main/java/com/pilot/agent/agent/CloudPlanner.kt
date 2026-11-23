@@ -167,6 +167,11 @@ class CloudPlanner(private val settingsProvider: () -> AgentSettings) : Planner 
 - swipe {x,y,x2,y2,ms}
 - scroll {id,target:"forward"|"backward"}
 - open {target}                     包名或应用名
+- systemop {target,text,id}          系统能力直调，一步完成，优于此后再点屏幕：
+    target 取值：volume/volume_set（text=百分比）、brightness/brightness_set（text=百分比）、
+    call（text=联系人/号码）、music（text=歌名）、navigate（text=目的地）、
+    navigate_stop、navigate_status、terminal（text=命令）、
+    settings_switch_on/settings_switch_off/settings_search（text=设置项关键词）
 - key {target:"back"|"home"|"recents"|"notifications"}
 - browser_open {url}                在可见浏览器会话打开网页，保留登录状态
 - browser_read {maxChars}           读取网页标题、网址和正文

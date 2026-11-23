@@ -19,6 +19,19 @@ class HeuristicPlanner(
 
     override val id: String = "heuristic"
 
+    /**
+     * P1：是否是单步、确定性的系统直调请求
+     * （音量 / 亮度 / 打电话 / 放歌 / 导航 / 终端 / 设置开关）。
+     *
+     * 这类能力一次系统 API 就能完成，交给云端模型反而会漏能力、去点屏幕。
+     * [PlannerRouter] 用它决定 AGENT 模式下是否先试规则层。
+     */
+    fun handlesDeterministically(goal: String): Boolean {
+        val g = goal.trim()
+        if (isMultiStep(g)) return false
+        return ruleSystemOp(g) != null
+    }
+
     override suspend fun decide(req: AgentRequest): AgentDecision {
         val goal = req.goal.trim()
         val snap = req.snapshot

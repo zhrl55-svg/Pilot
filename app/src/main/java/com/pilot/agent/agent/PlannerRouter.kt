@@ -23,11 +23,18 @@ class PlannerRouter(
     fun chain(goal: String, stepIndex: Int): List<Planner> {
         val s = settingsProvider()
         val simple = isSingleStep(goal)
+        // P1：云配置正常时，云端曾恒定抢在规则层前面，导致音量/亮度/音乐/
+        // 导航/终端/设置开关这些「一次系统 API 就能完成」的请求被云端模型
+        // 漏掉或改成点屏幕。首步若是确定性的系统直调，就先给规则层。
+        // 规则层只会返回 unable 表示不会，链会自动落到云端，不会吞掉复杂任务。
+        val deterministic = stepIndex == 0 && onDevice.handlesDeterministically(goal)
         return buildList {
             if (s.mode == AssistantMode.AGENT) {
-                // Agent 模式由模型主导决策；规则只在云端不可用或解析失败时兜底。
+                // Agent 模式由模型主导决策；规则只在云端不可用、解析失败，
+                // 或命中确定性系统直调时优先兜底。
+                if (deterministic) add(onDevice)
                 if (s.cloudReady) add(cloud)
-                add(onDevice)
+                if (!deterministic) add(onDevice)
                 if (s.enableLocalModel) add(local)
                 return@buildList
             }

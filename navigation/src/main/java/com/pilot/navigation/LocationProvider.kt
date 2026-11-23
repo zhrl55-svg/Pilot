@@ -1,5 +1,6 @@
 package com.pilot.navigation
 
+import android.annotation.SuppressLint
 import android.content.Context
 import com.amap.api.location.AMapLocation
 import com.amap.api.location.AMapLocationClient
@@ -132,6 +133,9 @@ class LocationProvider(private val context: Context) {
 
     // ------------------------------------------------------------ 通道 2：系统兜底
 
+    // 函数体整体在 runCatching 里，SecurityException（权限被拒）会被捕获；
+    // 定位权限在启动前已由调用方检查，这里显式标注避免 lint 误报。
+    @SuppressLint("MissingPermission")
     private fun startSystemLocation() {
         runCatching {
             val lm = context.getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager

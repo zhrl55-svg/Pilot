@@ -104,6 +104,39 @@ object ScheduledTaskManager {
 
     // ── UI 用：结构化读写 ────────────────────────────────────────────
 
+    /**
+     * P1：快路径结构化入口。
+     *
+     * Router/SlotExtractor 已用 ChineseTimeParser 抽出绝对时间与任务内容，
+     * 这里直接建任务，不再把原话交给只认特定正则的 [create] 重解析
+     * （旧实现把 `at/after/prompt` 全丢掉，再失败也会被包成 success）。
+     *
+     * @return null = 参数不完整；否则为回话（成功以「已创建」开头，可直接据此判定）
+     */
+    fun createFromParsed(context: Context, goal: String, atMillis: Long, daily: Boolean): String? {
+        val text = cleanGoal(goal)
+        if (text.isBlank()) return null
+        if (atMillis <= System.currentTimeMillis()) return null
+        if (!isSafeBackgroundGoal(text)) {
+            return "这个任务需要确认或操作屏幕，暂时不能无人值守执行。定时任务目前支持设备状态和资讯查询。"
+        }
+        val task = Task(UUID.randomUUID().toString(), text, atMillis, daily)
+        save(context, load(context) + task)
+        schedule(context, task)
+        return "已创建${if (daily) "每日" else "一次性"}任务：${task.goal}，${formatTime(task.at)}" +
+            if (daily) "，之后每天同一时间执行。" else "执行。"
+    }
+
+    /** 按 id 精确取消。@return null = 任务不存在 */
+    fun cancelById(context: Context, id: String): String? {
+        val tasks = load(context)
+        val target = tasks.firstOrNull { it.id == id } ?: return null
+        cancelAlarm(context, target)
+        save(context, tasks.filterNot { it.id == id })
+        Dbg.i(TAG, "定时任务已取消：${target.goal}")
+        return "已取消定时任务：${target.goal}"
+    }
+
     /** 列出全部任务（按触发时间升序）。UI 定时任务面板用。 */
     fun allTasks(context: Context): List<Task> =
         load(context).sortedBy { it.at }
@@ -181,11 +214,12 @@ object ScheduledTaskManager {
 
     fun cancel(context: Context, keyword: String): String {
         val clean = keyword.trim()
+        // 空关键词不猜（旧实现会直接取消最早一条，太危险）。
+        if (clean.isBlank()) return "要取消哪条定时任务？说“查看定时任务”可以先看看列表。"
         val tasks = load(context)
-        val target = if (clean.isBlank()) tasks.firstOrNull() else tasks.firstOrNull {
+        val target = tasks.firstOrNull {
             it.goal.contains(clean, ignoreCase = true)
-        }
-        if (target == null) return "没有找到要取消的定时任务。"
+        } ?: return "没有找到要取消的定时任务。"
         cancelAlarm(context, target)
         save(context, tasks.filterNot { it.id == target.id })
         return "已取消定时任务：${target.goal}"

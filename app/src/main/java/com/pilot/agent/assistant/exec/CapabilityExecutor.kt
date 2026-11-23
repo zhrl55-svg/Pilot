@@ -2,6 +2,7 @@ package com.pilot.agent.assistant.exec
 
 import android.content.Context
 import android.content.Intent
+import android.media.AudioManager
 import com.pilot.agent.action.ActionCatalog
 import com.pilot.agent.action.AppLaunchIndex
 import com.pilot.agent.action.DeviceActions
@@ -48,7 +49,7 @@ class CapabilityExecutor(
             "memory_write" -> memoryWrite(args)
             "memory_get" -> memoryGet(decision.action, userText)
             "file_read" -> fileRead(args)
-            "file_write" -> fileWrite(args)
+            "file_write" -> fileWrite(args, userText)
             "screenshot" -> screenshot()
             else -> null
         }
@@ -112,6 +113,16 @@ class CapabilityExecutor(
     // ── volume ───────────────────────────────────────────────────────
     private fun volume(action: String, args: JSONObject): ToolInvocation? {
         val ops = SystemOps(context)
+        // SlotExtractor 已抽出「铃声 / 来电」→ stream=ring。这里必须消费它，
+        // 否则「把铃声调到 50%」实际改的是媒体音量。
+        val stream = when (args.optString("stream")) {
+            "ring" -> AudioManager.STREAM_RING
+            "alarm" -> AudioManager.STREAM_ALARM
+            "notification" -> AudioManager.STREAM_NOTIFICATION
+            "system" -> AudioManager.STREAM_SYSTEM
+            else -> AudioManager.STREAM_MUSIC
+        }
+        val label = if (stream == AudioManager.STREAM_MUSIC) "音量" else "铃声"
         return when (action) {
             "set" -> {
                 val percent = args.optInt("percent", -1)
@@ -119,11 +130,11 @@ class CapabilityExecutor(
                 ToolInvocation(
                     name = "set_volume",
                     group = ToolGroup.READ,
-                    summary = "音量设为 $percent%",
-                    confirmation = "允许把音量设为 $percent% 吗？",
+                    summary = "${label}设为 $percent%",
+                    confirmation = "允许把${label}设为 $percent% 吗？",
                 ) { _, _ ->
-                    val message = ops.setVolume(percent)
-                    if (message == null) ToolResult.error("音量没有调成功。")
+                    val message = ops.setVolume(percent, stream, label)
+                    if (message == null) ToolResult.error("${label}没有调成功。")
                     else ToolResult.success(message)
                 }
             }
@@ -133,23 +144,23 @@ class CapabilityExecutor(
                 ToolInvocation(
                     name = "adjust_volume",
                     group = ToolGroup.READ,
-                    summary = if (delta > 0) "音量调大 $delta%" else "音量调小 ${-delta}%",
-                    confirmation = "允许调整音量吗？",
+                    summary = if (delta > 0) "${label}调大 $delta%" else "${label}调小 ${-delta}%",
+                    confirmation = "允许调整${label}吗？",
                 ) { _, _ ->
-                    val message = ops.adjustVolume(delta)
-                    if (message == null) ToolResult.error("音量没有调成功。")
+                    val message = ops.adjustVolume(delta, stream, label)
+                    if (message == null) ToolResult.error("${label}没有调成功。")
                     else ToolResult.success(message)
                 }
             }
             "status" -> ToolInvocation(
                 name = "volume_status",
                 group = ToolGroup.READ,
-                summary = "查看音量",
-                confirmation = "允许查看当前音量吗？",
+                summary = "查看${label}",
+                confirmation = "允许查看当前${label}吗？",
             ) { _, _ ->
-                val current = ops.currentVolumePercent()
-                if (current == null) ToolResult.unavailable("读不到当前音量。")
-                else ToolResult.success("当前音量 $current%")
+                val current = ops.currentVolumePercent(stream)
+                if (current == null) ToolResult.unavailable("读不到当前${label}。")
+                else ToolResult.success("当前${label} $current%")
             }
             else -> null
         }
@@ -289,7 +300,7 @@ class CapabilityExecutor(
         return ToolInvocation(
             name = "music_play",
             group = ToolGroup.READ,
-            summary = "播放 $label",
+            summary = "播放 ${label}",
             confirmation = "允许播放音乐吗？",
         ) { ctx, _ ->
             val settings = com.pilot.agent.agent.AgentSettings.load()
@@ -341,7 +352,7 @@ class CapabilityExecutor(
             }
             if (songs.isEmpty()) {
                 return@ToolInvocation ToolResult.unavailable(
-                    "没搜到「$label」。检查音乐服务是否在线、或先在 App 里登录网易云。",
+                    "没搜到「${label}」。检查音乐服务是否在线、或先在 App 里登录网易云。",
                 )
             }
             com.pilot.agent.music.MusicHistoryStore.remember(songs)
@@ -429,18 +440,19 @@ class CapabilityExecutor(
             group = ToolGroup.READ,
             summary = "查看提醒",
             confirmation = "允许查看提醒吗？",
-        ) { ctx, _ ->
-            val message = ReminderManager.handle(ctx, userText)
-            ToolResult.success(message)
-        }
+        ) { ctx, _ -> ToolResult.success(ReminderManager.listText(ctx)) }
         "cancel" -> ToolInvocation(
             name = "cancel_reminder",
             group = ToolGroup.DELETE,
             summary = "取消提醒",
             confirmation = "确认取消这个提醒吗？",
         ) { ctx, _ ->
-            val message = ReminderManager.handle(ctx, userText)
-            ToolResult.success(message)
+            // 有结构化 id 就按 id 精确取消；否则用原话里的关键词匹配标题。
+            // 两者都空时 ReminderManager 会让用户先查看列表，绝不盲取消。
+            val key = args.optString("id").ifBlank { userText }
+            val message = ReminderManager.cancel(ctx, key)
+            if (message.startsWith("已取消")) ToolResult.success(message)
+            else ToolResult.unavailable(message)
         }
         else -> null
     }
@@ -455,9 +467,39 @@ class CapabilityExecutor(
                 confirmation = "要创建这个定时任务吗？",
                 explicitAuthorized = true,
             ) { ctx, _ ->
-                val message = ScheduledTaskManager.create(ctx, userText)
-                    ?: "没听懂时间或要执行的内容。示例：每天 8 点查看财经新闻。"
-                ToolResult.success(message)
+                // Router 已抽出 at(ISO)/after(秒)/prompt —— 消费它们，
+                // 不能再把原话丢给 ScheduledTaskManager.create 另起一套正则重解析。
+                val atIso = args.optString("at")
+                val afterSec = args.optLong("after", 0L)
+                val at = when {
+                    atIso.isNotBlank() -> runCatching {
+                        java.time.LocalDateTime.parse(atIso)
+                            .atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+                    }.getOrNull()
+                    afterSec > 0L -> System.currentTimeMillis() + afterSec * 1000L
+                    else -> null
+                }
+                val prompt = args.optString("prompt").ifBlank {
+                    args.optString("label").ifBlank {
+                        userText.replace(Regex("""每天|定时|提醒我"""), "").trim()
+                    }
+                }.trim()
+                val repeat = args.optString("repeat")
+                val daily = repeat == "DAILY"
+                if (repeat == "WEEKDAYS" || repeat == "WEEKLY") {
+                    return@ToolInvocation ToolResult.unavailable("定时任务目前只支持一次性或每天重复，工作日/每周还没开放。")
+                }
+                if (at == null || prompt.isBlank()) {
+                    return@ToolInvocation ToolResult.unavailable(
+                        "没听懂时间或要执行的内容。示例：每天 8 点查看财经新闻。",
+                    )
+                }
+                val message = ScheduledTaskManager.createFromParsed(ctx, prompt, at, daily)
+                    ?: return@ToolInvocation ToolResult.unavailable(
+                        "定时任务参数不完整，请说清楚时间和要做的事，例如“每天 8 点查看财经新闻”。",
+                    )
+                if (message.startsWith("已创建")) ToolResult.success(message)
+                else ToolResult.error(message)
             }
             "list" -> ToolInvocation(
                 name = "list_scheduled_tasks",
@@ -471,7 +513,14 @@ class CapabilityExecutor(
                 summary = "取消定时任务",
                 confirmation = "确认取消这个定时任务吗？",
             ) { ctx, _ ->
-                ToolResult.success(ScheduledTaskManager.cancel(ctx, args.optString("id")))
+                val id = args.optString("id").trim()
+                val message = if (id.isNotBlank()) {
+                    ScheduledTaskManager.cancelById(ctx, id) ?: "没有找到要取消的定时任务。"
+                } else {
+                    ScheduledTaskManager.cancel(ctx, args.optString("label").ifBlank { userText })
+                }
+                if (message.startsWith("已取消")) ToolResult.success(message)
+                else ToolResult.unavailable(message)
             }
             else -> null
         }
@@ -551,16 +600,23 @@ class CapabilityExecutor(
         ) { _, _ -> tools.files.readFile(path) }
     }
 
-    private fun fileWrite(args: JSONObject): ToolInvocation? {
+    private fun fileWrite(args: JSONObject, userText: String): ToolInvocation? {
         val path = args.optString("path").trim()
         val content = args.optString("content")
         if (path.isBlank() || content.isBlank()) return null
+        // P1：只有用户明确说「覆盖」才允许覆盖同名文件。
+        // 旧实现固定 overwrite=true，等于任何一次写入都可能悄悄替换掉已有文件。
+        val overwrite = userText.contains("覆盖") || userText.contains("overwrite", ignoreCase = true)
         return ToolInvocation(
             name = "write_file",
             group = ToolGroup.WRITE,
             summary = "写入 $path",
-            confirmation = "确认把内容写入「$path」吗？同名文件会被覆盖。",
-        ) { _, _ -> tools.files.writeFile(path, content, overwrite = true) }
+            confirmation = if (overwrite) {
+                "确认覆盖「$path」吗？"
+            } else {
+                "确认把内容写入「$path」吗？同名文件存在时会停止。"
+            },
+        ) { _, _ -> tools.files.writeFile(path, content, overwrite) }
     }
 
     private fun screenshot(): ToolInvocation? = ToolInvocation(

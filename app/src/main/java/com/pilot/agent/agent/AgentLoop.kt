@@ -89,7 +89,7 @@ class AgentLoop(
         // 新任务顶掉旧任务：旧任务可能正卡在等用户确认，不顶掉的话后面所有请求都会被 isRunning 挡回去
         if (isRunning) {
             Dbg.i(TAG, "supersede running task")
-            cancel()
+            cancel(notify = false)
         }
         hasUi = ui
         val myToken = runSeq.incrementAndGet()
@@ -108,11 +108,21 @@ class AgentLoop(
         newJob.start()
     }
 
-    fun cancel() {
+    /**
+     * 中止当前任务。
+     *
+     * @param notify 是否向界面发一条失败事件。外部中止（停止按钮、无障碍断开、
+     *   AgentRuntime.detach）必须发：取消协程不会走 run() 的异常分支，
+     *   不补这一条 UI 的 running 会永远卡在 true。被新任务顶掉时传 false，
+     *   避免旧任务残留一条「已取消」错误。
+     */
+    fun cancel(notify: Boolean = true) {
+        val wasRunning = job?.isActive == true
         job?.cancel()
         job = null
         pendingConfirms.values.forEach { it.complete(false) }
         pendingConfirms.clear()
+        if (notify && wasRunning) sink.tryEmit(AgentEvent.Failed("任务已取消"))
     }
 
     fun confirm(requestId: Long, approved: Boolean) {
@@ -337,7 +347,18 @@ class AgentLoop(
                 }
 
                 "ask" -> {
-                    val ok = askUser(action.summary ?: "需要你确认后继续")
+                    val question = action.summary ?: "需要你确认后继续"
+                    // P1：同一句 ask 反复出现时直接中止。
+                    // 旧实现 continue 不写 history、也不带用户答复，规划器下一轮
+                    // 还会给出同一个 ask，一路弹确认直到 maxTurns。
+                    if (history.count { it.startsWith("询问：$question") } >= 2) {
+                        emit(AgentEvent.Failed("规划器连续两次重复同一个问题，已中止。换个说法再试一次。"))
+                        return
+                    }
+                    val ok = askUser(question)
+                    // 把问答写进 history：下游规划器能看到「问过什么、用户怎么答」，
+                    // 不会再把同一个问题问一遍。
+                    history += "询问：$question → ${if (ok) "用户已确认" else "用户取消"}"
                     if (!ok) {
                         emit(AgentEvent.Failed("用户取消"))
                         return

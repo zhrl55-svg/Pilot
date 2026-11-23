@@ -404,6 +404,8 @@ class SlotExtractor(
 
     private fun reminderTitle(text: String): String {
         var t = ChineseTimeParser.stripTimeExpressions(text)
+        // 起床类先说「叫我起床 / 叫醒我」，去掉后标题就是「起床」，比「叫我起床」更像提醒标题。
+        listOf("叫我起床", "叫醒我", "喊我起床").forEach { t = t.replace(it, "起床", ignoreCase = true) }
         listOf("记得提醒我", "提醒我", "提醒一下", "到点提醒", "记得提醒", "remind me to", "remind me", "reminder")
             .forEach { t = t.replace(it, " ", ignoreCase = true) }
         t = guardedStrip(t) { value ->

@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.os.Binder
+import android.os.Build
 import android.os.Process
 import com.pilot.agent.Dbg
 import kotlinx.coroutines.runBlocking
@@ -30,10 +31,21 @@ import com.pilot.agent.runtime.AgentRuntime
  */
 class RunReceiver : BroadcastReceiver() {
 
+    /**
+     * 发送方 UID。API 34+ 用 `sentFromUid`（可靠）；低版本 `getCallingUid()` 在
+     * onReceive 里已脱离发送方 Binder 事务，只能作为兜底，真正防线是 manifest 的
+     * signature 权限 `com.pilot.agent.permission.TRIGGER`。
+     */
+    private fun senderUid(): Int =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) sentFromUid
+        else Binder.getCallingUid()
+
     override fun onReceive(context: Context, intent: Intent) {
-        val caller = Binder.getCallingUid()
+        val caller = senderUid()
         val self = context.applicationInfo.uid
-        if (caller != Process.ROOT_UID && caller != Process.SHELL_UID && caller != self) {
+        if (caller != Process.ROOT_UID && caller != Process.SHELL_UID &&
+            caller != Process.SYSTEM_UID && caller != self
+        ) {
             Dbg.w(TAG, "拒绝来自 uid=$caller 的触发请求")
             return
         }
@@ -294,103 +306,16 @@ class RunReceiver : BroadcastReceiver() {
             Dbg.w(TAG, "触发请求缺少 goal / asr_test / llm_test")
             return
         }
-
-        // 助理快路径：规则选能力 → 确定性抽参 → 本机执行，不调云端。
-        // 接管了就不走下面的遗留匹配器，避免同一个请求被执行两遍。
-        // 需要端侧模型补值的请求在无界面场景不处理（保持确定性），照旧走原链路。
-        val fastPlan = AssistantFastPath.plan(context, goal, "broadcast")
-        val fastInvocation = fastPlan?.invocation
-        if (fastPlan != null && fastInvocation != null) {
-            val capability = fastPlan.capability
-            val action = fastPlan.action
-            val args = fastPlan.args
-            Thread {
-                val result = runCatching {
-                    runBlocking {
-                        AgentRuntime.localTools.execute(fastInvocation) { question, _ ->
-                            Dbg.w(TAG, "快路径无人确认，已拒绝：$question")
-                            false
-                        }
-                    }
-                }.getOrNull()
-                if (result != null) {
-                    val reply = ResultFormatter.format(capability, action, args, result)
-                    FastPathTrace.handled(
-                        context,
-                        capability,
-                        action,
-                        result.status.name,
-                        reply.text.length,
-                    )
-                    AgentRuntime.speaker.speak(reply.spoken)
-                } else {
-                    Dbg.e(TAG, "快路径没有返回结果")
-                }
-            }.apply { name = "fast-path"; isDaemon = true }.start()
-            return
-        }
-
-        // 自动路由：快路径有规则就本机直执行；没有规则的请求交给 Agent，
-        // 由模型决定回答还是执行。遗留匹配器不再插在中间。
-
-        // ★ 意图门：不是操作指令就别进 agent loop。
-        //   「你是谁」这类问题进 loop 会去乱点屏幕（真机实测过一句话触发 3 次乱点）。
-        //   走模型回答 —— 老板 11-10：「你是谁这样的问题不要走规则，模型交给模型回答」。
-        //   但 QUERY 类（查上证指数）要优先走 QueryEngine：更快、数据更准，
-        //   查不到才 fallback 到模型。
-        val kind = com.pilot.agent.agent.IntentGate.classify(goal)
-        if (kind != com.pilot.agent.agent.IntentGate.Kind.TASK) {
-            if (kind == com.pilot.agent.agent.IntentGate.Kind.QUERY) {
-                Thread {
-                    val answer = runCatching {
-                        runBlocking { com.pilot.agent.query.QueryEngine.handle(goal) }
-                    }.getOrNull()
-                    if (!answer.isNullOrBlank()) {
-                        val spokenSummary = com.pilot.agent.query.QueryEngine.speechSummary(answer)
-                        if (spokenSummary != null) AgentRuntime.speaker.speakExpanded(spokenSummary)
-                        else AgentRuntime.speaker.speak(answer)
-                    } else {
-                        AgentRuntime.speaker.speak(
-                            runCatching { runBlocking { answerByModel(goal) } }
-                                .getOrDefault("我暂时没法回答。"),
-                        )
-                    }
-                }.apply { name = "query-answer"; isDaemon = true }.start()
-                return
-            }
-            Dbg.i(TAG, "非操作指令（$kind），交给模型回答：$goal")
-            // onReceive 不能阻塞（10 秒 ANR），扔到后台线程回答
-            Thread {
-                val reply = runCatching { runBlocking { answerByModel(goal) } }
-                    .getOrDefault("我暂时没法回答。")
-                AgentRuntime.speaker.speak(reply)
-            }.apply { name = "chat-answer"; isDaemon = true }.start()
-            return
-        }
-
-        val loop = AgentRuntime.loop
-        if (loop == null) {
-            Dbg.e(TAG, "无障碍服务未连接，无法执行：$goal")
-            return
-        }
-
-        Dbg.i(TAG, "broadcast run goal=$goal caller=$caller")
-        // ui=false：后台触发时没人能点确认按钮，遇到需要确认的动作应快速放弃
-        // 自动路由的后半段：没有快路径规则的 TASK 交给 Agent 执行。
-        loop.start(
-            AgentRuntime.scope,
-            goal,
-            ui = false,
-            executionMode = com.pilot.agent.agent.AssistantMode.AGENT,
-        )
+        dispatchBackgroundGoal(context, goal, "broadcast uid=$caller")
     }
+}
 
-    /**
-     * 非操作类问题的模型回答（云端优先，端侧兜底）。
-     *
-     * 走 AgentRuntime 里同一套提示词，保证语音路径和广播路径回答一致。
-     */
-    private suspend fun answerByModel(text: String): String {
+/**
+ * 非操作类问题的模型回答（云端优先，端侧兜底）。
+ *
+ * 走 AgentRuntime 里同一套提示词，保证语音路径和广播路径回答一致。
+ */
+private suspend fun answerByModel(text: String): String {
         val s = com.pilot.agent.agent.AgentSettings.load()
         val now = java.text.SimpleDateFormat("yyyy年M月d日 EEEE HH:mm", java.util.Locale.CHINA)
             .format(java.util.Date())
@@ -447,9 +372,186 @@ class RunReceiver : BroadcastReceiver() {
                 "回答简短口语化，不超过 25 个字。$noThink\n" +
                 "user\n$text\nassistant\n"
         )?.trim()?.take(200) ?: "我暂时没法回答。"
+}
+
+/**
+ * 后台执行一条自然语言指令（无人确认）。
+ *
+ * 广播入口与后台语音共用这一条链，避免两套行为不一致：
+ * 快路径 → 只读本地工具 → 意图门（查询/闲聊交给模型）→ Agent 循环。
+ *
+ * @param callerLabel 仅用于日志/追踪，标明是谁触发的
+ */
+internal fun dispatchBackgroundGoal(
+    context: Context,
+    goal: String,
+    callerLabel: String = "background",
+) {
+    // 助理快路径：规则选能力 → 确定性抽参 → 本机执行，不调云端。
+    // 接管了就不走下面的遗留匹配器，避免同一个请求被执行两遍。
+    // 需要端侧模型补值的请求在无界面场景不处理（保持确定性），照旧走原链路。
+    val fastPlan = AssistantFastPath.plan(context, goal, callerLabel)
+    val fastInvocation = fastPlan?.invocation
+    if (fastPlan != null && fastInvocation != null) {
+        // 破坏性能力（HIGH / 路由强制确认）在后台没有可点确认的人，一律不执行。
+        // 否则用户把对应工具组设成 ALLOW 后，后台广播就能静默覆盖文件/删除。
+        if (fastPlan.needsConfirmation) {
+            Dbg.w(TAG, "后台无人确认，拒绝破坏性快路径：${fastPlan.capability}/${fastPlan.action}")
+            AgentRuntime.speaker.speak("这个操作需要你先确认，请在界面里说一次。")
+            return
+        }
+        val capability = fastPlan.capability
+        val action = fastPlan.action
+        val args = fastPlan.args
+        Thread {
+            val result = runCatching {
+                runBlocking {
+                    AgentRuntime.localTools.execute(fastInvocation) { question, _ ->
+                        Dbg.w(TAG, "快路径无人确认，已拒绝：$question")
+                        false
+                    }
+                }
+            }.getOrNull()
+            if (result != null) {
+                val reply = ResultFormatter.format(capability, action, args, result)
+                FastPathTrace.handled(
+                    context,
+                    capability,
+                    action,
+                    result.status.name,
+                    reply.text.length,
+                )
+                AgentRuntime.speaker.speak(reply.spoken)
+            } else {
+                Dbg.e(TAG, "快路径没有返回结果")
+            }
+        }.apply { name = "fast-path"; isDaemon = true }.start()
+        return
     }
 
-    private companion object {
-        const val TAG = "Pilot"
+    // 本地工具兜底：只读类（网络/定位/蓝牙/使用时长、列目录等）在后台无人确认
+    // 也可以安全执行；写/删/分享仍按原链路处理，绝不在后台静默执行。
+    val localInvocation = AgentRuntime.localTools.match(goal)
+    if (localInvocation != null &&
+        AgentRuntime.localTools.policyFor(localInvocation.group) ==
+        com.pilot.agent.tool.ToolPolicy.ALLOW
+    ) {
+        Thread {
+            val result = runCatching {
+                runBlocking {
+                    AgentRuntime.localTools.execute(localInvocation) { question, _ ->
+                        Dbg.w(TAG, "本地工具无人确认，已拒绝：$question")
+                        false
+                    }
+                }
+            }.getOrNull()
+            result?.let { AgentRuntime.speaker.speak(it.spoken) }
+        }.apply { name = "local-tool"; isDaemon = true }.start()
+        return
     }
+
+    // 自动路由：快路径有规则就本机直执行；没有规则的请求交给 Agent，
+    // 由模型决定回答还是执行。遗留匹配器不再插在中间。
+
+    // ★ 意图判定：和界面侧保持一致，先让云端模型判断「回答还是执行」，
+    //   关键词 IntentGate 只在云端不可用时兜底。否则「需要执行」的话被关键词
+    //   误判成闲聊，就只回一句话、什么都不做。
+    //   判定要联网，必须在后台线程跑，不能阻塞广播回调（10 秒 ANR）。
+    Thread {
+        val kind = com.pilot.agent.agent.IntentGate.classify(goal)
+        val settings = com.pilot.agent.agent.AgentSettings.load()
+        val decision = if (settings.cloudReady) {
+            val now = java.text.SimpleDateFormat("yyyy年M月d日 EEEE HH:mm", java.util.Locale.CHINA)
+                .format(java.util.Date())
+            val memory = runCatching {
+                AgentRuntime.localTools.memory.promptContext(goal, 5)
+            }.getOrDefault("")
+            runCatching {
+                runBlocking {
+                    com.pilot.agent.agent.AgentIntentRouter {
+                        com.pilot.agent.agent.AgentSettings.load()
+                    }.decide(goal, emptyList(), memory, now)
+                }
+            }.getOrNull()
+        } else {
+            null
+        }
+
+        if (decision != null) {
+            if (decision.execute) {
+                Dbg.i(TAG, "后台路由 → 执行 thought=${decision.thought}")
+                executeBackgroundTask(goal, callerLabel)
+                return@Thread
+            }
+            val answer = decision.answer?.trim().orEmpty()
+            if (answer.isNotBlank()) {
+                Dbg.i(TAG, "后台路由 → 回答 chars=${answer.length} thought=${decision.thought}")
+                AgentRuntime.speaker.speak(answer)
+                return@Thread
+            }
+        }
+
+        Dbg.i(TAG, "后台路由云端不可用或未给出结论（$kind），关键词兜底")
+        answerOrExecuteByKeyword(goal, kind, callerLabel)
+    }.apply { name = "background-route"; isDaemon = true }.start()
 }
+
+/**
+ * 关键词兜底：QUERY/CHAT 交给模型回答，TASK 交给 Agent 执行。
+ *
+ * 「你是谁」这类问题进 loop 会去乱点屏幕（真机实测过一句话触发 3 次乱点），
+ * 所以闲聊必须先在这里拦下。QUERY 类（查上证指数）优先走 QueryEngine：更快、数据更准。
+ * 注意：本函数运行在后台线程，内部可以放心使用 runBlocking。
+ */
+private fun answerOrExecuteByKeyword(
+    goal: String,
+    kind: com.pilot.agent.agent.IntentGate.Kind,
+    callerLabel: String,
+) {
+    if (kind == com.pilot.agent.agent.IntentGate.Kind.QUERY) {
+        val answer = runCatching {
+            runBlocking { com.pilot.agent.query.QueryEngine.handle(goal) }
+        }.getOrNull()
+        if (!answer.isNullOrBlank()) {
+            val spokenSummary = com.pilot.agent.query.QueryEngine.speechSummary(answer)
+            if (spokenSummary != null) AgentRuntime.speaker.speakExpanded(spokenSummary)
+            else AgentRuntime.speaker.speak(answer)
+        } else {
+            AgentRuntime.speaker.speak(
+                runCatching { runBlocking { answerByModel(goal) } }
+                    .getOrDefault("我暂时没法回答。"),
+            )
+        }
+        return
+    }
+    if (kind != com.pilot.agent.agent.IntentGate.Kind.TASK) {
+        Dbg.i(TAG, "非操作指令（$kind），交给模型回答：$goal")
+        val reply = runCatching { runBlocking { answerByModel(goal) } }
+            .getOrDefault("我暂时没法回答。")
+        AgentRuntime.speaker.speak(reply)
+        return
+    }
+    executeBackgroundTask(goal, callerLabel)
+}
+
+/** 交给 Agent 循环执行；后台无人确认，ui=false 时遇到确认动作会快速放弃。 */
+private fun executeBackgroundTask(goal: String, callerLabel: String) {
+    val loop = AgentRuntime.loop
+    if (loop == null) {
+        Dbg.e(TAG, "无障碍服务未连接，无法执行：$goal")
+        return
+    }
+    Dbg.i(TAG, "background run goal=$goal caller=$callerLabel")
+    loop.start(
+        AgentRuntime.scope,
+        goal,
+        ui = false,
+        executionMode = com.pilot.agent.agent.AssistantMode.AGENT,
+    )
+}
+
+/** 供后台语音（界面已销毁、没有 ViewModel）复用同一套执行链。 */
+fun runBackgroundGoal(context: Context, goal: String, callerLabel: String = "voice") =
+    dispatchBackgroundGoal(context, goal, callerLabel)
+
+private const val TAG = "Pilot"
