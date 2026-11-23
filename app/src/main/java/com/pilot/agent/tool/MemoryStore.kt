@@ -50,7 +50,9 @@ class MemoryStore(context: Context) : SQLiteOpenHelper(
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        // Version 1 is the first release. Future migrations go here.
+        // v1 是首个版本，当前没有迁移。
+        // 注意：提升 VERSION 时必须逐版本补齐列，否则老库缺列会让
+        // toMemory() 的 getColumnIndexOrThrow 直接崩溃。
     }
 
     fun remember(
@@ -66,7 +68,7 @@ class MemoryStore(context: Context) : SQLiteOpenHelper(
             val db = writableDatabase
             db.beginTransaction()
             try {
-                val existing = all().firstOrNull {
+                val existing = findByExactContent(content) ?: all().firstOrNull {
                     normalize(it.content) == normalize(content)
                 }
                 val result = if (existing != null) existing
@@ -101,6 +103,12 @@ class MemoryStore(context: Context) : SQLiteOpenHelper(
         return Memory(id, content, rawTags, "explicit", importance, now, now)
     }
 
+    /** SQL 精确命中优先，避免每次「记住…」都全表扫描 + 字符串规范化。 */
+    private fun findByExactContent(content: String): Memory? =
+        readableDatabase.query(
+            TABLE, COLUMNS, "content = ?", arrayOf(content), null, null, null, "1",
+        ).use { cursor -> if (cursor.moveToFirst()) cursor.toMemory() else null }
+
     fun all(limit: Int = MAX_RECORDS): List<Memory> {
         val rows = ArrayList<Memory>()
         readableDatabase.query(
@@ -129,24 +137,29 @@ class MemoryStore(context: Context) : SQLiteOpenHelper(
         if (normalizedQuery.isBlank()) return emptyList()
         val queryGrams = grams(normalizedQuery)
         return all().asSequence()
-            .map { memory ->
+            .mapNotNull { memory ->
                 val content = normalize(memory.content)
                 val tags = normalize(memory.tags)
-                var score = 0.0
+                // 相关性只由「命中」产生。旧实现把 importance/recency 直接加进 score，
+                // 而这两项基数（0.65 + 约 2.0）本来就超过阈值 1.2，导致**任何近期记忆
+                // 都会被判为相关**并塞进 prompt，也让 forget 误删无关记录。
+                var relevance = 0.0
                 if (content.contains(normalizedQuery) || tags.contains(normalizedQuery)) {
-                    score += 8.0
+                    relevance += 8.0
                 }
                 queryGrams.forEach { gram ->
-                    if (content.contains(gram)) score += 1.0
-                    if (tags.contains(gram)) score += 0.8
+                    if (content.contains(gram)) relevance += 1.0
+                    if (tags.contains(gram)) relevance += 0.8
                 }
+                if (relevance <= 0.0) return@mapNotNull null
                 val ageDays = ((System.currentTimeMillis() - memory.updatedAt).coerceAtLeast(0L) /
                     86_400_000.0)
-                score += memory.importance
-                score += (2.0 / (1.0 + ageDays / 30.0))
-                memory to score
+                // importance / 新鲜度只作为「同等相关」时的排序加成，不能把无关项拉过门槛。
+                val rank = relevance +
+                    memory.importance.coerceIn(0.0, 1.0) * 0.5 +
+                    (1.0 / (1.0 + ageDays / 30.0)) * 0.3
+                memory to rank
             }
-            .filter { it.second >= 1.2 }
             .sortedByDescending { it.second }
             .take(limit.coerceIn(1, 20))
             .map { it.first }
@@ -156,11 +169,14 @@ class MemoryStore(context: Context) : SQLiteOpenHelper(
     fun forget(query: String): List<Memory> {
         val clean = query.trim().trim('：', ':', '，', ',', '。', '.', ' ')
         if (clean.isBlank()) return emptyList()
-        val candidates = search(clean, 20).ifEmpty {
+        // 只删除确实与关键词相关的记录，且限制条数；旧实现依赖宽泛的 search，
+        // 一次「忘掉XX」可能连带清掉多条无关记忆。
+        val candidateLimit = 5
+        val candidates = search(clean, candidateLimit).ifEmpty {
             all().filter {
                 normalize(it.content).contains(normalize(clean)) ||
                     normalize(it.tags).contains(normalize(clean))
-            }.take(20)
+            }.take(candidateLimit)
         }
         val ids = candidates.joinToString(",") { it.id.toString() }
         if (ids.isNotBlank()) writableDatabase.delete(TABLE, "id IN ($ids)", null)
@@ -176,10 +192,27 @@ class MemoryStore(context: Context) : SQLiteOpenHelper(
         }
     }
 
-    fun promptContext(query: String, limit: Int = 5): String {
+    /**
+     * 注入 prompt 的记忆摘要。
+     *
+     * @param maxChars 总长度预算。记忆单条上限 1000 字，5 条最多能到 5000 字，
+     *   直接塞进 system prompt 会挤占对话与屏幕信息，所以这里按预算截断。
+     */
+    fun promptContext(
+        query: String,
+        limit: Int = 5,
+        maxChars: Int = 1_200,
+    ): String {
         val items = search(query, limit)
         if (items.isEmpty()) return ""
-        return items.joinToString("\n") { "• ${it.content}" }
+        val out = StringBuilder()
+        for (memory in items) {
+            val line = "• ${memory.content.take(300)}"
+            if (out.isNotEmpty() && out.length + 1 + line.length > maxChars) break
+            if (out.isNotEmpty()) out.append('\n')
+            out.append(line)
+        }
+        return out.toString()
     }
 
     private fun android.database.Cursor.toMemory() = Memory(
@@ -197,7 +230,9 @@ class MemoryStore(context: Context) : SQLiteOpenHelper(
             .replace(Regex("[\\p{P}\\p{S}\\s]+"), "")
 
     private fun grams(value: String): Set<String> {
-        if (value.length < 2) return setOf(value)
+        // 单字查询不做 bigram：否则「查」这类单字会命中几乎全部记忆。
+        // 单字仍可通过整串 contains 精确命中。
+        if (value.length < 2) return emptySet()
         return value.windowed(2).toSet()
     }
 
