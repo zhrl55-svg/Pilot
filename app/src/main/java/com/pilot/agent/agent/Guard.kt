@@ -45,6 +45,16 @@ class Guard(private val ctx: Context) {
             val field = (action.target.orEmpty() + " " + action.summary.orEmpty()).lowercase()
             if (sensitiveFieldWords.any { field.contains(it) }) return Risk.SENSITIVE
         }
+        if (action.action == "browser_click") {
+            // P2：网页按钮不在无障碍节点树里，原来会落进通用匹配而漏判。
+            // target 通常就是按钮可见文字/选择器，必须独立参与风险判定。
+            val label = (action.target.orEmpty() + " " + action.summary.orEmpty()).lowercase()
+            if (moneyWords.any { label.contains(it) }) return Risk.MONEY
+            if (irreversibleWords.any { label.contains(it) }) return Risk.IRREVERSIBLE
+            if (externalWords.any { label.contains(it) }) return Risk.EXTERNAL
+            // 看不清目标（css 选择器）时按对外副作用处理，强制确认。
+            if (label.startsWith("css:")) return Risk.EXTERNAL
+        }
         if (action.action == "mcp_call") {
             val tool = (action.tool.orEmpty() + " " + action.server.orEmpty()).lowercase()
             if (listOf("delete", "remove", "send", "post", "create", "update", "write", "submit")

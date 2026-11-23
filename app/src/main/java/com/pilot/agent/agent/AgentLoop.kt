@@ -51,6 +51,7 @@ class AgentLoop(
 
     private val pendingConfirms = ConcurrentHashMap<Long, CompletableDeferred<Boolean>>()
     private val confirmSeq = AtomicLong(0)
+    private val runSeq = AtomicLong(0)
     private var job: Job? = null
 
     /** 本次任务最后一个「把用户带到别的 App」的动作落在了哪个包，用于决定收尾要不要归位。 */
@@ -91,11 +92,12 @@ class AgentLoop(
             cancel()
         }
         hasUi = ui
+        val myToken = runSeq.incrementAndGet()
         // LAZY 启动：否则 Main.immediate 下 launch 的 lambda 会在 job 赋值之前就跑起来，
         // 循环里的 job?.isActive 读到的是上一轮的旧 Job，直接判定"已取消"静默退出。
         val newJob = scope.launch(start = CoroutineStart.LAZY) {
             try {
-                run(goal.trim(), executionMode)
+                run(goal.trim(), executionMode, myToken)
             } catch (t: Throwable) {
                 if (t is kotlinx.coroutines.CancellationException) throw t
                 Dbg.e(TAG, "run failed: ${t.message}", t)
@@ -117,7 +119,7 @@ class AgentLoop(
         pendingConfirms.remove(requestId)?.complete(approved)
     }
 
-    private suspend fun run(goal: String, executionMode: AssistantMode?) {
+    private suspend fun run(goal: String, executionMode: AssistantMode?, token: Long) {
         val configured = settingsProvider()
         val settings = if (executionMode != null) configured.copy(mode = executionMode) else configured
         Dbg.i(
@@ -137,7 +139,10 @@ class AgentLoop(
         try {
             runInner(goal, settings)
         } finally {
-            restoreOrigin(originPkg)
+            // P1：被新任务抢占后，旧任务不得再归位——否则会把前台从新任务
+            // 正在操作的 App 拽回旧任务记忆中的 App。
+            if (runSeq.get() == token) restoreOrigin(originPkg)
+            else Dbg.i(TAG, "旧任务已让位，跳过归位 token=$token")
         }
     }
 

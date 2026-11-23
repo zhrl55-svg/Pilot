@@ -34,6 +34,28 @@ object ReminderManager {
         text.contains("提醒我") || text.contains("记得提醒") ||
             text.contains("我的提醒") || text.contains("取消提醒") || text.contains("删除提醒")
 
+    /**
+     * P1：快路径结构化入口。Router/SlotExtractor 已用 ChineseTimeParser 抽出绝对时间，
+     * 直接建提醒，不再把原话交给只支持"N分钟后"的 parse() 重解析。
+     * @param atMillis UTC epoch 毫秒；@return null = 时间无效
+     */
+    @Synchronized
+    fun createFromParsed(context: Context, title: String, atMillis: Long): String? {
+        if (title.isBlank()) return null
+        if (atMillis <= System.currentTimeMillis() ||
+            atMillis > System.currentTimeMillis() + TimeUnit.DAYS.toMillis(30)
+        ) return "提醒时间需要在现在之后、未来 30 天以内。"
+        if (Build.VERSION.SDK_INT >= 33 &&
+            context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) return "需要先开启 Pilot 的通知权限，才能可靠提醒你。请在系统设置中允许通知，然后重新设置提醒。"
+        val item = Reminder(UUID.randomUUID().toString(), title, atMillis)
+        save(context, load(context) + item)
+        schedule(context, item)
+        return "已设提醒：${item.title}，${formatTime(item.at)}。可以说“我的提醒”查看，或“取消提醒”。"
+    }
+
+    @Synchronized
     fun handle(context: Context, text: String): String {
         if (text.contains("我的提醒")) {
             val all = load(context).sortedBy { it.at }

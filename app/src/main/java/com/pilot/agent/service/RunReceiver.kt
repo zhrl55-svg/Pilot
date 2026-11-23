@@ -426,7 +426,7 @@ class RunReceiver : BroadcastReceiver() {
                     .addHeader("Content-Type", "application/json")
                     .post(okhttp3.RequestBody.create("application/json".toMediaType(), body))
                     .build()
-                okhttp3.OkHttpClient().newCall(req).execute().use { resp ->
+                com.pilot.agent.agent.CloudHttp.client.newCall(req).execute().use { resp ->
                     if (resp.isSuccessful) {
                         org.json.JSONObject(resp.body?.string().orEmpty())
                             .optJSONArray("choices")?.optJSONObject(0)

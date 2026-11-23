@@ -175,6 +175,9 @@ object ChineseTimeParser {
         var explicitPastDate = false
         var confidence = 0.72
         var ambiguous = false
+        // P1：今晚/明晚/今早/明早只设日期不够，还隐含时段。
+        // 否则"明晚8点"会把 period 留空，被当成明早 8 点且 isConfident=true 直接执行。
+        var impliedPeriod: String? = null
 
         RELATIVE_DAY.find(text)?.let { m ->
             val word = m.groupValues[1]
@@ -183,7 +186,10 @@ object ChineseTimeParser {
                 date = now.toLocalDate().plusDays(delta)
                 dateSpecified = true
                 confidence = 0.96
-                if (word == "今早" || word == "明早") confidence = 0.92
+                when (word) {
+                    "今晚", "明晚" -> impliedPeriod = "晚上"
+                    "今早", "明早" -> impliedPeriod = "早上"
+                }
             }
         }
         EN_RELATIVE_DAY.find(text)?.let { m ->
@@ -198,6 +204,7 @@ object ChineseTimeParser {
                 date = now.toLocalDate().plusDays(delta)
                 dateSpecified = true
                 confidence = 0.96
+                if (word == "tonight") impliedPeriod = "晚上"
             }
         }
 
@@ -290,6 +297,7 @@ object ChineseTimeParser {
 
         val period = PERIOD.find(text)?.groupValues?.get(1)
             ?: EN_PERIOD.find(text)?.groupValues?.get(1)
+            ?: impliedPeriod
 
         var hour: Int? = null
         var minute = 0
@@ -653,7 +661,9 @@ object ChineseTimeParser {
         return when (period) {
             "下午", "傍晚", "晚上", "夜里", "afternoon", "evening", "night", "tonight" ->
                 if (hour < 12) hour + 12 else hour
-            "中午" -> if (hour < 11) hour + 12 else hour
+            // P1：中午就是 12 点前后，10/11 点本就是上午。
+            // 原来 hour<11 时 +12 会把"中午10点"变成 22:00 并非确定执行。
+            "中午" -> hour
             else -> hour
         }
     }

@@ -243,6 +243,12 @@ class WebPageTool : QueryTool {
             val uri = runCatching { Uri.parse(url) }.getOrNull()
                 ?: return@withContext "正文抓取失败：链接格式不正确。"
             if (uri.scheme != "https" || uri.host.isNullOrBlank()) return@withContext "正文抓取失败：只允许 HTTPS 链接。"
+            // P2：禁止字面量 IP 作为目标（含 IPv4/IPv6），减少 DNS rebinding 与
+            // 直接打内网的风险；域名仍由 safeDns 在解析时校验公网地址。
+            val hostLiteral = uri.host!!
+            if (hostLiteral.matches(Regex("""^\d{1,3}(\.\d{1,3}){3}$""")) ||
+                hostLiteral.contains(":")
+            ) return@withContext "正文抓取失败：不接受 IP 地址直连。"
             try {
                 val request = Request.Builder().url(url)
                     .header("User-Agent", "PilotAndroid/1.0")

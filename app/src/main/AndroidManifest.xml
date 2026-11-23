@@ -59,6 +59,11 @@
         tools:ignore="ProtectedPermissions" />
     <uses-permission android:name="android.permission.STATUS_BAR"
         tools:ignore="ProtectedPermissions" />
+    <!-- 与 rom/privapp-permissions 白名单对齐（状态栏展开 / 后台恢复 UI） -->
+    <uses-permission android:name="android.permission.EXPAND_STATUS_BAR"
+        tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.START_ACTIVITIES_FROM_BACKGROUND"
+        tools:ignore="ProtectedPermissions" />
     <uses-permission android:name="android.permission.INTERACT_ACROSS_USERS"
         tools:ignore="ProtectedPermissions" />
     <uses-permission android:name="android.permission.MANAGE_ACTIVITY_TASKS"

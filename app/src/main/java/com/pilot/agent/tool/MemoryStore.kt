@@ -61,10 +61,29 @@ class MemoryStore(context: Context) : SQLiteOpenHelper(
         val content = rawContent.trim().trim('，', ',', '。', '.', '；', ';')
         if (content.length < 2) return null
         if (content.length > MAX_CONTENT_CHARS) return null
-        val existing = all().firstOrNull {
-            normalize(it.content) == normalize(content)
+        // P1：查重与插入在同一事务内串行化，避免快路径与 Agent 链路并发写入重复记忆。
+        return synchronized(this) {
+            val db = writableDatabase
+            db.beginTransaction()
+            try {
+                val existing = all().firstOrNull {
+                    normalize(it.content) == normalize(content)
+                }
+                val result = if (existing != null) existing
+                else insertMemory(content, rawTags, importance)
+                db.setTransactionSuccessful()
+                result
+            } finally {
+                db.endTransaction()
+            }
         }
-        if (existing != null) return existing
+    }
+
+    private fun insertMemory(
+        content: String,
+        rawTags: String,
+        importance: Double,
+    ): Memory? {
         val now = System.currentTimeMillis()
         val values = ContentValues().apply {
             put("content", content)

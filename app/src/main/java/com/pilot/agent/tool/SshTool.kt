@@ -169,7 +169,9 @@ internal class SshTool {
             session = JSch().getSession(username, host, port).apply {
                 setPassword(password)
                 setConfig("PreferredAuthentications", "password,keyboard-interactive")
-                setConfig("StrictHostKeyChecking", "accept-new")
+                // P1：accept-new 会静默接受任意主机密钥（含中间人）。
+                // 改为严格校验：目标主机必须先纳入 KnownHosts 才能连接。
+                setConfig("StrictHostKeyChecking", "yes")
                 timeout = IO_TIMEOUT_MS
             }
             session.connect(CONNECT_TIMEOUT_MS)
@@ -212,7 +214,7 @@ internal class SshTool {
                 message.contains("refused", ignoreCase = true) ->
                     "端口拒绝连接"
                 message.contains("UnknownHostKey", ignoreCase = true) ->
-                    "主机密钥校验失败"
+                    "主机密钥校验失败：请先在可信网络下核对该主机指纹并加入 KnownHosts，Pilot 不会自动接受未知主机"
                 else -> "握手失败（${error.javaClass.simpleName}）"
             }
             ToolResult.error("SSH 连接失败：$reason。目标 $host:$port。")

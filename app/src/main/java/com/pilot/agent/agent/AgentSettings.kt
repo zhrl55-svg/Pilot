@@ -181,7 +181,8 @@ data class AgentSettings(
             migrateVoiceAutoV2(p)
             return AgentSettings(
                 baseUrl = p.getString(K_URL, null) ?: DEFAULT_BASE_URL,
-                apiKey = p.getString(K_KEY, null) ?: "",
+                // P0：API Key 从 Keystore 读；首次运行迁移旧版明文并清除。
+                apiKey = readMigratedSecret(p, K_KEY),
                 webSearchApiKey = SecretVault.get(K_WEB_SEARCH_KEY),
                 model = p.getString(K_MODEL, null) ?: DEFAULT_MODEL,
                 // 自动路由：忽略旧版保存的助理/Agent 选择，统一按 Agent 语义执行
@@ -218,7 +219,7 @@ data class AgentSettings(
                     ?: DEFAULT_MUSIC_URL,
                 musicFallbackUrl = p.getString(K_MUSIC_FALLBACK_URL, null)
                     ?: DEFAULT_MUSIC_FALLBACK_URL,
-                neteaseCookie = p.getString(K_NETEASE_COOKIE, null) ?: "",
+                neteaseCookie = readMigratedSecret(p, K_NETEASE_COOKIE),
                 assistantFastPath = p.getBoolean(K_ASSISTANT_FAST_PATH, true),
             )
         }
@@ -226,7 +227,9 @@ data class AgentSettings(
         fun save(s: AgentSettings) {
             PilotApp.prefs.edit()
                 .putString(K_URL, s.baseUrl)
-                .putString(K_KEY, s.apiKey)
+                // P0：敏感凭据不再写明文，迁移后清除旧值
+                .remove(K_KEY)
+                .remove(K_NETEASE_COOKIE)
                 .putString(K_MODEL, s.model)
                 .putString(K_MODE, AssistantMode.AGENT.storageValue)
                 .putInt(K_TURNS, s.maxTurns.coerceIn(MIN_AGENT_TURNS, MAX_AGENT_TURNS))
@@ -257,10 +260,29 @@ data class AgentSettings(
                 .putString(K_INTERRUPT_WORDS, s.interruptWords)
                 .putString(K_MUSIC_URL, s.musicBaseUrl)
                 .putString(K_MUSIC_FALLBACK_URL, s.musicFallbackUrl)
-                .putString(K_NETEASE_COOKIE, s.neteaseCookie)
                 .putBoolean(K_ASSISTANT_FAST_PATH, s.assistantFastPath)
                 .apply()
-            runCatching { SecretVault.put(K_WEB_SEARCH_KEY, s.webSearchApiKey) }
+            runCatching {
+                SecretVault.put(K_WEB_SEARCH_KEY, s.webSearchApiKey)
+                SecretVault.put(K_KEY, s.apiKey)
+                SecretVault.put(K_NETEASE_COOKIE, s.neteaseCookie)
+            }
+        }
+
+        /**
+         * P0 迁移：优先从 Keystore 读；为空时取旧版明文值，写入 Keystore 后立即清除明文。
+         */
+        private fun readMigratedSecret(
+            p: android.content.SharedPreferences,
+            key: String,
+        ): String {
+            val encrypted = SecretVault.get(key)
+            if (encrypted.isNotBlank()) return encrypted
+            val legacy = p.getString(key, null).orEmpty()
+            if (legacy.isBlank()) return ""
+            runCatching { SecretVault.put(key, legacy) }
+            p.edit().remove(key).apply()
+            return legacy
         }
 
         fun isAccessibilityEnabled(ctx: Context): Boolean {

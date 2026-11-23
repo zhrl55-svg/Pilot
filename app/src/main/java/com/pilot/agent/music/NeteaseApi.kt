@@ -107,7 +107,8 @@ object NeteaseApi {
             val builder = Request.Builder().url(url).get()
             if (!cookie.isNullOrBlank()) builder.header("Cookie", cookie)
             client.newCall(builder.build()).execute().use { resp ->
-                JSONObject().put("ok", true).put("code", resp.code).put("body", resp.body?.string().orEmpty())
+                JSONObject().put("ok", true).put("code", resp.code)
+                    .put("body", com.pilot.agent.agent.HttpBodies.readCapped(resp.body))
             }
         }
     } catch (t: Throwable) {

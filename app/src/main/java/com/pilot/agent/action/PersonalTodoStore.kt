@@ -12,6 +12,8 @@ object PersonalTodoStore {
 
     fun handles(text: String): Boolean = listOf("我的待办", "添加待办", "新增待办", "记一条待办", "完成待办", "删除待办", "清空已完成").any(text::contains)
 
+    // P1：语音/广播/UI 可同时写入，load→modify→save 必须串行化，否则丢更新。
+    @Synchronized
     fun handle(text: String): String {
         when {
             text.contains("我的待办") -> {

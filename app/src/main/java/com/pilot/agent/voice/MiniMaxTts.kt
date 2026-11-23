@@ -33,6 +33,7 @@ class MiniMaxTts(private val context: Context) : SpeechOutput {
 
     companion object {
         private const val TAG = "PilotTts"
+        private const val MAX_BODY_CHARS = 4 * 1024 * 1024
 
         /**
          * 可选音色。
@@ -231,8 +232,20 @@ class MiniMaxTts(private val context: Context) : SpeechOutput {
             conn.outputStream.use { it.write(payload.toByteArray()) }
 
             val code = conn.responseCode
+            // P2：限制响应体大小，避免异常大响应 string→byte[] 双份占内存。
             val body = (if (code in 200..299) conn.inputStream else conn.errorStream)
-                ?.bufferedReader()?.use { it.readText() }.orEmpty()
+                ?.bufferedReader()?.use { reader ->
+                    val buf = CharArray(8192)
+                    val sb = StringBuilder()
+                    var total = 0
+                    while (total < MAX_BODY_CHARS) {
+                        val n = reader.read(buf, 0, minOf(buf.size, MAX_BODY_CHARS - total))
+                        if (n < 0) break
+                        sb.append(buf, 0, n)
+                        total += n
+                    }
+                    sb.toString()
+                }.orEmpty()
 
             if (code !in 200..299) {
                 lastError = "HTTP $code ${body.take(160)}"

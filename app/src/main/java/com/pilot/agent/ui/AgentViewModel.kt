@@ -307,6 +307,10 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var memoryList by mutableStateOf<List<com.pilot.agent.tool.MemoryStore.Memory>>(emptyList())
         private set
+    var showScheduledTasks by mutableStateOf(false)
+        private set
+    var scheduledTaskList by mutableStateOf<List<com.pilot.agent.tool.ScheduledTaskManager.Task>>(emptyList())
+        private set
 
     fun refreshLocalToolState() {
         toolPolicies = AgentRuntime.localTools.policies()
@@ -333,6 +337,47 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         AgentRuntime.localTools.deleteMemoryFromUi(id)
         memoryList = AgentRuntime.localTools.memory.all()
         toolMemoryCount = memoryList.size
+    }
+
+    fun openScheduledTasks() {
+        scheduledTaskList = com.pilot.agent.tool.ScheduledTaskManager.allTasks(getApplication())
+        showScheduledTasks = true
+    }
+
+    fun closeScheduledTasks() {
+        showScheduledTasks = false
+    }
+
+    fun refreshScheduledTasks() {
+        scheduledTaskList = com.pilot.agent.tool.ScheduledTaskManager.allTasks(getApplication())
+    }
+
+    /** @return true 表示成功；失败时刷新列表让 UI 显示真实状态。 */
+    fun updateScheduledTask(
+        id: String,
+        goal: String = "",
+        at: Long = 0L,
+        daily: Boolean? = null,
+    ): Boolean {
+        val ok = com.pilot.agent.tool.ScheduledTaskManager.updateTask(
+            getApplication(), id, goal, at, daily,
+        ) != null
+        refreshScheduledTasks()
+        return ok
+    }
+
+    fun deleteScheduledTask(id: String): Boolean {
+        val ok = com.pilot.agent.tool.ScheduledTaskManager.deleteTask(getApplication(), id)
+        refreshScheduledTasks()
+        return ok
+    }
+
+    fun createScheduledTask(goal: String, at: Long, daily: Boolean): Boolean {
+        val created = com.pilot.agent.tool.ScheduledTaskManager.createTask(
+            getApplication(), goal, at, daily,
+        )
+        refreshScheduledTasks()
+        return created != null
     }
 
     var foreground by mutableStateOf("")
@@ -516,7 +561,9 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 if (mp.shuffleEnabled != musicShuffle) musicShuffle = mp.shuffleEnabled
                 if (mp.playbackMode != musicPlaybackMode) musicPlaybackMode = mp.playbackMode
                 publishNotificationStatus()
-                delay(100)
+                // P2：100ms × 十余个 MusicPlayer Binder 同步调用 = 持续 10Hz 压力；
+                // 300ms 对播放条 UI 足够跟手，负载降 2/3。
+                delay(300)
             }
         }
         viewModelScope.launch {
@@ -1180,7 +1227,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 .addHeader("Content-Type", "application/json")
                 .post(okhttp3.RequestBody.create("application/json".toMediaType(), body))
                 .build()
-            okhttp3.OkHttpClient().newCall(req).execute().use { resp ->
+            com.pilot.agent.agent.CloudHttp.client.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) {
                     Dbg.w(TAG, "云端对话失败 http=${resp.code}")
                     return null

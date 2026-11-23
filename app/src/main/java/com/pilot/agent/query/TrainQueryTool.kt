@@ -417,7 +417,13 @@ class TrainQueryTool : QueryTool {
             .build()
         val html = executeText(request, "获取 12306 会话失败")
         val match = LEFT_TICKET_PATH_REGEX.find(html)?.groupValues?.getOrNull(1)
-        val endpoint = match?.takeIf { it.isNotBlank() } ?: "leftTicket/query"
+        // P1：12306 响应可控，endpoint 必须是相对路径且只含安全字符，
+        // 否则被投毒后可让 App 向任意地址发带 Cookie 的请求（SSRF）。
+        val endpoint = match?.takeIf {
+            it.isNotBlank() &&
+                !it.contains("://") &&
+                it.matches(Regex("""[a-zA-Z0-9_/?=&.-]+"""))
+        } ?: "leftTicket/query"
         discoveredQueryPath.set(endpoint)
         Dbg.i(TAG, "12306 查询入口=$endpoint")
         return endpoint

@@ -74,6 +74,32 @@ object GeoCoder {
     }
 
     /**
+     * 反查城市 adcode（高德天气接口只认 adcode，不认城市名）。
+     * 同步调用，调用方放子线程。失败返回 null。
+     */
+    fun adcodeOf(lat: Double, lon: Double): String? {
+        if (lat == 0.0 || lon == 0.0) return null
+        val key = NavKeys.webKey()
+        if (key.isBlank()) return null
+        return runCatching {
+            val tail = "?key=$key&location=$lon,$lat&extensions=base&batch=false"
+            val conn = URL(BASE + tail).openConnection() as HttpURLConnection
+            conn.connectTimeout = 5000
+            conn.readTimeout = 6000
+            conn.requestMethod = "GET"
+            val json = JSONObject(conn.inputStream.use { it.readBytes().decodeToString() })
+            if (json.optString("status") != "1") return null
+            json.optJSONObject("regeocode")
+                ?.optJSONObject("addressComponent")
+                ?.optString("adcode")
+                ?.takeIf { it.length == 6 && it.all(Char::isDigit) }
+        }.getOrElse {
+            NLog.w(TAG, "adcode 反查异常 ${it.message}")
+            null
+        }
+    }
+
+    /**
      * 反查地址，失败时退回「附近的路名或 POI 名」。
      * 给 UI 直接显示用，保证不会出现纯经纬度。
      */

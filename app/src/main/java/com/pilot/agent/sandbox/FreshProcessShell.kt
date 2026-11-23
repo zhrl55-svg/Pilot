@@ -8,6 +8,7 @@ import java.io.File
 import java.nio.charset.StandardCharsets
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 
 /**
@@ -109,7 +110,10 @@ internal class FreshProcessShell(
         // process and lets EOF end the loop naturally.
         val timedOut = java.util.concurrent.atomic.AtomicBoolean(false)
         val readEof = java.util.concurrent.atomic.AtomicBoolean(false)
-        val watchdog = kotlinx.coroutines.GlobalScope.launch(Dispatchers.IO) {
+        val shellScope = kotlinx.coroutines.CoroutineScope(
+            kotlinx.coroutines.SupervisorJob() + Dispatchers.IO,
+        )
+        val watchdog = shellScope.launch(Dispatchers.IO) {
             kotlinx.coroutines.delay(timeout)
             // [T-android-mcp-detached-daemon-hang] Do NOT gate this on
             // `process.isAlive`.
@@ -160,7 +164,7 @@ internal class FreshProcessShell(
         // proot (and the daemon) alone.
         val lastReadAt = java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis())
         val closedOnStatus = java.util.concurrent.atomic.AtomicBoolean(false)
-        val monitor = kotlinx.coroutines.GlobalScope.launch(Dispatchers.IO) {
+        val monitor = shellScope.launch(Dispatchers.IO) {
             while (!statusFile.exists()) {
                 if (readEof.get()) return@launch
                 kotlinx.coroutines.delay(STATUS_POLL_MS)
@@ -210,6 +214,7 @@ internal class FreshProcessShell(
         } finally {
             watchdog.cancel()
             monitor.cancel()
+            shellScope.cancel()
         }
 
         // Stderr goes after stdout: separate pipes cannot be re-interleaved.

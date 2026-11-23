@@ -260,8 +260,17 @@ class RouteStore internal constructor(
             runCatching { file.copyTo(backup, overwrite = true) }
         }
         if (!tmp.renameTo(file)) {
-            tmp.copyTo(file, overwrite = true)
-            tmp.delete()
+            // P1：Windows 上 rename 到已存在文件会失败（JVM 单测也会踩到）。
+            // 此时先删除旧文件再 rename——中途失败可从刚才的 .bak 恢复，
+            // 绝不用 copyTo(overwrite) 直接截断事实源。
+            val backup = File(rootDir, "routes.json.bak")
+            val hadBackup = backup.isFile
+            runCatching { file.delete() }
+            if (!tmp.renameTo(file)) {
+                Dbg.w(TAG, "路由持久化失败，尝试从备份恢复")
+                if (hadBackup) runCatching { backup.copyTo(file, overwrite = true) }
+                return
+            }
         }
         _routes.value = routes
         _owners.value = owners

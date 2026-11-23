@@ -42,8 +42,8 @@ class CapabilityExecutor(
             "app_launch" -> appLaunch(args)
             "volume" -> volume(decision.action, args)
             "device" -> device(decision.action)
-            "media" -> media(decision.action)
-            "reminder" -> reminder(decision.action, userText)
+            "media" -> media(decision.action, args, userText)
+            "reminder" -> reminder(decision.action, args, userText)
             "scheduled_task" -> scheduledTask(decision.action, args, userText)
             "memory_write" -> memoryWrite(args)
             "memory_get" -> memoryGet(decision.action, userText)
@@ -186,10 +186,11 @@ class CapabilityExecutor(
     }
 
     // ── media ────────────────────────────────────────────────────────
-    private fun media(action: String): ToolInvocation? {
-        // 播放（按歌名/歌手/流派搜索）要走 Netease 检索流水线，那条链路在
-        // AgentLoop 里；本阶段不重复实现，交回原链路。
-        if (action == "play") return null
+    private fun media(action: String, args: JSONObject, userText: String): ToolInvocation? {
+        // 播放：直接走 Netease 检索 + MusicPlayer，一步到位。
+        // 之前这里 return null 交回 AgentLoop，结果云端规划器去点开屏广告、
+        // 翻应用抽屉，3-6 步还经常失败（真机实测）。
+        if (action == "play") return musicPlay(args, userText)
         return when (action) {
             "pause" -> ToolInvocation(
                 name = "media_pause",
@@ -270,6 +271,119 @@ class CapabilityExecutor(
         }
     }
 
+    /**
+     * 点歌：消费抽取层已经判定好的 kind/query/artist/chart，不再 contain() 猜意图。
+     * 顺序：本地文件 → 网易云检索（歌名/歌手/流派/场景/榜单）→ 直接播放。
+     */
+    private fun musicPlay(args: JSONObject, userText: String): ToolInvocation {
+        val kind = args.optString("kind").ifBlank { "song" }
+        val query = args.optString("query").trim()
+        val artist = args.optString("artist").trim()
+        val chart = args.optString("chart").trim()
+        val label = when {
+            query.isNotBlank() -> query
+            artist.isNotBlank() -> artist
+            chart.isNotBlank() -> chart
+            else -> userText.take(20)
+        }
+        return ToolInvocation(
+            name = "music_play",
+            group = ToolGroup.READ,
+            summary = "播放 $label",
+            confirmation = "允许播放音乐吗？",
+        ) { ctx, _ ->
+            val settings = com.pilot.agent.agent.AgentSettings.load()
+            val base = settings.musicBaseUrl
+            val cookie = settings.neteaseCookie
+
+            // 1) 具体歌名/歌手：先查本地，命中就零网络播放
+            val searchKey = when {
+                query.isNotBlank() && artist.isNotBlank() -> "$artist $query"
+                query.isNotBlank() -> query
+                artist.isNotBlank() -> artist
+                else -> ""
+            }
+            if (searchKey.isNotBlank() && kind != "genre" && kind != "scene") {
+                val local = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    com.pilot.agent.music.LocalMusicLibrary.find(ctx, searchKey)
+                }
+                if (local != null) {
+                    val started = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main.immediate) {
+                        MusicPlayer.get(ctx).playQueue(
+                            listOf(
+                                MusicPlayer.Track(
+                                    title = local.title,
+                                    artist = local.artist,
+                                    source = MusicPlayer.Source.Local(local.uri),
+                                ),
+                            ),
+                        )
+                    }
+                    return@ToolInvocation if (started) {
+                        ToolResult.success("正在播放本地音乐：${local.display}")
+                    } else {
+                        ToolResult.error("本地音乐播放失败：${local.display}")
+                    }
+                }
+            }
+
+            // 2) 网易云检索
+            val songs = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                when (kind) {
+                    "chart" -> chartSongs(base, chart, cookie)
+                    "daily" -> com.pilot.agent.music.NeteaseApi.everydayRecommendations(base, cookie, 20)
+                    "liked" -> com.pilot.agent.music.NeteaseApi.likedSongs(base, cookie, 20)
+                    "recent" -> com.pilot.agent.music.NeteaseApi.recentSongs(base, cookie, 20)
+                    "none" -> com.pilot.agent.music.MusicHistoryStore.recent(20)
+                        .ifEmpty { com.pilot.agent.music.NeteaseApi.chartSongs(base, 3778678L, cookie, 20) }
+                    else -> com.pilot.agent.music.NeteaseApi.search(base, searchKey.ifBlank { "热门" }, 10, cookie)
+                }
+            }
+            if (songs.isEmpty()) {
+                return@ToolInvocation ToolResult.unavailable(
+                    "没搜到「$label」。检查音乐服务是否在线、或先在 App 里登录网易云。",
+                )
+            }
+            com.pilot.agent.music.MusicHistoryStore.remember(songs)
+            val tracks = songs.map { song ->
+                MusicPlayer.Track(
+                    title = song.name,
+                    artist = song.artist,
+                    resolver = {
+                        com.pilot.agent.music.NeteaseApi.playUrl(base, song.id, cookie)
+                            ?.let { MusicPlayer.Source.Remote(it) }
+                    },
+                    lyricProvider = {
+                        com.pilot.agent.music.NeteaseApi.lyrics(base, song.id, cookie)
+                    },
+                )
+            }
+            val started = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main.immediate) {
+                MusicPlayer.get(ctx).playQueue(tracks)
+            }
+            if (started) {
+                ToolResult.success("正在播放：${tracks.first().display}，共 ${tracks.size} 首")
+            } else {
+                ToolResult.error("播放器启动失败，可能是音源地址无效。")
+            }
+        }
+    }
+
+    /** 榜单名 → 网易云官方歌单 id。 */
+    private fun chartSongs(
+        base: String,
+        chart: String,
+        cookie: String,
+    ): List<com.pilot.agent.music.NeteaseApi.Song> {
+        val id = when (chart) {
+            "new" -> 3779629L
+            "rising" -> 19723756L
+            "hot" -> 3778678L
+            else -> 3778678L
+        }
+        return com.pilot.agent.music.NeteaseApi.chartSongs(base, id, cookie, 20)
+    }
+
     // ── reminder ─────────────────────────────────────────────────────
     /**
      * 提醒管理器只提供一个入口 [ReminderManager.handle]：它自己认「提醒我 /
@@ -277,7 +391,7 @@ class CapabilityExecutor(
      *
      * 取消是破坏性操作 → 走 DELETE 组（默认每次询问），不当作「用户已经明确要求」。
      */
-    private fun reminder(action: String, userText: String): ToolInvocation? = when (action) {
+    private fun reminder(action: String, args: JSONObject, userText: String): ToolInvocation? = when (action) {
         "schedule" -> ToolInvocation(
             name = "create_reminder",
             group = ToolGroup.WRITE,
@@ -285,8 +399,30 @@ class CapabilityExecutor(
             confirmation = "允许创建这个提醒吗？",
             explicitAuthorized = true,
         ) { ctx, _ ->
-            val message = ReminderManager.handle(ctx, userText)
-            ToolResult.success(message)
+            // P1：Router 用 ChineseTimeParser 判定"有参数可执行"，执行器必须消费
+            // 同一套结构化结果，不能再交给只支持"N分钟后"的 parse() 重解析。
+            val atIso = args.optString("at")
+            val afterSec = args.optLong("after", 0L)
+            val structuredAt = when {
+                atIso.isNotBlank() -> runCatching {
+                    java.time.LocalDateTime.parse(atIso).atZone(java.time.ZoneId.systemDefault())
+                        .toInstant().toEpochMilli()
+                }.getOrNull()
+                afterSec > 0L -> System.currentTimeMillis() + afterSec * 1000L
+                else -> null
+            }
+            if (structuredAt == null) {
+                // Router 放行但槽位不可解析：不能把"无法确定时间"包装成 SUCCESS。
+                return@ToolInvocation ToolResult.unavailable("这个提醒的时间没解析出来，请换个说法，例如“30 分钟后提醒我”。")
+            }
+            val title = args.optString("title").ifBlank {
+                userText.replace(Regex("""提醒我|记得提醒|^(请|帮我)"""), "").trim()
+                    .ifBlank { "提醒" }
+            }
+            val message = ReminderManager.createFromParsed(ctx, title, structuredAt)
+                ?: return@ToolInvocation ToolResult.unavailable("提醒参数不完整，请重新说一次。")
+            if (message.startsWith("已设提醒")) ToolResult.success(message)
+            else ToolResult.error(message)
         }
         "list" -> ToolInvocation(
             name = "list_reminders",

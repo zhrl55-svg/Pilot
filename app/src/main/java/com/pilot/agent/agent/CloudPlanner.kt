@@ -36,6 +36,8 @@ class CloudPlanner(private val settingsProvider: () -> AgentSettings) : Planner 
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
+        // P1：主规划链路必须有总时限，否则弱网下可永久挂起
+        .callTimeout(70, TimeUnit.SECONDS)
         .build()
 
     override suspend fun decide(req: AgentRequest): AgentDecision = withContext(Dispatchers.IO) {
@@ -194,6 +196,9 @@ class CloudPlanner(private val settingsProvider: () -> AgentSettings) : Planner 
 7. 调用会产生外部副作用的 MCP 工具前先用 ask 确认；只读查询可直接调用。
 8. 只输出 JSON。
 9. 不声称已完成未执行的动作；需要实时信息时必须使用浏览器、MCP 或已有工具读取。
+10. 用户要求的能力不在上面的动作清单里（例如扫描局域网设备、查看路由器终端、远程控制其他设备、
+    破解/刷机）时，立刻用 ask 说明“Pilot 没有这个能力”，不要靠滑动桌面、翻最近任务、
+    搜应用名去反复碰运气——真机实测这类硬试会白跑十几步仍然失败。
 
 ${IntentGate.SELF_KNOWLEDGE}
 """.trimIndent()

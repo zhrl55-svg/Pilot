@@ -148,7 +148,9 @@ class ScreenReader(private val service: AccessibilityService) {
                                 return
                             }
                             val scaled = downscale(bitmap, maxWidth)
-                            val file = File(dir, "shot_${System.currentTimeMillis()}.jpg")
+                            // 固定文件名覆盖写入：本方法每轮感知都会调用，带时间戳会无限堆积磁盘。
+                            // 调用方拿到的 File 在本次任务内消费完即失效，不跨轮保存。
+                            val file = File(dir, "shot.jpg")
                             val ok = runCatching {
                                 FileOutputStream(file).use { fos ->
                                     scaled.compress(Bitmap.CompressFormat.JPEG, quality, fos)

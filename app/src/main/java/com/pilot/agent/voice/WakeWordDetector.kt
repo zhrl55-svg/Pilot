@@ -217,9 +217,13 @@ class WakeWordDetector(private val context: Context) {
         const val TAG = "PilotVoice"
         const val ASSET_DIR = "kws"
         const val KEYWORD_SCORE = 2.0f
-        const val KEYWORD_THRESHOLD = 0.12f
+        // 0.12 过于敏感：真机实测打字/环境音下「不说了/别说了/第一个」三分钟误命中 20+ 次。
+        // 0.22 仍低于官方示例（0.25），保留轻声唤醒的余量，同时明显压掉误报。
+        const val KEYWORD_THRESHOLD = 0.22f
 
         /** 100 帧 = 2 秒打一次心跳，太密会把日志淹掉 */
-        const val HEARTBEAT_FRAMES = 100L
+        // 心跳只用于判断"模型没认词 vs 代码没被调用"，2 秒一条纯属刷屏；
+        // 30 秒（1500 帧 × 20ms）足够定位问题，日志量降 15 倍。
+        const val HEARTBEAT_FRAMES = 1500L
     }
 }

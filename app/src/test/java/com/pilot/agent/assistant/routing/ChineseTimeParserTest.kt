@@ -41,6 +41,21 @@ class ChineseTimeParserTest {
     }
 
     @Test
+    fun `tomorrow evening 8pm uses evening hour`() {
+        // P1 回归：原来"明晚8点"被解析成明早 8 点且 isConfident=true。
+        val parsed = ChineseTimeParser.parse("明晚8点", now)!!
+        assertEquals(now.toLocalDate().plusDays(1), parsed.dateTime.toLocalDate())
+        assertEquals(20, parsed.dateTime.hour)
+    }
+
+    @Test
+    fun `noon 10am stays in the morning`() {
+        // P1 回归：原来"中午10点"被解析成 22:00。
+        val parsed = ChineseTimeParser.parse("中午10点", now)!!
+        assertEquals(10, parsed.dateTime.hour)
+    }
+
+    @Test
     fun `no time expression yields nothing`() {
         assertNull(ChineseTimeParser.parse("提醒我喝水", now))
     }

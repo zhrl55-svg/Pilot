@@ -107,6 +107,7 @@ class SkillStore(private val dir: File) {
             ?.first
     }
 
+    @Synchronized
     fun recordSuccess(goal: String, pkg: String, steps: List<SkillStep>) {
         if (steps.isEmpty()) return
         val list = all().toMutableList()
@@ -132,6 +133,7 @@ class SkillStore(private val dir: File) {
         persist(list.sortedByDescending { it.updatedAt }.take(200))
     }
 
+    @Synchronized
     fun recordHit(id: String) {
         val list = all().toMutableList()
         val idx = list.indexOfFirst { it.id == id }
@@ -141,10 +143,12 @@ class SkillStore(private val dir: File) {
         }
     }
 
+    @Synchronized
     fun delete(id: String) {
         persist(all().filterNot { it.id == id })
     }
 
+    @Synchronized
     fun clear() {
         runCatching { file.delete() }
     }

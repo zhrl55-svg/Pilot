@@ -12,6 +12,7 @@ import java.util.Locale
  * file bodies, memory text, passwords, and chat messages are never appended.
  */
 class ToolAuditLog(private val context: Context) {
+    @Synchronized
     fun record(
         tool: String,
         group: ToolGroup,

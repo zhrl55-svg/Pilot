@@ -18,7 +18,8 @@ object DefaultRoutes {
      * v2：新增 `tool.memory-list`（memory_get/list）——「你记得什么」列全部，
      * 和遗留链路的 memory_list 对齐（v1 走搜索，结果不一样）。
      */
-    const val SEED_VERSION = 2
+    // 3：内置路由匹配字段随版本刷新（见 migrate）；2 → 3 时同步了提醒口语词表
+    const val SEED_VERSION = 3
 
     private fun r(
         id: String,
@@ -241,7 +242,15 @@ object DefaultRoutes {
         r(
             "life.reminder-list", "提醒列表", "life", "reminder", "list",
             priority = 195,
-            keywords = listOf("提醒列表", "我的提醒", "查看提醒", "打开提醒", "list reminders", "show reminders"),
+            keywords = listOf(
+                "提醒列表", "我的提醒", "查看提醒", "打开提醒",
+                // 口语疑问式：真机实测「我有提醒吗」原来 no-match，落到 Agent 去翻通知栏
+                "有提醒吗", "有提醒么", "有什么提醒", "有哪些提醒", "还有提醒",
+                "我有提醒", "提醒有没有", "查看我的提醒",
+                "list reminders", "show reminders",
+            ),
+            // 排除"提醒我…"这种创建语义，交给高优先级的 schedule
+            exclude = listOf("提醒我", "记得提醒"),
         ),
         r(
             "life.reminder-cancel", "取消提醒", "life", "reminder", "cancel",
@@ -336,11 +345,26 @@ object DefaultRoutes {
      * 迁移：只补种子里新增的 id，**不覆盖**用户改过的路由。
      */
     fun migrate(loaded: List<AssistantRoute>, fromVersion: Int): List<AssistantRoute> {
-        var routes = loaded
-        if (fromVersion < SEED_VERSION) {
-            val existing = routes.mapTo(hashSetOf()) { it.id }
-            routes = routes + all.filter { it.id !in existing }
+        if (fromVersion >= SEED_VERSION) return loaded
+        val builtins = all.associateBy { it.id }
+        // 内置路由的匹配字段（关键词/模式/排除词）必须跟随版本更新，
+        // 否则修好的默认词表对已安装用户永远不生效——真机实测：改了
+        // life.reminder-list 的关键词，设备上 11-18 的 routes.json 仍然 no-match。
+        // 只保留用户可调的 enabled 与 priority，其余用新版内置值。
+        val merged = loaded.map { local ->
+            val builtin = builtins[local.id] ?: return@map local
+            local.copy(
+                label = builtin.label,
+                category = builtin.category,
+                keywords = builtin.keywords,
+                allKeywords = builtin.allKeywords,
+                patterns = builtin.patterns,
+                exclude = builtin.exclude,
+                examples = builtin.examples,
+                confirm = builtin.confirm,
+            )
         }
-        return routes
+        val existing = merged.mapTo(hashSetOf()) { it.id }
+        return merged + all.filter { it.id !in existing }
     }
 }

@@ -27,11 +27,16 @@ object Dbg {
     private const val MAX_BYTES = 4L * 1024 * 1024
     private const val MAX_MSG = 2000
 
+    // P2：release 默认关闭文件日志（高频路径同步磁盘 IO + 敏感内容落盘风险）。
+    // 真机现场需要抓日志时由用户在设置里显式打开。
     @Volatile
-    var enabled = true
+    var enabled: Boolean = BuildConfig.DEBUG
 
     private val file: File?
         get() = runCatching { File(PilotApp.instance.filesDir, "pilot.log") }.getOrNull()
+
+    // SimpleDateFormat 非线程安全，复用实例必须串行格式化。
+    private val stamp = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
 
     fun i(tag: String, msg: String) = write('I', tag, msg)
 
@@ -49,10 +54,12 @@ object Dbg {
         }
         if (!enabled) return
         val f = file ?: return
-        runCatching {
-            if (f.length() > MAX_BYTES) f.delete()
-            val ts = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
-            f.appendText("$ts $level/$tag: $msg\n")
+        synchronized(stamp) {
+            runCatching {
+                if (f.length() > MAX_BYTES) f.delete()
+                val ts = stamp.format(Date())
+                f.appendText("$ts $level/$tag: $msg\n")
+            }
         }
     }
 

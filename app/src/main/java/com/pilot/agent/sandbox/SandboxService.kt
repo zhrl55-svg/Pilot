@@ -145,7 +145,9 @@ class SandboxService : Service() {
                 try {
                     for (i in 0 until n) {
                         try { callbacks.getBroadcastItem(i).onResult(jobId, b) }
-                        catch (_: RemoteException) { }
+                        catch (e: RemoteException) {
+                            Dbg.w(TAG, "job $jobId 结果回调失败：${e.message}")
+                        }
                     }
                 } finally {
                     callbacks.finishBroadcast()

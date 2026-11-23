@@ -71,7 +71,9 @@ android {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            signingConfig = signingConfigs.findByName("platform") ?: signingConfigs.getByName("debug")
+            // P1：缺失平台密钥时禁止静默回退 debug 签名——
+            // 否则 release 包拿不到 signature|privileged 权限且无任何报错。
+            signingConfigs.findByName("platform")?.let { signingConfig = it }
         }
     }
 
@@ -109,6 +111,17 @@ android {
         unitTests.isReturnDefaultValues = true
     }
 }
+
+// P1：只在真正打 release 包的执行期校验平台签名，不影响 debug 构建。
+tasks.matching { it.name.startsWith("assembleRelease") || it.name.startsWith("bundleRelease") }
+    .configureEach {
+        doFirst {
+            val ext = extensions.getByType<com.android.build.gradle.AppExtension>()
+            if (ext.signingConfigs.findByName("platform") == null) {
+                error("keystore/platform.jks 缺失：release 必须使用平台签名，禁止回退 debug")
+            }
+        }
+    }
 
 dependencies {
     implementation(files("libs/tailscale-bridge.aar"))

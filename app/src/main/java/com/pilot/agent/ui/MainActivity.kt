@@ -40,6 +40,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -57,6 +58,7 @@ import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -262,6 +264,7 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
                     ).show()
                 }
             },
+            onScheduledTasksOpen = { vm.openScheduledTasks() },
             onNavOpen = {
                 // 直接拉起导航界面（NavActivity 在 :navigation 进程）
                 runCatching {
@@ -446,6 +449,10 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
 
     if (vm.showMemoryList) {
         MemoryListDialog(vm, onDismiss = { vm.closeMemoryList() })
+    }
+
+    if (vm.showScheduledTasks) {
+        ScheduledTaskDialog(vm, onDismiss = { vm.closeScheduledTasks() })
     }
 
     // 二维码单独一层：不嵌在设置弹窗里，扫码时设置可以先关掉
@@ -773,6 +780,7 @@ private fun Header(
     onClearChat: () -> Unit,
     onTerminalOpen: () -> Unit,
     onBrowserOpen: () -> Unit,
+    onScheduledTasksOpen: () -> Unit,
     onNavOpen: () -> Unit,
 ) {
     val colors = MaterialTheme.colorScheme
@@ -812,6 +820,13 @@ private fun Header(
                         onClick = {
                             menuExpanded = false
                             onTerminalOpen()
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("定时任务") },
+                        onClick = {
+                            menuExpanded = false
+                            onScheduledTasksOpen()
                         },
                     )
                     DropdownMenuItem(

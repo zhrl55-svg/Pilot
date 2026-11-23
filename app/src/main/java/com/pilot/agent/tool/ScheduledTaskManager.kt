@@ -102,6 +102,70 @@ object ScheduledTaskManager {
             if (daily) "，之后每天同一时间执行。" else "执行。"
     }
 
+    // ── UI 用：结构化读写 ────────────────────────────────────────────
+
+    /** 列出全部任务（按触发时间升序）。UI 定时任务面板用。 */
+    fun allTasks(context: Context): List<Task> =
+        load(context).sortedBy { it.at }
+
+    /**
+     * 改时间 / 改内容 / 切换每日。改完立即重排闹钟。
+     * @return 成功返回新任务，失败返回 null（任务不存在）。
+     */
+    fun updateTask(
+        context: Context,
+        id: String,
+        goal: String = "",
+        at: Long = 0L,
+        daily: Boolean? = null,
+    ): Task? {
+        val tasks = load(context).toMutableList()
+        val index = tasks.indexOfFirst { it.id == id }
+        if (index < 0) return null
+        val old = tasks[index]
+        val next = old.copy(
+            goal = goal.trim().ifBlank { old.goal }.let { cleanGoal(it) },
+            at = if (at > 0L) at else old.at,
+            daily = daily ?: old.daily,
+        )
+        tasks[index] = next
+        cancelAlarm(context, old)
+        save(context, tasks)
+        schedule(context, next)
+        Dbg.i(TAG, "定时任务已更新：${next.goal} at=${next.at} daily=${next.daily}")
+        return next
+    }
+
+    /** 删除单条任务。@return 成功返回 true。 */
+    fun deleteTask(context: Context, id: String): Boolean {
+        val tasks = load(context)
+        val target = tasks.firstOrNull { it.id == id } ?: return false
+        cancelAlarm(context, target)
+        save(context, tasks.filterNot { it.id == id })
+        Dbg.i(TAG, "定时任务已删除：${target.goal}")
+        return true
+    }
+
+    /**
+     * 新建任务（UI 直接填表单）。
+     * @param at 触发时间（epoch 毫秒）
+     * @param daily true = 每天同一时间
+     */
+    fun createTask(context: Context, goal: String, at: Long, daily: Boolean): Task? {
+        val text = cleanGoal(goal)
+        if (text.isBlank()) return null
+        val task = Task(
+            id = "st_" + System.currentTimeMillis(),
+            goal = text,
+            at = at,
+            daily = daily,
+        )
+        save(context, load(context) + task)
+        schedule(context, task)
+        Dbg.i(TAG, "定时任务已创建：${task.goal} at=${task.at} daily=${task.daily}")
+        return task
+    }
+
     fun list(context: Context): String {
         val tasks = load(context).sortedBy { it.at }
         if (tasks.isEmpty()) return "现在没有定时任务。"
@@ -263,8 +327,14 @@ object ScheduledTaskManager {
     }
 
     private fun nextDailyAt(previous: Long, after: Long = previous): Long {
+        // P2：固定 +86400000ms 会在夏令时切换后漂移一小时（并且逐次累积）。
+        // 用本地日历按"日"递增，时分保持不变。
+        val cal = Calendar.getInstance(Locale.CHINA).apply { timeInMillis = previous }
         var value = previous
-        while (value <= after) value += 86_400_000L
+        while (value <= after) {
+            cal.add(Calendar.DAY_OF_YEAR, 1)
+            value = cal.timeInMillis
+        }
         return value
     }
 

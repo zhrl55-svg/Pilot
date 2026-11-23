@@ -579,7 +579,8 @@ class VoiceInput(
                 Dbg.i(TAG, "导航候选打断：$word（候选 $count 个）")
                 runCatching { onInterrupt(word) }
                 runCatching { VoiceState.write(context, VoiceState.IDLE, word) }
-            } else {
+            } else if (logThrottled("ordinal:$word", 10_000L)) {
+                // 序号词常驻词表（导航播报要能打断），无效命中很常见，日志限流避免刷屏
                 Dbg.i(TAG, "序号词「$word」当前无效（播报中=${AudioGate.isMuted} 候选=$count），忽略")
             }
             return
@@ -596,7 +597,7 @@ class VoiceInput(
         if (isInterruptWord && !isWakeWord) {
             if (speaking && st.interruptEnabled) {
                 tryInterrupt(word, isInterruptWord = true)
-            } else {
+            } else if (logThrottled("interrupt:$word", 3_000L)) {
                 Dbg.i(TAG, "打断词「$word」在非播报状态，忽略（不唤醒）")
             }
             return
@@ -613,6 +614,18 @@ class VoiceInput(
             return
         }
         onWakeHit(word)
+    }
+
+    /** 同一 key 在 [windowMs] 内只返回 true 一次，用于抑制重复命中日志刷屏。 */
+    private val logStamps = HashMap<String, Long>()
+    private fun logThrottled(key: String, windowMs: Long): Boolean {
+        val now = System.currentTimeMillis()
+        val last = logStamps[key]
+        if (last != null && now - last < windowMs) return false
+        logStamps[key] = now
+        // 词表有限，不会无限增长；顺手清掉过期项
+        if (logStamps.size > 64) logStamps.entries.removeAll { now - it.value > 60_000L }
+        return true
     }
 
     /** 「第二个」→ 2；不是序号词返回 null。 */

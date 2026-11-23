@@ -22,6 +22,7 @@ object QueryEngine {
         NotificationQueryTool(),
         trainTool,
         StockTool(),
+        WeatherTool(),
         NewsSearchTool(),
         NearbySearchTool(),
         WebSearchTool(),
