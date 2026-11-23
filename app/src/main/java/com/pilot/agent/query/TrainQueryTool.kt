@@ -126,10 +126,11 @@ class TrainQueryTool : QueryTool {
             }
 
             val queryResult = queryTickets(parsed, originStations, destinationStations)
-            val trains = queryResult.trains
-                .filter { it.matchesFilter(parsed.filter) }
+            val base = queryResult.trains
                 .filter { train -> parsed.timeRange?.contains(train.startTime) ?: true }
                 .filter { !parsed.availableOnly || it.hasAvailability }
+            fun pick(filter: Filter): List<Train> = base
+                .filter { it.matchesFilter(filter) }
                 .let { list ->
                     when (parsed.sort) {
                         SortMode.ARRIVAL -> list.sortedWith(compareBy({ it.arriveDate }, { it.arriveTime }))
@@ -139,6 +140,18 @@ class TrainQueryTool : QueryTool {
                     }
                 }
                 .distinctBy { "${it.code}|${it.fromStation}|${it.toStation}|${it.startTime}" }
+            // 高铁/城际筛选在普速线路上会直接筛空（例如兰州→张掖没有 G/C）。
+            // 用户要的是「查车票」，空结果不等于没有车：自动放宽为全部车次并说明。
+            var relaxedFrom: Filter? = null
+            var trains = pick(parsed.filter)
+            if (trains.isEmpty() && parsed.filter != Filter.NONE) {
+                val relaxed = pick(Filter.NONE)
+                if (relaxed.isNotEmpty()) {
+                    relaxedFrom = parsed.filter
+                    trains = relaxed
+                }
+            }
+
 
             if (trains.isEmpty()) {
                 synchronized(stateLock) { pending = null }
@@ -154,7 +167,7 @@ class TrainQueryTool : QueryTool {
             }
 
             synchronized(stateLock) { pending = null }
-            formatTrains(parsed, trains, trains.size)
+            formatTrains(parsed, trains, trains.size, relaxedFrom)
         } catch (failure: TrainQueryFailure) {
             Dbg.w(TAG, "12306 查询失败：${failure.reason}")
             "12306 暂时没查成：${failure.message}。查询条件已保留，可以回复“重试”。"
@@ -569,11 +582,20 @@ class TrainQueryTool : QueryTool {
         LocalDate.parse(raw, DATE_COMPACT).toString()
     }.getOrDefault(raw)
 
-    private fun formatTrains(request: TrainRequest, trains: List<Train>, total: Int): String = buildString {
+    private fun formatTrains(
+        request: TrainRequest,
+        trains: List<Train>,
+        total: Int,
+        relaxedFrom: Filter? = null,
+    ): String = buildString {
         append("12306 余票：").append(request.fromDisplay).append(" → ").append(request.toDisplay)
             .append("，").append(request.date).append('\n')
         append("查询时间：").append(queryTime())
-        if (request.filter != Filter.NONE) append("；筛选：").append(request.filter.label)
+        if (relaxedFrom != null) {
+            append("；该线路没有").append(relaxedFrom.label).append("，已放宽为全部车次")
+        } else if (request.filter != Filter.NONE) {
+            append("；筛选：").append(request.filter.label)
+        }
         request.timeRange?.let { append("；出发时间：").append(it.label) }
         append("；查到 ").append(total).append(" 趟")
         append('\n')

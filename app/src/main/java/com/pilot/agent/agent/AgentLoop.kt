@@ -229,7 +229,7 @@ class AgentLoop(
                 if (!explicitAgentExtension) {
                     val answer = com.pilot.agent.query.QueryEngine.handle(goal)
                     if (answer != null) {
-                        Dbg.i(TAG, "查询完成：${answer.take(60)}")
+                        Dbg.i(TAG, "查询完成：${answer.take(400)}")
                         emit(AgentEvent.Finished(answer))
                         return
                     }
