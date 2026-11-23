@@ -41,7 +41,7 @@ enum class FastPathOwner {
  */
 object DefaultOwners {
     /** 已经过真机影子对照、默认由快路径接管的能力。 */
-    private val PROMOTED = setOf(
+    val promoted: Set<String> = setOf(
         "device",
         "memory_get",
         "memory_write",
@@ -57,7 +57,7 @@ object DefaultOwners {
 
     val all: Map<String, FastPathOwner> =
         CapabilityRegistry.all.associate {
-            it.id to if (it.id in PROMOTED) FastPathOwner.ROUTE else FastPathOwner.LEGACY
+            it.id to if (it.id in promoted) FastPathOwner.ROUTE else FastPathOwner.LEGACY
         }
 
     /** 解析存储值；未知值按 LEGACY（宁可不动行为）。 */

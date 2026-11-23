@@ -2,6 +2,12 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- 触发入口专用权限：signature 级，只有同签名应用（含 :navigation 子进程）能调用。
+         调试包在 src/debug/AndroidManifest.xml 里移除该权限，保留 adb 调试入口。 -->
+    <permission
+        android:name="com.pilot.agent.permission.TRIGGER"
+        android:protectionLevel="signature" />
+
     <!-- ========== 普通权限：第三方 App 也能拿 ========== -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -30,6 +36,8 @@
     <!-- ========== 系统能力直调：音量 / 亮度 / 电话 / 联系人 ========== -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.CALL_PHONE" />
+    <!-- 电话是可选的（平板/无通话硬件设备也要能装），声明为非必需。 -->
+    <uses-feature android:name="android.hardware.telephony" android:required="false" />
     <uses-permission android:name="android.permission.READ_CONTACTS" />
     <!-- 调屏幕亮度；特殊权限，需要用户在系统设置里手动开启（会拉起授权页引导） -->
     <uses-permission android:name="android.permission.WRITE_SETTINGS"
@@ -195,6 +203,7 @@
             android:excludeFromRecents="true"
             android:exported="true"
             android:noHistory="true"
+            android:permission="com.pilot.agent.permission.TRIGGER"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
         <!-- Agent 的可见浏览器会话：保留 Cookie、登录状态和连续 DOM 操作。 -->
@@ -249,7 +258,8 @@
         <!-- 后台触发入口：语音、系统键、外部程序通过它唤起 agent，不需要 agent 自己的界面在前台 -->
         <receiver
             android:name=".service.RunReceiver"
-            android:exported="true">
+            android:exported="true"
+            android:permission="com.pilot.agent.permission.TRIGGER">
             <intent-filter>
                 <action android:name="com.pilot.agent.RUN" />
             </intent-filter>

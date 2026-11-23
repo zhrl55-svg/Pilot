@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  调试包专用：移除触发入口的 signature 权限，保留 `adb shell am start / am broadcast`
+  调试能力。release 包仍由 src/main/AndroidManifest.xml 的
+  com.pilot.agent.permission.TRIGGER 保护，第三方 App 无法触发。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <application>
+        <activity
+            android:name=".ui.TriggerActivity"
+            tools:remove="android:permission" />
+        <receiver
+            android:name=".service.RunReceiver"
+            tools:remove="android:permission" />
+    </application>
+</manifest>

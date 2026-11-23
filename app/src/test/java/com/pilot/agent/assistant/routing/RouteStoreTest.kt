@@ -119,4 +119,41 @@ class RouteStoreTest {
         target.importJson(json)
         assertEquals(FastPathOwner.ROUTE, target.ownerFor("volume"))
     }
+
+    @Test
+    fun `legacy owners are migrated to route once`() {
+        val dir = tempDir()
+        RouteStore(dir)
+        val file = java.io.File(dir, "routes.json")
+        val doc = org.json.JSONObject(file.readText())
+        doc.remove("ownersVersion")
+        val legacy = org.json.JSONObject()
+        CapabilityRegistry.all.forEach { legacy.put(it.id, "LEGACY") }
+        doc.put("owners", legacy)
+        file.writeText(doc.toString(2))
+
+        val reloaded = RouteStore(dir)
+        CapabilityRegistry.all.forEach { capability ->
+            assertEquals(
+                "旧版 LEGACY 归属应迁移为 ROUTE：${capability.id}",
+                FastPathOwner.ROUTE,
+                reloaded.ownerFor(capability.id),
+            )
+        }
+        assertTrue("迁移后应写回版本号", file.readText().contains("\"ownersVersion\": 1"))
+    }
+
+    @Test
+    fun `explicit shadow survives owners migration`() {
+        val dir = tempDir()
+        RouteStore(dir).setOwner("device", FastPathOwner.SHADOW)
+        val file = java.io.File(dir, "routes.json")
+        val doc = org.json.JSONObject(file.readText())
+        doc.remove("ownersVersion")
+        file.writeText(doc.toString(2))
+
+        val reloaded = RouteStore(dir)
+        assertEquals(FastPathOwner.SHADOW, reloaded.ownerFor("device"))
+        assertEquals(FastPathOwner.ROUTE, reloaded.ownerFor("file_write"))
+    }
 }

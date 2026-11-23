@@ -2,7 +2,9 @@ package com.pilot.agent.ui
 
 import android.app.Activity
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
+import android.os.Process
 import com.pilot.agent.Dbg
 import com.pilot.agent.runtime.AgentRuntime
 
@@ -46,6 +48,7 @@ class TriggerActivity : Activity() {
 
     private fun handle(intent: Intent?) {
         val i = intent ?: return
+        if (!isTrustedCaller()) return
 
         // 开始一次语音识别（导航界面点了麦克风）
         if (i.getBooleanExtra("start_voice", false)) {
@@ -179,5 +182,27 @@ class TriggerActivity : Activity() {
         }
         Dbg.i(TAG, "trigger run goal=$goal")
         loop.start(AgentRuntime.scope, goal, ui = false)
+    }
+
+    /**
+     * 纵深防御：manifest 已用 signature 权限挡住第三方，这里再校验一次调用方。
+     * 允许 root / shell / system / 自身 UID（:navigation 与本应用同 UID）。
+     */
+    private fun isTrustedCaller(): Boolean {
+        // getLaunchedFromUid 是 API 34 新增；低版本（本项目 minSdk 30，绝大多数设备）没有此方法，
+        // 直接调用会抛 NoSuchMethodError。低版本只能依赖 manifest 的 signature 权限挡第三方，
+        // 这里按「自身 UID」放行，把校验交给系统。
+        val caller = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            launchedFromUid
+        } else {
+            applicationInfo.uid
+        }
+        if (caller == Process.ROOT_UID || caller == Process.SHELL_UID ||
+            caller == Process.SYSTEM_UID || caller == applicationInfo.uid
+        ) {
+            return true
+        }
+        Dbg.w(TAG, "拒绝来自 uid=$caller 的触发请求")
+        return false
     }
 }

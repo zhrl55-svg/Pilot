@@ -97,6 +97,7 @@ class RouteStore internal constructor(
     fun exportJson(): String = JSONObject().apply {
         put("schemaVersion", SCHEMA_VERSION)
         put("defaultsVersion", DefaultRoutes.SEED_VERSION)
+        put("ownersVersion", OWNERS_VERSION)
         put("routes", JSONArray().also { arr -> _routes.value.forEach { arr.put(it.toJson()) } })
         put("owners", ownersJson(_owners.value))
     }.toString(2)
@@ -181,11 +182,15 @@ class RouteStore internal constructor(
                 runCatching { validate(route) }.isSuccess
             }.take(MAX_ROUTES)
             val seedVersion = doc.optInt("defaultsVersion", 0)
+            val ownersVersion = doc.optInt("ownersVersion", 0)
             val owners = doc.optJSONObject("owners")?.let { parseOwners(it) } ?: DefaultOwners.all
             val withNewDefaults = DefaultRoutes.migrate(valid, seedVersion).take(MAX_ROUTES)
             _routes.value = withNewDefaults
-            _owners.value = normalizeOwners(owners)
-            if (withNewDefaults.size != loaded.size || seedVersion < DefaultRoutes.SEED_VERSION) {
+            _owners.value = normalizeOwners(migrateOwners(owners, ownersVersion))
+            if (withNewDefaults.size != loaded.size ||
+                seedVersion < DefaultRoutes.SEED_VERSION ||
+                ownersVersion < OWNERS_VERSION
+            ) {
                 writeAll(withNewDefaults, DefaultRoutes.SEED_VERSION, force = true)
             }
         }
@@ -234,6 +239,26 @@ class RouteStore internal constructor(
             owners[capability] ?: fallback
         }
 
+    /**
+     * 旧版默认值是 LEGACY：这些设备升级后快路径会整体拒绝执行，而遗留匹配器
+     * 已不在主链路，等于能力全部停摆。这里按 ownersVersion 做一次性迁移：
+     * 已验证接管（[DefaultOwners.promoted]）的能力，若存储里还是 LEGACY，
+     * 提升为 ROUTE；SHADOW/ROUTE 与用户显式值保持不变。
+     */
+    private fun migrateOwners(
+        owners: Map<String, FastPathOwner>,
+        fromVersion: Int,
+    ): Map<String, FastPathOwner> {
+        if (fromVersion >= OWNERS_VERSION) return owners
+        return owners.mapValues { (capability, owner) ->
+            if (owner == FastPathOwner.LEGACY && capability in DefaultOwners.promoted) {
+                FastPathOwner.ROUTE
+            } else {
+                owner
+            }
+        }
+    }
+
     private fun ownersJson(owners: Map<String, FastPathOwner>): JSONObject = JSONObject().apply {
         normalizeOwners(owners).forEach { (capability, owner) -> put(capability, owner.name) }
     }
@@ -249,6 +274,7 @@ class RouteStore internal constructor(
         val doc = JSONObject().apply {
             put("schemaVersion", SCHEMA_VERSION)
             put("defaultsVersion", seedVersion)
+            put("ownersVersion", OWNERS_VERSION)
             put("routes", JSONArray().also { arr -> routes.forEach { arr.put(it.toJson()) } })
             put("owners", ownersJson(owners))
         }
@@ -278,6 +304,8 @@ class RouteStore internal constructor(
 
     companion object {
         const val SCHEMA_VERSION = 2
+        /** owners 迁移版本：旧版 routes.json 没有该字段，读出 0 时触发一次升级。 */
+        const val OWNERS_VERSION = 1
         const val MAX_ROUTES = 200
         const val MAX_KEYWORDS = 20
         const val MAX_PATTERNS = 20
