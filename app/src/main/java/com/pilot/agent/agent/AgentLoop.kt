@@ -84,6 +84,7 @@ class AgentLoop(
         goal: String,
         ui: Boolean = true,
         executionMode: AssistantMode? = null,
+        chatHistory: List<Pair<String, String>> = emptyList(),
     ) {
         if (goal.isBlank()) return
         // 新任务顶掉旧任务：旧任务可能正卡在等用户确认，不顶掉的话后面所有请求都会被 isRunning 挡回去
@@ -97,7 +98,7 @@ class AgentLoop(
         // 循环里的 job?.isActive 读到的是上一轮的旧 Job，直接判定"已取消"静默退出。
         val newJob = scope.launch(start = CoroutineStart.LAZY) {
             try {
-                run(goal.trim(), executionMode, myToken)
+                run(goal.trim(), executionMode, myToken, chatHistory)
             } catch (t: Throwable) {
                 if (t is kotlinx.coroutines.CancellationException) throw t
                 Dbg.e(TAG, "run failed: ${t.message}", t)
@@ -129,7 +130,12 @@ class AgentLoop(
         pendingConfirms.remove(requestId)?.complete(approved)
     }
 
-    private suspend fun run(goal: String, executionMode: AssistantMode?, token: Long) {
+    private suspend fun run(
+        goal: String,
+        executionMode: AssistantMode?,
+        token: Long,
+        chatHistory: List<Pair<String, String>> = emptyList(),
+    ) {
         val configured = settingsProvider()
         val settings = if (executionMode != null) configured.copy(mode = executionMode) else configured
         Dbg.i(
@@ -147,7 +153,7 @@ class AgentLoop(
             ?.takeIf { it.isNotEmpty() && it != self }
         landedPkg = null
         try {
-            runInner(goal, settings)
+            runInner(goal, settings, chatHistory)
         } finally {
             // P1：被新任务抢占后，旧任务不得再归位——否则会把前台从新任务
             // 正在操作的 App 拽回旧任务记忆中的 App。
@@ -175,7 +181,11 @@ class AgentLoop(
         runCatching { actions.openApp(originPkg) }
     }
 
-    private suspend fun runInner(goal: String, settings: AgentSettings) {
+    private suspend fun runInner(
+        goal: String,
+        settings: AgentSettings,
+        chatHistory: List<Pair<String, String>> = emptyList(),
+    ) {
 
         if (com.pilot.agent.action.CalendarTool.handles(goal)) {
             emit(AgentEvent.Finished(com.pilot.agent.action.CalendarTool.create(
@@ -288,7 +298,11 @@ class AgentLoop(
             Dbg.i(TAG, "step=$step captured pkg=${snap.pkg} nodes=${snap.nodes.size} truncated=${snap.truncated}")
 
             val request = AgentRequest(
-                goal = goal, history = history, snapshot = snap, stepIndex = step - 1
+                goal = goal,
+                history = history,
+                snapshot = snap,
+                stepIndex = step - 1,
+                chatHistory = chatHistory,
             )
             // 按成本从低到高逐级尝试：规则 → 端侧小模型 → 云端。
             // 某个规划器抛异常（没配 key、模型没装）就跳到下一个，不打断整个任务。

@@ -22,8 +22,8 @@ object ChatSessionStore {
     /** 最多保留的会话数；再多就淘汰最旧的。 */
     private const val MAX_SESSIONS = 20
 
-    /** 单会话最多回放的聊天条数（内存里的日志上限是 200）。 */
-    private const val MAX_MESSAGES = 100
+    /** 单会话最多回放的聊天条数（与 VM 内存日志上限 200 对齐，避免重启后可见条数缩水）。 */
+    private const val MAX_MESSAGES = 200
 
     /** 单会话最多保留的上下文问答轮数（与 VM 的 chatHistory 上限一致）。 */
     private const val MAX_HISTORY = 40
@@ -83,6 +83,8 @@ object ChatSessionStore {
             }.sortedByDescending { it.updatedAt }
         }.getOrElse {
             Dbg.w(TAG, "读取会话失败：${it.message}")
+            // 备份原文，避免下一次保存把损坏数据覆盖后就彻底找不回。
+            runCatching { SecretVault.put(KEY + "_corrupt", raw) }
             emptyList()
         }
     }
@@ -94,6 +96,7 @@ object ChatSessionStore {
             sessions.sortedByDescending { it.updatedAt }.take(MAX_SESSIONS).forEach { s ->
                 array.put(
                     JSONObject().apply {
+                        put("schemaVersion", 1)
                         put("id", s.id)
                         put("title", s.title.take(80))
                         put("createdAt", s.createdAt)

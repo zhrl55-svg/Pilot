@@ -1591,7 +1591,12 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         publishNotificationStatus()
         justSent = true
         progress = 0 to settings.maxTurns
-        AgentRuntime.loop?.start(AgentRuntime.scope, g, executionMode = effectiveMode)
+        AgentRuntime.loop?.start(
+            AgentRuntime.scope,
+            g,
+            executionMode = effectiveMode,
+            chatHistory = chatHistory.toList(),
+        )
     }
 
     private fun openAccessibilitySettings() {

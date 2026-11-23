@@ -58,6 +58,7 @@ class CloudPlanner(private val settingsProvider: () -> AgentSettings) : Planner 
 
     private fun call(s: AgentSettings, req: AgentRequest, retryHint: String?): String {
         val history = req.history.takeLast(8)
+        val chatTurns = req.chatHistory.takeLast(3)
         val memory = com.pilot.agent.runtime.AgentRuntime.localTools.memory
             .promptContext(req.goal, 5)
         val now = java.text.SimpleDateFormat(
@@ -66,6 +67,13 @@ class CloudPlanner(private val settingsProvider: () -> AgentSettings) : Planner 
         ).format(java.util.Date())
         val userText = buildString {
             append("用户目标: ").append(req.goal).append('\n')
+            if (chatTurns.isNotEmpty()) {
+                append("最近对话（只用于理解指代，不要重复执行已完成的事）:\n")
+                chatTurns.forEach { (q, a) ->
+                    append("用户: ").append(q.take(200)).append('\n')
+                    append("助手: ").append(a.take(300)).append('\n')
+                }
+            }
             append("当前时间: ").append(now).append('\n')
             if (memory.isNotBlank()) {
                 append("相关长期记忆:\n").append(memory).append('\n')
