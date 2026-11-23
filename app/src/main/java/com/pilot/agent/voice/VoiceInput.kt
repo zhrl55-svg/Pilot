@@ -795,6 +795,26 @@ class VoiceInput(
             try {
                 val ms = pcm.size * 1000 / AudioCapture.SAMPLE_RATE
                 Dbg.i(TAG, "识别 ${ms}ms 音频")
+                // P2：会话内逐句验声纹。唤醒只证明「喊醒的是主人」，这一轮里
+                // 后面每句可能是另一个人说的。模型不可用 / 音频不足 0.6s 时放行，
+                // 与 VoiceprintGate「宁可放过，不可错杀」的定位一致。
+                if (wakeAuthorized) {
+                    val s = AgentSettings.load()
+                    if (s.requireVoiceprint && gate.hasTemplate()) {
+                        val score = gate.verify(pcm)
+                        if (score == null) {
+                            Dbg.i(TAG, "逐句声纹不可用（${gate.lastError ?: "音频不足"}），放行")
+                        } else if (score < s.voiceprintThreshold) {
+                            Dbg.i(
+                                TAG,
+                                "逐句声纹 ${"%.2f".format(score)} 阈值 ${s.voiceprintThreshold} → 拒绝，忽略这句",
+                            )
+                            return@execute
+                        } else {
+                            Dbg.i(TAG, "逐句声纹 ${"%.2f".format(score)} → 通过")
+                        }
+                    }
+                }
                 val text = asr.transcribe(pcm)
                 val authorized = wakeAuthorized
                 // ★ 首句注册：还没有模板时，**任何一句被识别的话**都拿来注册。
