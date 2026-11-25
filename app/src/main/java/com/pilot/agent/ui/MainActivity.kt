@@ -323,6 +323,11 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
                     })
                 },
         ) {
+            // ★ 滚动兜底：列表一开始滚动就收掉文字选择，
+            //   避免慢速滑动漏判成长按后选中内容、菜单跟着列表滚（用户反馈）。
+            LaunchedEffect(listState.isScrollInProgress) {
+                if (listState.isScrollInProgress) selectingEntryId = null
+            }
             if (vm.chatLogs.isEmpty()) {
                 EmptyHint()
             } else {
@@ -1543,7 +1548,13 @@ private fun LogRow(
                     }
                     onSelectionChange(true)
                 } else {
-                    // 单击 / 长按（靠超时唤醒，按住不动不会有新事件）
+                    // ★ 先区分「滑动」和「点击/长按」：按住期间移动超过 touchSlop，
+                    //   说明用户在上下滑列表，直接放弃本行手势且不消费事件。
+                    //   旧实现只等 450ms，慢速滑动（按住超过 450ms）会被误判成长按，
+                    //   于是选中文字弹出复制菜单，同时吃掉 MOVE 让列表滚不动。
+                    val slop = viewConfiguration.touchSlop
+                    val downPos = downRaw.position
+                    var moved = false
                     val tapped = withTimeoutOrNull(450L) {
                         while (true) {
                             val ev = awaitPointerEvent()
@@ -1553,10 +1564,18 @@ private fun LogRow(
                                 if (selStart != null) ev.changes.forEach { it.consume() }
                                 break
                             }
+                            if ((ev.changes.firstOrNull { it.id == downRaw.id }?.position?.minus(downPos))?.getDistance()
+                                    ?.let { it > slop } == true
+                            ) {
+                                moved = true
+                                break
+                            }
                         }
                         true
                     }
-                    if (tapped != null) {
+                    if (moved) {
+                        // 滚动：事件未被消费，交给父级 LazyColumn 处理（选择态由滚动监听收掉）
+                    } else if (tapped != null) {
                         if (selStart != null) {
                             val c = chunkBoundsAt(down)
                             if (c != null) { selStart = c.first; selEnd = c.last; anchorChar = c.first }
