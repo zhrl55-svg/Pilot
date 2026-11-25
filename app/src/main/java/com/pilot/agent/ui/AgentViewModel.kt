@@ -1637,9 +1637,9 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
      * - 任务在跑 → 中止；
      * - 两个都在发生 → 两个都停。
      */
-    /** 预听音色（不改变当前设置）。 */
-    fun previewVoice(engine: String, voiceId: String) {
-        AgentRuntime.speaker.previewVoice(engine, voiceId)
+    /** 预听音色（不改变当前设置）；[rate] 传设置页滑杆当前值，未保存也生效。 */
+    fun previewVoice(engine: String, voiceId: String, rate: Float? = null) {
+        AgentRuntime.speaker.previewVoice(engine, voiceId, rate = rate)
         add(LogEntry.Kind.OBSERVE, "正在试听该音色…")
     }
 

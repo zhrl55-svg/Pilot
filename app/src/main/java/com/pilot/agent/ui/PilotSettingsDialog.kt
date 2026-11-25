@@ -42,13 +42,16 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -81,6 +84,7 @@ import androidx.compose.ui.window.DialogProperties
 import com.pilot.agent.agent.AgentSettings
 import com.pilot.agent.tool.ToolGroup
 import com.pilot.agent.tool.ToolPolicy
+import com.pilot.agent.voice.OnDeviceModelManager
 import kotlinx.coroutines.delay
 
 private val SettingsBlack = Color(0xFF000000)
@@ -146,7 +150,19 @@ private enum class SettingsPage(
         "容器挂载、资源回收和已学技能",
         Color(0xFF55B9E8),
     ),
+    ONDEVICE(
+        SettingsGlyph.DATABASE,
+        "",
+        "端侧模型",
+        "语音识别与快路径小模型的下载、校验和删除",
+        Color(0xFFB58CFF),
+    ),
 }
+
+/** 语速按 0.05 一档量化，避免滑杆产生 1.0499999 这类值。 */
+private fun quantizeTtsRate(value: Float): Float =
+    (kotlin.math.round(value / AgentSettings.TTS_RATE_STEP) * AgentSettings.TTS_RATE_STEP)
+        .coerceIn(AgentSettings.MIN_TTS_RATE, AgentSettings.MAX_TTS_RATE)
 
 private class SettingsDraft(initial: AgentSettings) {
     var baseUrl by mutableStateOf(initial.baseUrl)
@@ -173,6 +189,7 @@ private class SettingsDraft(initial: AgentSettings) {
     var ttsEngine by mutableStateOf(initial.ttsEngine)
     var ttsVoiceId by mutableStateOf(initial.ttsVoiceId)
     var systemVoice by mutableStateOf(initial.systemTtsVoice)
+    var ttsRate by mutableStateOf(initial.ttsRate)
 
     var musicPolicy by mutableStateOf(initial.musicPolicy)
     var musicBaseUrl by mutableStateOf(initial.musicBaseUrl)
@@ -208,6 +225,10 @@ private class SettingsDraft(initial: AgentSettings) {
         ttsEngine = ttsEngine,
         ttsVoiceId = ttsVoiceId,
         systemTtsVoice = systemVoice,
+        ttsRate = ttsRate.coerceIn(
+            AgentSettings.MIN_TTS_RATE,
+            AgentSettings.MAX_TTS_RATE,
+        ),
         musicPolicy = musicPolicy,
         musicBaseUrl = musicBaseUrl.trim().trimEnd('/'),
         musicFallbackUrl = musicFallbackUrl.trim().trimEnd('/'),
@@ -441,6 +462,10 @@ private fun SettingsHome(
         vm.allFilesAccess,
     ).count { it }
 
+    val context = LocalContext.current
+    val modelStates by OnDeviceModelManager.states.collectAsState()
+    LaunchedEffect(Unit) { OnDeviceModelManager.refreshAsync(context) }
+
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         state = listState,
@@ -503,6 +528,21 @@ private fun SettingsHome(
                 status = "${vm.sandboxMounts().size} 个目录挂载 · ${vm.skillCount} 条技能",
                 statusActive = true,
                 onClick = { onOpen(SettingsPage.SANDBOX) },
+            )
+        }
+        item {
+            val asr = modelStates[OnDeviceModelManager.ASR_SENSEVOICE]
+            val llm = modelStates[OnDeviceModelManager.FAST_LLM]
+            val installed = listOf(asr, llm).count { it?.installed == true }
+            SettingsCategoryCard(
+                page = SettingsPage.ONDEVICE,
+                status = when {
+                    installed == 2 -> "语音识别与小模型均已安装"
+                    installed == 1 -> "已安装 $installed/2，可补齐离线能力"
+                    else -> "未下载 · 端侧能力暂不可用"
+                },
+                statusActive = installed > 0,
+                onClick = { onOpen(SettingsPage.ONDEVICE) },
             )
         }
 
@@ -793,6 +833,128 @@ private fun SettingsPageContent(
             onToolPolicyChange,
         )
         SettingsPage.SANDBOX -> SandboxSettingsPage(vm, draft)
+        SettingsPage.ONDEVICE -> OnDeviceSettingsPage()
+    }
+}
+
+@Composable
+private fun OnDeviceSettingsPage() {
+    val context = LocalContext.current
+    val states by OnDeviceModelManager.states.collectAsState()
+    LaunchedEffect(Unit) { OnDeviceModelManager.refreshAsync(context) }
+
+    SettingsPageList {
+        item {
+            SettingsSectionCard(
+                title = "端侧模型",
+                description = "模型不进安装包：语音识别约 228 MB，快路径小模型约 166 MB。" +
+                    "下载可暂停，回来点「继续下载」会从断点续传；大小与 SHA-256 校验通过后才生效。",
+            ) {
+                for (spec in OnDeviceModelManager.specs) {
+                    val state = states[spec.key]
+                        ?: OnDeviceModelManager.ModelState(totalBytes = spec.totalBytes)
+                    OnDeviceModelRow(spec, state)
+                }
+            }
+        }
+        item {
+            SettingsSectionCard(
+                title = "离线部署",
+                description = "也可以用数据线推：把文件放到 " +
+                    "/sdcard/Android/data/com.pilot.agent/files/models/<目录>/，" +
+                    "App 启动时会自动搬进私有目录，与这里下载的结果等价。",
+            ) {
+                InfoLine("语音识别目录：models/asr-sensevoice")
+                InfoLine("快路径小模型目录：models/mnn-llm-0.3b")
+            }
+        }
+    }
+}
+
+@Composable
+private fun OnDeviceModelRow(
+    spec: OnDeviceModelManager.ModelSpec,
+    state: OnDeviceModelManager.ModelState,
+) {
+    val context = LocalContext.current
+    var confirmDelete by remember { mutableStateOf(false) }
+    val title = when (spec.key) {
+        OnDeviceModelManager.ASR_SENSEVOICE -> "语音识别 · SenseVoice Small"
+        else -> "快路径小模型 · Pocket 0.3B"
+    }
+    fun mb(bytes: Long): String =
+        String.format(java.util.Locale.US, "%.1f MB", bytes / 1024f / 1024f)
+
+    val status = when {
+        state.installed -> "已安装 · ${mb(spec.totalBytes)}"
+        state.isBusy -> "${mb(state.bytesDone)} / ${mb(state.totalBytes)}"
+        state.phase == OnDeviceModelManager.Phase.FAILED ->
+            "下载失败：${state.error ?: "未知错误"}（已下载部分会保留）"
+        state.partialBytes > 0 -> "已下载 ${mb(state.partialBytes)}，可继续"
+        else -> "未下载 · ${mb(spec.totalBytes)}"
+    }
+
+    Text(title, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+    Text(status, fontSize = 10.sp, color = SettingsMuted, lineHeight = 14.sp)
+    if (state.isBusy) {
+        LinearProgressIndicator(
+            progress = {
+                if (state.totalBytes > 0) {
+                    (state.bytesDone.toFloat() / state.totalBytes).coerceIn(0f, 1f)
+                } else {
+                    0f
+                }
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(4.dp),
+        )
+    }
+    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        when {
+            state.isBusy -> TextButton(onClick = { OnDeviceModelManager.cancel(spec.key) }) {
+                Text("暂停", fontSize = 11.sp)
+            }
+            state.installed -> TextButton(
+                onClick = { confirmDelete = true },
+            ) {
+                Text("删除", fontSize = 11.sp)
+            }
+            else -> TextButton(
+                onClick = { OnDeviceModelManager.install(context, spec.key) },
+            ) {
+                Text(
+                    if (state.partialBytes > 0) "继续下载" else "下载",
+                    fontSize = 11.sp,
+                )
+            }
+        }
+    }
+
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("删除端侧模型") },
+            text = {
+                Text(
+                    "将释放 ${mb(spec.totalBytes)} 空间，删除后该项能力暂不可用，" +
+                        "随时可以重新下载。",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        confirmDelete = false
+                        OnDeviceModelManager.delete(context, spec.key)
+                    },
+                ) {
+                    Text("删除")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDelete = false }) { Text("取消") }
+            },
+        )
     }
 }
 
@@ -895,7 +1057,7 @@ private fun VoiceSettingsPage(vm: AgentViewModel, draft: SettingsDraft) {
                             it.id to it.label
                         },
                         onSelect = { draft.ttsVoiceId = it },
-                        onPreview = { vm.previewVoice(AgentSettings.TTS_MINIMAX, it) },
+                        onPreview = { vm.previewVoice(AgentSettings.TTS_MINIMAX, it, draft.ttsRate) },
                     )
                     AgentSettings.TTS_SYSTEM -> DropdownSetting(
                         label = "系统音色",
@@ -912,9 +1074,35 @@ private fun VoiceSettingsPage(vm: AgentViewModel, draft: SettingsDraft) {
                         },
                         onPreview = { id ->
                             if (id.isNotBlank()) {
-                                vm.previewVoice(AgentSettings.TTS_SYSTEM, id)
+                                vm.previewVoice(AgentSettings.TTS_SYSTEM, id, draft.ttsRate)
                             }
                         },
+                    )
+                }
+                if (draft.ttsEngine != AgentSettings.TTS_OFF) {
+                    Text("播报语速", fontSize = 10.sp, color = SettingsMuted)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Slider(
+                            value = draft.ttsRate,
+                            onValueChange = { draft.ttsRate = quantizeTtsRate(it) },
+                            valueRange = AgentSettings.MIN_TTS_RATE..AgentSettings.MAX_TTS_RATE,
+                            // 0.05 一档：(2.0 - 0.5) / 0.05 - 1 = 29 个中间点
+                            steps = 29,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            String.format(java.util.Locale.US, "%.2f×", draft.ttsRate),
+                            fontSize = 12.sp,
+                            color = SettingsMuted,
+                        )
+                    }
+                    Text(
+                        "系统 TTS 与 MiniMax 共用；试听和正式播报都按这个速度。",
+                        fontSize = 10.sp,
+                        color = SettingsMuted,
                     )
                 }
                 Text("播报时音乐", fontSize = 10.sp, color = SettingsMuted)

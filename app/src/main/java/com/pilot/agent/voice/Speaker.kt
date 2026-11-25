@@ -256,16 +256,21 @@ class Speaker(context: Context) {
      * @param engine TTS_MINIMAX / TTS_SYSTEM
      * @param voiceId MiniMax 是 voice_id；系统 TTS 是 Voice.name
      */
-    fun previewVoice(engine: String, voiceId: String, sample: String = "你好，我是小派，这是音色的效果试听。") {
+    fun previewVoice(
+        engine: String,
+        voiceId: String,
+        sample: String = "你好，我是小派，这是音色的效果试听。",
+        rate: Float? = null,
+    ) {
         runCatching {
             when (engine) {
                 com.pilot.agent.agent.AgentSettings.TTS_MINIMAX -> {
                     val m = minimax ?: MiniMaxTts(appContext).also { minimax = it }
-                    m.preview(sample, voiceId) {}
+                    m.preview(sample, voiceId, rate = rate) {}
                 }
                 com.pilot.agent.agent.AgentSettings.TTS_SYSTEM -> {
                     val t = system ?: SystemTts(appContext).also { system = it }
-                    t.preview(sample, voiceId)
+                    t.preview(sample, voiceId, rate)
                 }
             }
         }.onFailure { Dbg.w(TAG, "预听失败 ${it.message}") }

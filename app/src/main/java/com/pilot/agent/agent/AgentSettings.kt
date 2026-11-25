@@ -45,6 +45,13 @@ data class AgentSettings(
      * 空 = 用引擎默认音色。
      */
     val systemTtsVoice: String = "",
+    /**
+     * 播报语速：0.5～2.0，1.0 = 正常。
+     *
+     * 系统 TTS 与 MiniMax 共用同一个值 —— 用户选哪个引擎，听感的速度应该一致。
+     * 存成 Float（而不是档位字符串），设置页用滑杆连续调节；试听和正式播报都走这里。
+     */
+    val ttsRate: Float = DEFAULT_TTS_RATE,
     val ttsModel: String = "speech-02-hd",
     // ---------- 语音唤醒与声纹 ----------
     /** 待命模式：开着就一直听唤醒词（默认开：进 App 就开麦），命中后自动进入聆听 */
@@ -117,6 +124,23 @@ data class AgentSettings(
         const val TTS_MINIMAX = "minimax"
         const val TTS_OFF = "off"
 
+        /** 播报语速范围与默认值（系统 TTS 与 MiniMax 都接受 0.5～2.0）。 */
+        const val MIN_TTS_RATE = 0.5f
+        const val MAX_TTS_RATE = 2.0f
+        const val DEFAULT_TTS_RATE = 1.0f
+        /** 滑杆步进：0.05 一档，避免浮点抖动。 */
+        const val TTS_RATE_STEP = 0.05f
+
+        /**
+         * 轻量读取播报语速。
+         *
+         * 播报路径（SystemTts）每句都要用，不能走 [load]：那会经 SecretVault
+         * 做 Keystore 解密并装载全部字段，放在每次 speak 前是白付的代价。
+         */
+        fun ttsRate(): Float =
+            PilotApp.prefs.getFloat(K_TTS_RATE, DEFAULT_TTS_RATE)
+                .coerceIn(MIN_TTS_RATE, MAX_TTS_RATE)
+
         /** 播报时音乐降音量（不断歌） */
         const val MUSIC_DUCK = "duck"
         /** 播报时直接停掉音乐 */
@@ -145,6 +169,7 @@ data class AgentSettings(
         private const val K_CHAT_CONTEXT = "chat_context_turns"
         private const val K_TTS_VOICE = "tts_voice_id"
         private const val K_SYS_TTS_VOICE = "system_tts_voice"
+        private const val K_TTS_RATE = "tts_rate"
         private const val K_TTS_MODEL = "tts_model"
         private const val K_WAKE_ENABLED = "wake_enabled"
         private const val K_WAKE_WORDS = "wake_words"
@@ -203,6 +228,8 @@ data class AgentSettings(
                 chatContextTurns = p.getInt(K_CHAT_CONTEXT, 4),
                 ttsVoiceId = p.getString(K_TTS_VOICE, null) ?: "male-qn-qingse",
                 systemTtsVoice = p.getString(K_SYS_TTS_VOICE, null) ?: "",
+                ttsRate = p.getFloat(K_TTS_RATE, DEFAULT_TTS_RATE)
+                    .coerceIn(MIN_TTS_RATE, MAX_TTS_RATE),
                 ttsModel = p.getString(K_TTS_MODEL, null) ?: "speech-02-hd",
                 wakeEnabled = p.getBoolean(K_WAKE_ENABLED, true),
                 wakeWords = p.getString(K_WAKE_WORDS, null) ?: DEFAULT_WAKE_WORDS,
@@ -248,6 +275,7 @@ data class AgentSettings(
                 .putInt(K_CHAT_CONTEXT, s.chatContextTurns)
                 .putString(K_TTS_VOICE, s.ttsVoiceId)
                 .putString(K_SYS_TTS_VOICE, s.systemTtsVoice)
+                .putFloat(K_TTS_RATE, s.ttsRate.coerceIn(MIN_TTS_RATE, MAX_TTS_RATE))
                 .putString(K_TTS_MODEL, s.ttsModel)
                 .putBoolean(K_WAKE_ENABLED, s.wakeEnabled)
                 .putString(K_WAKE_WORDS, s.wakeWords)

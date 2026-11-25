@@ -89,9 +89,11 @@ class SystemTts(context: Context) : SpeechOutput {
                             Dbg.w(TAG, lastError!!)
                         }
                     }
-                    tts?.setSpeechRate(1.0f)
+                    // 语速与音色都来自设置；设置页改完不用重启 App，下一次播报生效。
+                    val s = AgentSettings.load()
+                    tts?.setSpeechRate(s.ttsRate)
                     // 应用用户选择的音色（可能为空 = 默认）
-                    applyVoice(AgentSettings.load().systemTtsVoice)
+                    applyVoice(s.systemTtsVoice)
                     tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                         override fun onStart(utteranceId: String?) = Unit
                         override fun onDone(utteranceId: String?) {
@@ -168,14 +170,17 @@ class SystemTts(context: Context) : SpeechOutput {
      * 用指定音色播一段样音（预听），播完切回原来的音色。
      *
      * 系统的 setVoice 是全局的，所以要先记住原音色。
+     * [rate] 是设置页滑杆的**当前值**（可能还没保存），为空才回退到已保存值 ——
+     * 否则拖完滑杆点试听，听到的还是旧速度。
      */
-    fun preview(text: String, voiceName: String) {
+    fun preview(text: String, voiceName: String, rate: Float? = null) {
         val t = tts ?: return
         if (voiceName.isBlank()) return
         val original = runCatching { t.voice?.name }.getOrNull()
         runCatching {
             val v = t.voices?.firstOrNull { it.name == voiceName } ?: return
             if (t.setVoice(v) != TextToSpeech.SUCCESS) return
+            t.setSpeechRate(rate ?: AgentSettings.ttsRate())
             t.speak(text, TextToSpeech.QUEUE_FLUSH, null, "preview_${System.currentTimeMillis()}")
             // 播完切回
             main.postDelayed({
@@ -228,6 +233,8 @@ class SystemTts(context: Context) : SpeechOutput {
             val id = "pilot_${++seq}"
             doneCallbacks[id] = onDone
             main.post {
+                // 设置页可能刚改过语速：每次播报前同步一次（只读一个 Float）。
+                tts?.setSpeechRate(AgentSettings.ttsRate())
                 val params = Bundle()
                 val r = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, id)
                 if (r != TextToSpeech.SUCCESS) {

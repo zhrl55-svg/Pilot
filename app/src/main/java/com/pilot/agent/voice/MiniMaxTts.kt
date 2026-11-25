@@ -174,9 +174,12 @@ class MiniMaxTts(private val context: Context) : SpeechOutput {
 
     /**
      * 用**指定音色**合成一段话（预听用），不改变当前设置。
+     *
+     * [rate] 是设置页滑杆的当前值（可能还没保存），为空才用已保存的语速。
      */
-    fun preview(text: String, voiceId: String, onDone: () -> Unit) {
-        val s = AgentSettings.load()
+    fun preview(text: String, voiceId: String, rate: Float? = null, onDone: () -> Unit) {
+        val stored = AgentSettings.load()
+        val s = if (rate != null) stored.copy(ttsRate = rate) else stored
         if (s.apiKey.isBlank()) {
             Dbg.w(TAG, "预览失败：没有 API Key")
             onDone()
@@ -204,7 +207,7 @@ class MiniMaxTts(private val context: Context) : SpeechOutput {
                 "voice_setting",
                 JSONObject()
                     .put("voice_id", voiceOverride ?: s.ttsVoiceId)
-                    .put("speed", 1.0)
+                    .put("speed", s.ttsRate.toDouble().coerceIn(0.5, 2.0))
                     .put("vol", 1.0)
                     .put("pitch", 0)
             )
