@@ -552,6 +552,7 @@ class VoiceInput(
             SystemClock.uptimeMillis() - AudioGate.lastReleaseAt < ECHO_GUARD_MS
         if (AudioGate.isMuted || echoGuard) {
             vad?.reset()
+            vad?.resetNoiseFloor()
         } else if (mode == Mode.LISTEN || mode == Mode.ACTIVE) {
             vad?.feed(frame, len)
         }

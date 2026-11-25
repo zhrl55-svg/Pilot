@@ -40,6 +40,11 @@ class EnergyVad(
     }
 
     @Synchronized
+    fun resetNoiseFloor() {
+        noiseFloor = 120.0
+    }
+
+    @Synchronized
     fun feed(frame: ShortArray, len: Int) {
         val rms = rms(frame, len)
 
