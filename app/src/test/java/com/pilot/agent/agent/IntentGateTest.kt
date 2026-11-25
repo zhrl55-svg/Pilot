@@ -38,6 +38,18 @@ class IntentGateTest {
         assertEquals(IntentGate.Kind.TASK, IntentGate.classify("叫我起床"))
     }
 
+    // Test scenario: 句子里提到「系统设置」但没有打开动作，是在核对/提问，
+    // 不能因为 TASK_VERBS 里裸的「设置」就判成任务（真机会去打开设置页）。
+    @Test
+    fun `settings mentions without an open verb are chat`() {
+        assertEquals(IntentGate.Kind.CHAT, IntentGate.classify("你测试一下系统设置执行生效了没有"))
+        assertEquals(IntentGate.Kind.CHAT, IntentGate.classify("系统设置里有这个选项吗"))
+        assertEquals(IntentGate.Kind.CHAT, IntentGate.classify("设置页那个开关是什么意思"))
+        // 带打开动作的仍然是任务
+        assertEquals(IntentGate.Kind.TASK, IntentGate.classify("打开系统设置"))
+        assertEquals(IntentGate.Kind.TASK, IntentGate.classify("进入设置页"))
+    }
+
     // Test scenario: 资讯/行情类问题判为查询，走数据源而不是动手。
     @Test
     fun `information requests are queries`() {

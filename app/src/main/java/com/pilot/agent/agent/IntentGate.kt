@@ -200,6 +200,11 @@ object IntentGate {
         if (LIVE_INFO_HINTS.any(t::contains) && DEVICE_ACTION_HINTS.none(t::contains)) return Kind.QUERY
         if (t.contains("https://", ignoreCase = true) && listOf("网页", "链接", "文章", "总结", "阅读", "读一下", "浏览").any(t::contains)) return Kind.QUERY
         if (WEB_SEARCH_HINTS.any(t::contains) && DEVICE_ACTION_HINTS.none(t::contains)) return Kind.QUERY
+        // 「系统设置执行生效了没有」「系统设置里有这个选项吗」—— 句子里出现
+        // 「系统设置」四个字，但没有任何「打开/进入/去」的动作，用户是在核对、
+        // 提问或讨论。TASK_VERBS 里裸的「设置」会把它判成任务，然后云端模型
+        // 常常真的去打开设置页。这类句子交给模型按上下文回答。
+        if (looksLikeSettingsMention(t)) return Kind.CHAT
         // 有操作动词 → 任务（哪怕同时有"查"，比如"打开XX查一下"）
         if (hasVerb || rawShell) return Kind.TASK
         // 纯交流开头且没有查询词 → 闲聊
@@ -208,6 +213,22 @@ object IntentGate {
         if (hasQuery) return Kind.QUERY
         return Kind.CHAT
     }
+
+    /**
+     * 句子里提到「系统设置 / 设置页 / 设置界面」，却没有打开它的动作。
+     *
+     * 这是**提及**，不是命令：「你测试一下系统设置执行生效了没有」
+     * 「系统设置里有这个选项吗」都该由模型回答，而不是去打开设置页。
+     * 带「打开/进入/跳到/前往/去」的句子照旧判任务（「打开系统设置」）。
+     */
+    private fun looksLikeSettingsMention(t: String): Boolean {
+        val mentions = listOf("系统设置", "设置页", "设置页面", "设置界面", "设置里", "设置中")
+            .any { t.contains(it) }
+        if (!mentions) return false
+        return OPEN_VERBS.none { t.contains(it) }
+    }
+
+    private val OPEN_VERBS = listOf("打开", "启动", "进入", "跳到", "跳转", "前往", "去")
 
     private fun looksLikeTrainQuery(text: String): Boolean {
         if (listOf("导航", "路线", "带我去", "打开", "关闭", "播放", "暂停").any(text::contains)) {
@@ -226,8 +247,7 @@ object IntentGate {
     private val ROUTE_AND_TRAIN_MARKERS = listOf("到", "至", "去", "从")
 
     /** 给用户看的解释 */
-    fun reason(text: String): String = when {
-        text.isBlank() -> "空输入"
+    fun reason(text: String): String = when {        text.isBlank() -> "空输入"
         classify(text) == Kind.TASK -> "操作指令"
         classify(text) == Kind.QUERY -> "信息查询"
         else -> "看起来是交流而不是操作指令"

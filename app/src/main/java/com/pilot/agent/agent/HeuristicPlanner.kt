@@ -1,7 +1,9 @@
 package com.pilot.agent.agent
 
+import com.pilot.agent.action.ActionCatalog
 import com.pilot.agent.action.LevelChange
 import com.pilot.agent.perception.UiNode
+import com.pilot.agent.tool.LegacyIntentGuard
 
 /**
  * 端侧快思考：纯规则，零延迟、零成本、离线可用。
@@ -29,7 +31,18 @@ class HeuristicPlanner(
     fun handlesDeterministically(goal: String): Boolean {
         val g = goal.trim()
         if (isMultiStep(g)) return false
-        return ruleSystemOp(g) != null
+        if (ruleSystemOp(g) != null) return true
+        // 系统设置页的直达：一个 Intent 就能到位，别让云端模型去走搜索、点候选
+        // （实测「打开蓝牙设置」被云端带去华为应用市场）。只认设置类 action，
+        // deep link（微信 / 淘宝）不在此列，那些保持原链路。
+        return isSettingsShortcut(ActionCatalog.resolve(g)?.action)
+    }
+
+    private fun isSettingsShortcut(action: String?): Boolean {
+        val a = action ?: return false
+        return a.startsWith("android.settings.") ||
+            a.startsWith("com.android.settings.") ||
+            a == "android.intent.action.POWER_USAGE_SUMMARY"
     }
 
     override suspend fun decide(req: AgentRequest): AgentDecision {
@@ -92,7 +105,11 @@ class HeuristicPlanner(
         // ★ 开关类设置项：「打开蓝牙」要的是开关真的到位，不是打开设置页。
         //   顺序很关键——先让直达/索引把页面打开（毫秒级、稳），再拨开关；
         //   如果直达没有对应入口，才落到"设置内搜索 → 拨开关"。
-        settingsKeyword(goal)?.let { kw ->
+        // 疑问句不是指令：「蓝牙怎么打开」「通知栏里那个开关是什么」是在**问**，
+        // 交给下游模型回答；规则层一动手就会真的打开设置页。
+        val settingTarget = settingsKeyword(goal)?.takeIf { !looksLikeSettingQuestion(goal) }
+
+        settingTarget?.let { kw ->
             val off = Regex("关闭|关掉|停用|禁用|取消|关一下").containsMatchIn(goal)
             val on = Regex("打开|开启|启用|开一下|亮起|启动").containsMatchIn(goal) && !off
             if (on || off) {
@@ -140,8 +157,12 @@ class HeuristicPlanner(
             }
         }
 
-        // 纯导航类（"点击电池"这种没有开关动词的）→ 只是进到这一项的页面
-        settingsKeyword(goal)?.let { kw ->
+        // 纯导航类（"看看电池设置"这种没有开关动词的）→ 只是进到这一项的页面。
+        // 但必须是**明确的导航指令**：一句话里顺带提到「通知」「显示」不是命令，
+        // 否则「通知栏那个图标是什么」会打开设置搜索。
+        settingTarget
+            ?.takeIf { ActionCatalog.isDirectiveReference(goal, it) }
+            ?.let { kw ->
             return AgentDecision(
                 thought = "设置项搜索：$kw",
                 action = AgentAction(
@@ -176,6 +197,21 @@ class HeuristicPlanner(
     private fun settingsKeyword(goal: String): String? {
         val g = goal.lowercase()
         return SETTINGS_WORDS.filter { g.contains(it) }.maxByOrNull { it.length }
+    }
+
+    /**
+     * 这句话是不是在**问**设置项，而不是要让助手去动它。
+     *
+     * 「蓝牙怎么打开」「蓝牙打开了吗」是问；「能帮我打开蓝牙吗」是请求。
+     * 判据：带疑问词（怎么/如何/为什么…）或句尾疑问（吗/呢/？），
+     * 且句首不是祈使说法 —— 祈使句里的语气词不算疑问。
+     */
+    private fun looksLikeSettingQuestion(goal: String): Boolean {
+        val g = goal.trim()
+        val requesting = REQUEST_PREFIX.any { g.startsWith(it) }
+        if (requesting) return LegacyIntentGuard.isQuestion(g)
+        return LegacyIntentGuard.isQuestion(g) ||
+            listOf("吗", "呢", "？", "?").any { g.contains(it) }
     }
 
     /**
@@ -434,6 +470,12 @@ class HeuristicPlanner(
             "定位", "语言", "输入法", "日期", "时间", "备份", "恢复出厂",
             "无障碍", "开发者", "关于手机", "系统更新", "通知", "锁屏", "壁纸",
             "指纹", "面部", "安全", "账号", "账户", "辅助功能",
+        )
+
+        /** 祈使句开头：这类句子里的「吗」是客气，不是疑问。 */
+        private val REQUEST_PREFIX = listOf(
+            "帮我", "帮忙", "请", "给我", "麻烦", "你帮我",
+            "能帮我", "能不能帮我", "可以帮我", "可以帮忙",
         )
 
 

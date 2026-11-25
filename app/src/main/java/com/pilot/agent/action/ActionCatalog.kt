@@ -45,7 +45,7 @@ object ActionCatalog {
         Entry(listOf("电池", "电量", "耗电"), Intent.ACTION_POWER_USAGE_SUMMARY, "电池用量"),
         Entry(listOf("省电", "节电", "电池 saver"), Settings.ACTION_BATTERY_SAVER_SETTINGS, "节电助手"),
         Entry(listOf("wifi", "wi-fi", "无线网", "局域网"), Settings.ACTION_WIFI_SETTINGS, "WLAN"),
-        Entry(listOf("蓝牙"), Settings.ACTION_BLUETOOTH_SETTINGS, "蓝牙"),
+        Entry(listOf("蓝牙", "bluetooth"), Settings.ACTION_BLUETOOTH_SETTINGS, "蓝牙"),
         Entry(listOf("移动网络", "流量", "数据网络", "双卡"), Settings.ACTION_DATA_ROAMING_SETTINGS, "移动网络"),
         Entry(listOf("飞行模式"), Settings.ACTION_AIRPLANE_MODE_SETTINGS, "飞行模式"),
         Entry(listOf("显示", "亮度"), Settings.ACTION_DISPLAY_SETTINGS, "显示"),
@@ -89,13 +89,98 @@ object ActionCatalog {
         Entry(listOf("京东"), Intent.ACTION_VIEW, "京东", uri = "openapp.jdmobile://"),
     )
 
-    /** 只有表达"打开/进入/启动"意图时才算直达，别把"电池还剩多少"当成本地跳转 */
-    private val INTENT_WORDS = listOf("打开", "启动", "进入", "去", "看看", "查看", "设置", "管理", "扫", "开始")
+    /**
+     * 意图动词：只有紧挨在目标词前面（或整句就是目标词）才算直达。
+     *
+     * ★ 这里曾经是「整句含意图词 + 整句含目标词」，而词表里连「设置」「查看」
+     *   都有 —— 「你测试一下系统设置执行生效了没有」既含「设置」又含
+     *   「系统设置」，真的把设置页打开了。用户说的明明是另一件事。
+     *   设置页是给别人看的界面，不该因为一句话里顺带提到软件功能就弹出来。
+     */
+    private val INTENT_WORDS = listOf(
+        "打开", "启动", "进入", "跳到", "跳转", "前往",
+        "看看", "查看", "浏览", "管理", "扫", "开始",
+        "open", "launch", "go to", "show",
+    )
+
+    /** 单字意图词必须**紧贴**目标词：「去设置」行，「我昨天去了系统设置」不行。 */
+    private val ADJACENT_INTENT = listOf("去", "到")
+
+    /** 后置动词：「把蓝牙打开」也算命令，但必须紧挨着目标词。 */
+    private val POST_VERBS = listOf("打开", "开启", "关闭", "关掉", "启用", "禁用", "开一下", "关一下")
+
+    /** 目标词后面只允许这些尾巴；再多就是顺带提及，不是"去打开它"。 */
+    private val TAIL_OK = setOf(
+        "", "设置", "设置页", "设置页面", "设置界面", "设置里",
+        "页", "页面", "界面", "里", "详情", "一下", "看看", "看一下", "settings",
+    )
+
+    /** 在**聊**这个功能的句子，一律不动手。 */
+    private val TOPIC_CUES = listOf(
+        "讨论", "方案", "原理", "代码", "日志", "排查", "实现",
+        "接口", "设计", "开发", "优化", "重构", "架构",
+    )
+
+    /** 意图词与目标词之间允许隔几个字（「打开一下蓝牙」）。 */
+    private const val INTENT_WINDOW = 8
 
     fun resolve(goal: String): Entry? {
-        val g = goal.lowercase()
-        if (INTENT_WORDS.none { g.contains(it) }) return null
-        return TABLE.firstOrNull { e -> e.keywords.any { g.contains(it.lowercase()) } }
+        val g = goal.lowercase().trim()
+        if (g.isEmpty()) return null
+        if (TOPIC_CUES.any { g.contains(it) }) return null
+        return TABLE.firstOrNull { e -> e.keywords.any { isDirectiveReference(g, it.lowercase()) } }
+    }
+
+    /**
+     * 按**目标名**找条目，不再做意图判定。
+     *
+     * 给已经抽过槽的调用方用：用户说了「打开 X」，槽位就是 X，
+     * 此时「系统设置」这种纯名词本身已经是命令对象。
+     */
+    fun resolveTarget(name: String): Entry? {
+        val n = name.lowercase().trim()
+        if (n.isEmpty()) return null
+        return TABLE.firstOrNull { e -> e.keywords.any { n.contains(it.lowercase()) } }
+    }
+
+    /**
+     * 目标词在这句话里是不是被当成「去打开 / 去看看」的对象。
+     *
+     * 判据刻意落在**词与词的相对位置**上，而不是整句里"有没有"：
+     * - 前面 8 个字内出现意图动词（「打开蓝牙设置」）；
+     * - 或单字意图词紧贴（「去设置」）；
+     * - 或整句就是一个目标名（「系统设置」「电池」）；
+     * - 或后置动词紧贴（「把蓝牙打开」）。
+     * 其余一律视为提及 —— 宁可漏给云端模型（它能读上下文），也不能误弹页面。
+     */
+    fun isDirectiveReference(goal: String, target: String): Boolean {
+        val g = goal.lowercase().trim()
+        val t = target.lowercase().trim()
+        if (g.isEmpty() || t.isEmpty()) return false
+        var from = 0
+        while (true) {
+            val i = g.indexOf(t, from)
+            if (i < 0) return false
+            if (referenceOk(g, i, t)) return true
+            from = i + 1
+        }
+    }
+
+    private fun referenceOk(g: String, i: Int, t: String): Boolean {
+        val head = g.substring(0, i).trim()
+        val tail = g.substring(i + t.length).trim()
+            .trimEnd('。', '！', '!', '，', ',', '~', '～')
+        val tailOk = tail.isEmpty() || tail in TAIL_OK
+        val postIntent = POST_VERBS.any { tail == it || tail == it + "一下" || tail == it + "吧" }
+        if (!tailOk && !postIntent) return false
+
+        // 整句就是一个目标名：「系统设置」「电池」「打开设置」（关键词本身带动词）。
+        if (head.isEmpty()) return tailOk
+
+        val pre = g.substring(maxOf(0, i - INTENT_WINDOW), i)
+        if (INTENT_WORDS.any { pre.contains(it) }) return true
+        if (ADJACENT_INTENT.any { pre.endsWith(it) }) return true
+        return postIntent
     }
 
     fun toIntent(entry: Entry): Intent =

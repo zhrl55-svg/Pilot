@@ -68,7 +68,9 @@ class CapabilityExecutor(
         // ★ 两样都没有就**交回原链路**（返回 null），而不是回一句「没找到「X」」。
         //   原链路的 agent 还能在屏幕上找；快路径不能把用户的请求做死。
         //   索引没建好时（appIndexProvider() 为 null）尤其要这样。
-        val catalog = ActionCatalog.resolve(app)
+        // app 槽是用户已经明确说「打开 X」之后抽出来的目标名，
+        // 这里再要求句子里带意图动词就多余了（槽本身就是命令对象）。
+        val catalog = ActionCatalog.resolveTarget(app)
         val entry = if (catalog == null) appIndexProvider()?.resolve(app) else null
         if (catalog == null && entry == null) return null
 
