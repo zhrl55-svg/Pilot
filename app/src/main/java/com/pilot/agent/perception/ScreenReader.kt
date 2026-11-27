@@ -51,6 +51,13 @@ class ScreenReader(private val service: AccessibilityService) {
     @Volatile
     private var snapshot: ScreenSnapshot? = null
 
+    /**
+     * 虚拟屏执行模式：只读这个 displayId 上的应用窗口；null = 主屏（默认行为）。
+     * 仅当 [com.pilot.agent.display.VirtualDisplayHost] 可用时由任务层设置。
+     */
+    @Volatile
+    var displayIdFilter: Int? = null
+
     fun last(): ScreenSnapshot? = snapshot
 
     /** 最新一帧的帧号；还没抓过返回 0。 */
@@ -227,6 +234,17 @@ class ScreenReader(private val service: AccessibilityService) {
      * 规划器看到的就只剩一排按键。这种情况改取当前聚焦/活动的应用窗口。
      */
     private fun pickRoot(): AccessibilityNodeInfo? {
+        // 虚拟屏执行：优先取目标 displayId 上的应用窗口（主屏 rootInActiveWindow 看不到）。
+        displayIdFilter?.let { filter ->
+            val root = try {
+                service.windows.firstOrNull {
+                    it.displayId == filter && it.type == AccessibilityWindowInfo.TYPE_APPLICATION
+                }?.root
+            } catch (_: Throwable) {
+                null
+            }
+            if (root != null) return root
+        }
         val active = service.rootInActiveWindow
         val pkg = active?.packageName?.toString().orEmpty()
         if (active != null && !isImePackage(pkg)) return active
@@ -258,7 +276,10 @@ class ScreenReader(private val service: AccessibilityService) {
     /** 当前聚焦的**应用窗口**（排除 SystemUI 面板、输入法、悬浮窗）。 */
     private fun focusedAppWindow(): AccessibilityWindowInfo? = try {
         val ws = service.windows
-        ws.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_APPLICATION && it.isFocused }
+        val filtered = displayIdFilter?.let { f -> ws.filter { it.displayId == f } } ?: ws
+        filtered.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_APPLICATION && it.isFocused }
+            ?: filtered.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_APPLICATION && it.isActive }
+            ?: ws.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_APPLICATION && it.isFocused }
             ?: ws.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_APPLICATION && it.isActive }
     } catch (_: Throwable) {
         null

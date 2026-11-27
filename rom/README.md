@@ -176,3 +176,37 @@ adb shell dumpsys package com.pilot.agent | grep -i "unknown permission"
 | 长期记忆与情境适应 | 技能库 + 审计日志 | 部分（缺用户画像） |
 
 缺的两块（多模态生成、长期记忆）是下一阶段的事，不影响先跑通操作闭环。
+
+## 虚拟屏执行模式所需权限（「页面尽量不占主屏」第二步）
+
+Agent 默认在**主屏**执行（做完切回）。若希望把任务 App 放到一块独立虚拟屏、主屏继续给用户，
+需要系统签名/priv-app 授予以下权限，App 侧 `com.pilot.agent.display.VirtualDisplayHost`
+才能把别的 App 的 Activity 拉上虚拟屏：
+
+```xml
+<!-- AndroidManifest.xml -->
+<uses-permission android:name="android.permission.ADD_TRUSTED_DISPLAY"/>
+<uses-permission android:name="android.permission.CAPTURE_VIDEO_OUTPUT"/>
+```
+
+`privapp-permissions` 白名单示例（放在 `/system/etc/permissions/privapp-permissions-com.pilot.agent.xml`）：
+
+```xml
+<permissions>
+  <privapp-permissions package="com.pilot.agent">
+    <permission name="android.permission.ADD_TRUSTED_DISPLAY"/>
+    <permission name="android.permission.CAPTURE_VIDEO_OUTPUT"/>
+  </privapp-permissions>
+</permissions>
+```
+
+这两项是 `signature|privileged`，普通 debug 签名手机无法用 `pm grant` 授予。因此
+`VirtualDisplayHost.isAvailable()` 在普通安装上一律返回**不可用**，任务自动退回现有「做完切回」，
+不改变任何安全护栏与确认流程。
+
+### 验证步骤（系统签名设备）
+1. `adb shell dumpsys package com.pilot.agent | grep -E "ADD_TRUSTED_DISPLAY|CAPTURE_VIDEO_OUTPUT"` 确认已授予。
+2. 调试入口 `--ez vd_probe true`，日志应显示 `虚拟屏探测：available=true`。
+3. 发起一个启动类任务（如“打开设置”），用 `adb shell dumpsys display` 确认出现 `pilot-virtual` 显示屏，
+   主屏前台保持用户原界面；任务结束 `VirtualDisplayHost.stop()` 释放。
+4. 取消/结束后确认虚拟屏与预览 `ImageReader` 均已释放（无内存泄漏）。

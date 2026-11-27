@@ -62,12 +62,15 @@ object VerifiedLauncher {
     /**
      * @param expectPackage 期望落到的包；null 时用 resolveActivity 推断，推断不出则只要求「前台变了」。
      * @param timeoutMs 回查等待时长。冷启动的大 App（设置、微信）焦点切换可能要 5 秒，打开 App 时建议传 6000。
+     * @param displayId 目标显示屏（虚拟屏执行模式）。非 null 时用 ActivityOptions 把 Activity 拉到该屏；
+     *   主屏前台回查无法覆盖别的显示屏，因此一律返回 [LaunchOutcome.Unknown]（结果未确认），交给调用方如实上报。
      */
     suspend fun launch(
         ctx: Context,
         intent: Intent,
         expectPackage: String?,
         timeoutMs: Long = 1500,
+        displayId: Int? = null,
     ): LaunchOutcome {
         val target = expectPackage?.takeIf { it.isNotBlank() } ?: inferPackage(ctx, intent)
         val self = ctx.packageName
@@ -77,6 +80,26 @@ object VerifiedLauncher {
         val selfWasForeground = probe.selfForeground()
 
         if (ctx !is Activity) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (displayId != null) {
+            return try {
+                if (ctx !is Activity) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                val options = android.app.ActivityOptions.makeBasic().apply {
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                        setLaunchDisplayId(displayId)
+                    }
+                }
+                ctx.startActivity(intent, options.toBundle())
+                Dbg.i(TAG, "已请求在 displayId=$displayId 启动 ${target ?: intent.action}")
+                // 目标在别的显示屏上，主屏前台回查不到 → 结果未确认。
+                LaunchOutcome.Unknown
+            } catch (e: SecurityException) {
+                LaunchOutcome.Blocked("$REASON_DENIED（${e.message ?: "SecurityException"}）")
+            } catch (e: ActivityNotFoundException) {
+                LaunchOutcome.Failed(e)
+            } catch (t: Throwable) {
+                LaunchOutcome.Failed(t)
+            }
+        }
         try {
             ctx.startActivity(intent)
         } catch (e: SecurityException) {

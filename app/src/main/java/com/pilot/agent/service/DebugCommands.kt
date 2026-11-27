@@ -48,9 +48,9 @@ internal object DebugCommands {
         "fastpath_owner", "fastpath_compare", "reminder_cancel", "memory_delete_id",
         "memory_forget", "fastpath_fill_test", "set_netease_cookie", "tts_test", "tts_engine",
         "asr_test", "llm_test", "sandbox_test", "sandbox_timeout_ms", "voice_test", "simulate_nav",
-        "debug_launch",
+        "debug_launch", "browser_test",
     )
-    private val BOOL_KEYS = listOf("kws_test", "import_models", "log_verbose")
+    private val BOOL_KEYS = listOf("kws_test", "import_models", "log_verbose", "vd_probe")
 
     /** 是否携带了任何调试指令（正式入口据此拒绝并记日志）。 */
     fun hasDebugExtra(intent: Intent): Boolean =
@@ -405,6 +405,37 @@ internal object DebugCommands {
                 }
                 Dbg.i(TAG, "debug_launch $debugLaunch -> $outcome")
             }.apply { name = "debug-launch"; isDaemon = true }.start()
+            return true
+        }
+
+        // 虚拟屏能力探测（无副作用）：普通签名应返回不可用。
+        if (intent.hasExtra("vd_probe")) {
+            val cap = com.pilot.agent.display.VirtualDisplayHost.isAvailable(app)
+            Dbg.i(TAG, "虚拟屏探测：available=${cap.available} reason=${cap.reason}")
+            return true
+        }
+
+        // 浏览器打开测试：按当前设置（默认小窗）打开一个网址，记录方式与是否占屏。
+        //   --es browser_test "https://example.com"
+        val browserTest = intent.getStringExtra("browser_test")?.trim().orEmpty()
+        if (browserTest.isNotEmpty()) {
+            Thread {
+                val fgBefore = com.pilot.agent.runtime.AgentRuntime.foreground.value
+                val r = runBlocking {
+                    com.pilot.agent.browser.BrowserSessionManager.execute(
+                        context = app,
+                        action = "browser_open",
+                        target = browserTest,
+                        text = null,
+                        maxChars = null,
+                    )
+                }
+                val overlay = com.pilot.agent.browser.BrowserOverlay.isShowing()
+                Dbg.i(
+                    TAG,
+                    "浏览器测试 ok=${r.ok} overlay=$overlay fgBefore=$fgBefore msg=${LogRedactor.text("m", r.message)}",
+                )
+            }.apply { name = "browser-selftest"; isDaemon = true }.start()
             return true
         }
 

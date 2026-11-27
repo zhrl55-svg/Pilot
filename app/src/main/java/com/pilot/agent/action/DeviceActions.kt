@@ -53,6 +53,13 @@ class DeviceActions(
         private set
 
     /**
+     * 虚拟屏执行模式的目标 displayId；null = 主屏（默认行为）。
+     * 仅当 [com.pilot.agent.display.VirtualDisplayHost] 可用时由任务层设置，否则始终为 null。
+     */
+    @Volatile
+    var targetDisplayId: Int? = null
+
+    /**
      * 最近一次节点动作因「帧过期 / 节点已变化」被拒绝的原因；成功或非过期失败时为 null。
      * AgentLoop 据此提示规划器「界面已变化，重新读屏」。
      */
@@ -377,7 +384,12 @@ class DeviceActions(
      * - true：回查确认到达（Ok），或前台切到了别的界面 / 目标本来就在前台（Unknown，交给下一轮重感知）；
      * - false：没有 Activity、系统拒绝，或整条降级链都没能把目标拉到前台。
      */
-    private suspend fun startSafely(intent: Intent, expectPkg: String? = null): Boolean {
+    private suspend fun startSafely(
+        intent: Intent,
+        expectPkg: String? = null,
+        displayId: Int? = null,
+    ): Boolean {
+        val targetDisplay = displayId ?: targetDisplayId
         currentCoroutineContext().ensureActive()
         lastLaunchOutcome = null
         val pm = service.packageManager
@@ -395,7 +407,7 @@ class DeviceActions(
         //   而早先的判据是 rootInActiveWindow + 1.2 秒超时，窗口切换期 root 返回 null，
         //   null 被当成「前台没动」→ 把「冷启动慢」误判成「被系统拦截」→
         //   白走一遍桌面翻屏（10 秒，还可能翻不到）。别再按老结论下判断。
-        when (val first = VerifiedLauncher.launch(service, intent, target, 6000L)) {
+        when (val first = VerifiedLauncher.launch(service, intent, target, 6000L, displayId = targetDisplay)) {
             LaunchOutcome.Ok -> {
                 lastLaunchOutcome = first
                 return true
@@ -445,7 +457,7 @@ class DeviceActions(
         Dbg.w(TAG, "启动未生效，回桌面后重试一次：$target")
         service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
         delay(600)
-        when (val retry = VerifiedLauncher.launch(service, intent, target, 4000L)) {
+        when (val retry = VerifiedLauncher.launch(service, intent, target, 4000L, displayId = targetDisplay)) {
             LaunchOutcome.Ok, LaunchOutcome.Unknown -> {
                 lastLaunchOutcome = retry
                 return true

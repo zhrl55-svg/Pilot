@@ -338,3 +338,24 @@ Pilot 在后台或锁屏时，让用户能判断语音入口是否可用；Agent
 # Music API routing
 
 Online music API requests use the configured primary and fallback URLs. On Wi‑Fi, Pilot prefers a LAN URL over a Tailnet URL; on cellular, it prefers Tailnet. Network/transport failures try the other configured URL. HTTP application errors are returned directly instead of silently switching servers. Local MediaStore matches are played before any network request. The embedded `tsnet` process is started only when a Tailnet URL is used and is unbound after the short idle window.
+
+## 页面尽量不占主屏（2026-11-27）
+
+### 内置浏览器：后台 / 小窗 / 全屏
+- 设置项「网页打开方式」默认 **小窗**（`AgentSettings.browserMode`）。
+- `BrowserEngine`：进程内唯一 WebView，可无头加载与提取（不占屏），也可被 `BrowserOverlay`
+  放进 `TYPE_APPLICATION_OVERLAY` 悬浮窗；cookie 由系统 CookieManager 共享，切全屏/收回小窗按
+  `BrowserEngine.currentUrl` 续页。
+- `BrowserOverlay`：可拖动、最小化为气泡、展开全屏（`BrowserActivity`）、关闭；全屏页「小窗」按钮可收回。
+- 用户明确「打开网页给我看/登录/扫码」→ 直接全屏；无悬浮窗权限→退回后台无头并提示。
+- 打开方式纯决策在 `BrowserSessionManager.decideSurface(...)`，有单测。
+
+### 虚拟屏执行（display 模块）
+- `com.pilot.agent.display.VirtualDisplayHost`：`isAvailable()` 探测是否持有 `ADD_TRUSTED_DISPLAY`
+  （系统签名/priv-app）；可用时 `DisplayManager.createVirtualDisplay`（ImageReader surface，
+  PUBLIC|OWN_CONTENT_ONLY），把任务 App 启动到该 `displayId`。
+- 启动链路：`VerifiedLauncher.launch(..., displayId)` 用 `ActivityOptions.setLaunchDisplayId`；
+  `DeviceActions.targetDisplayId` 供 openApp/launchComponent 使用；`ScreenReader.displayIdFilter`
+  让感知只读该屏窗口。
+- 非系统签名设备 `isAvailable()` 恒为不可用 → 自动退回现有「做完切回」，Guard/确认流程不变。
+- 所需权限与 privapp 白名单、验证步骤见 `rom/README.md`。
