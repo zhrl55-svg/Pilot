@@ -15,4 +15,10 @@ interface QueryTool {
 
     /** 执行查询。@return 给用户播报的文本；null 表示拿不到 */
     suspend fun execute(goal: String): String?
+
+    /**
+     * 结构化结果（审核 Q-01）。默认按 [QueryResult.classify] 对 [execute] 的文本分类；
+     * 能明确区分成功/失败的工具应覆盖它。
+     */
+    suspend fun executeResult(goal: String): QueryResult = QueryResult.classify(execute(goal))
 }

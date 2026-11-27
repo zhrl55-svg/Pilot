@@ -1,11 +1,10 @@
 package com.pilot.agent.query
 
 import com.pilot.agent.Dbg
+import com.pilot.agent.assistant.llm.LlmGateway
 import java.nio.charset.Charset
-import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
 import okhttp3.Request
 
 /**
@@ -27,10 +26,8 @@ class StockTool : QueryTool {
 
     override val name: String = "stock"
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(6, TimeUnit.SECONDS)
-        .readTimeout(10, TimeUnit.SECONDS)
-        .build()
+    /** 与 LlmGateway 共享连接池（审核 arch D5）。 */
+    private val client = LlmGateway.derive(connectSeconds = 6, readSeconds = 10)
 
     /** 关键词 → 新浪代码。用 s_ 前缀取简版（6 个字段），够播报用 */
     private val INDEXES: List<Pair<String, String>> = listOf(
@@ -44,12 +41,33 @@ class StockTool : QueryTool {
         "沪深" to "s_sh000300",
     )
 
-    private val HINTS = listOf(
-        "上证", "深证", "创业板", "沪深", "大盘", "沪指",
-        "A股", "a股", "指数", "行情", "股价", "涨了", "跌了",
+    /** 明确的指数/市场实体：出现其一才算股票查询。 */
+    private val ENTITY_HINTS = listOf(
+        "上证", "深证", "创业板", "沪深", "大盘", "沪指", "成指", "A股", "a股", "股市",
     )
 
-    override fun matches(goal: String): Boolean = HINTS.any { goal.contains(it) }
+    /** 个股说法（“茅台股价”）：本工具不支持，但要接住并如实说明，不能拿大盘冒充。 */
+    private val SINGLE_STOCK_HINTS = listOf("股价", "股票")
+
+    /**
+     * 审核 Q-02：原来“指数 / 行情 / 涨了 / 跌了”都会命中，“紫外线指数”“油价涨了吗”也报 A 股。
+     * 现在必须出现市场实体或“股价/股票”。
+     */
+    override fun matches(goal: String): Boolean =
+        ENTITY_HINTS.any { goal.contains(it) } || SINGLE_STOCK_HINTS.any { goal.contains(it) }
+
+    override suspend fun executeResult(goal: String): QueryResult {
+        val namesIndex = INDEXES.any { goal.contains(it.first) } ||
+            listOf("A股", "a股", "股市").any(goal::contains)
+        if (!namesIndex) {
+            return QueryResult.NoResult(
+                "我目前只能查上证、深证、创业板和沪深300 指数，还查不了个股行情。",
+            )
+        }
+        val text = execute(goal)
+            ?: return QueryResult.Unavailable("行情接口暂时没有返回数据，请稍后再试。")
+        return QueryResult.Answer(text)
+    }
 
     override suspend fun execute(goal: String): String? = withContext(Dispatchers.IO) {
         // 提到哪个就查哪个；没提到具体指数就报三大指数
@@ -76,6 +94,7 @@ class StockTool : QueryTool {
                 String(resp.body?.bytes() ?: return@withContext null, Charset.forName("GBK"))
             }
         } catch (t: Throwable) {
+            if (t is kotlinx.coroutines.CancellationException) throw t
             Dbg.e(TAG, "行情请求失败：${t.message}")
             return@withContext null
         }

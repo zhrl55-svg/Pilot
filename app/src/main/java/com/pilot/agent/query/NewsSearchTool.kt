@@ -25,7 +25,8 @@ class NewsSearchTool : QueryTool {
 
     override val name: String = "news_search"
 
-    private val client = OkHttpClient.Builder()
+    // 从 LlmGateway 根 client 派生：共享连接池与线程池（审核 arch D5）。
+    private val client = com.pilot.agent.assistant.llm.LlmGateway.http.newBuilder()
         .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(8, TimeUnit.SECONDS)
         .callTimeout(10, TimeUnit.SECONDS)

@@ -1,6 +1,8 @@
 package com.pilot.agent.action
 
-import com.pilot.agent.query.SecretVault
+import com.pilot.agent.Dbg
+import com.pilot.agent.query.EncryptedJsonStore
+import com.pilot.agent.query.VaultUnavailableException
 import java.util.UUID
 import org.json.JSONArray
 import org.json.JSONObject
@@ -14,7 +16,16 @@ object PersonalTodoStore {
 
     // P1：语音/广播/UI 可同时写入，load→modify→save 必须串行化，否则丢更新。
     @Synchronized
-    fun handle(text: String): String {
+    fun handle(text: String): String =
+        try {
+            handleUnsafe(text)
+        } catch (e: VaultUnavailableException) {
+            // E1：读/写加密存储失败时不把空列表写回去，如实告诉用户这次没改动。
+            Dbg.e("PersonalTodo", "待办存储不可用，已中止本次操作：${e.name}")
+            EncryptedJsonStore.UNAVAILABLE_MESSAGE
+        }
+
+    private fun handleUnsafe(text: String): String {
         when {
             text.contains("我的待办") -> {
                 val active = all().filterNot { it.done }.sortedByDescending { it.created }
@@ -60,17 +71,18 @@ object PersonalTodoStore {
         return "已删除待办：${item.text}"
     }
 
-    private fun all(): List<Todo> = runCatching {
-        val json = JSONArray(SecretVault.get(KEY).ifBlank { "[]" })
-        (0 until json.length()).mapNotNull { i ->
+    /** 读失败抛 [VaultUnavailableException]；JSON 损坏会先备份再按空处理（见 EncryptedJsonStore）。 */
+    private fun all(): List<Todo> {
+        val json = EncryptedJsonStore.readArray(KEY)
+        return (0 until json.length()).mapNotNull { i ->
             val o = json.optJSONObject(i) ?: return@mapNotNull null
             Todo(o.optString("id"), o.optString("text"), o.optLong("created"), o.optBoolean("done"))
         }
-    }.getOrDefault(emptyList())
+    }
 
     private fun save(items: List<Todo>) {
         val json = JSONArray()
         items.takeLast(500).forEach { json.put(JSONObject().put("id", it.id).put("text", it.text).put("created", it.created).put("done", it.done)) }
-        SecretVault.put(KEY, json.toString())
+        EncryptedJsonStore.writeArray(KEY, json)
     }
 }

@@ -23,6 +23,8 @@ import com.pilot.agent.assistant.exec.FastPathTrace
 import com.pilot.agent.assistant.exec.ResultFormatter
 import com.pilot.agent.chat.ChatSessionStore
 import com.pilot.agent.runtime.AgentRuntime
+import com.pilot.agent.runtime.await
+import com.pilot.agent.runtime.rethrowIfCancellation
 import com.pilot.agent.tool.ToolGroup
 import com.pilot.agent.tool.ToolPolicy
 import com.pilot.agent.tool.ToolStatus
@@ -197,6 +199,13 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
 
     var accessibilityOn by mutableStateOf(false)
         private set
+
+    /**
+     * 权限已开、但无障碍服务还没绑上时，暂存的待启动目标。
+     * 进程刚被拉起时系统常常晚一点才 bind 无障碍服务，等一下就能连上，
+     * 不该把用户扔到设置页（11-26 真机反馈：权限明明开着仍被提示未开启）。
+     */
+    private var loopRetryGoal: Pair<String, AssistantMode>? = null
 
     var notificationAccess by mutableStateOf(false)
         private set
@@ -690,7 +699,10 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun refreshStatus() {
-        accessibilityOn = AgentSettings.isAccessibilityEnabled(getApplication())
+        // ★ 运行时已绑定也算就绪。EMUI 上 Settings.Secure 偶尔读不到/被裁剪，
+        //   会出现「服务 Bound 了但界面说未开启」的假阴性（11-26 真机反馈）。
+        accessibilityOn = AgentRuntime.connected ||
+            AgentSettings.isAccessibilityEnabled(getApplication())
         notificationAccess = com.pilot.agent.service.NotificationInbox.isPermissionEnabled(getApplication())
         reminderNotificationsAllowed = android.os.Build.VERSION.SDK_INT < 33 ||
             getApplication<Application>().checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
@@ -1260,7 +1272,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 .addHeader("Content-Type", "application/json")
                 .post(okhttp3.RequestBody.create("application/json".toMediaType(), body))
                 .build()
-            com.pilot.agent.agent.CloudHttp.client.newCall(req).execute().use { resp ->
+            com.pilot.agent.agent.CloudHttp.client.newCall(req).await().use { resp ->
                 if (!resp.isSuccessful) {
                     Dbg.w(TAG, "云端对话失败 http=${resp.code}")
                     return null
@@ -1270,6 +1282,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                     ?.optJSONObject("message")?.optString("content")
             }
         } catch (t: Throwable) {
+            rethrowIfCancellation(t)
             Dbg.w(TAG, "云端对话异常：${t.message}")
             null
         }
@@ -1571,7 +1584,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         if (running) return
         reloadSettings()
         refreshStatus()
-        if (!accessibilityOn || AgentRuntime.loop == null) {
+        if (!accessibilityOn) {
             // Android 不允许普通 App 静默勾选无障碍开关，但可以把用户直接带到
             // Pilot 的服务详情页，并同时用聊天文字和语音说明下一步。
             Dbg.w(TAG, "操作权限未开启，已提示并打开设置：goalChars=${g.length}")
@@ -1584,6 +1597,37 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             }
             openAccessibilitySettings()
             refreshStatus()
+            return
+        }
+        if (AgentRuntime.loop == null) {
+            // ★ 权限开着但没有 loop = 服务还没绑定（进程刚拉起/被系统回收后最常见），
+            //   原来跟"权限未开"共用一条提示，导致用户明明开了权限还被叫去开权限。
+            //   先静默等一次重连，连不上再给准确的提示和恢复办法。
+            Dbg.w(TAG, "操作权限已开，但无障碍服务尚未连接，等 1.2s 重连：goalChars=${g.length}")
+            if (loopRetryGoal == null) {
+                loopRetryGoal = g to effectiveMode
+                viewModelScope.launch {
+                    delay(1_200)
+                    val pending = loopRetryGoal
+                    loopRetryGoal = null
+                    when {
+                        pending == null -> Unit
+                        AgentRuntime.loop != null -> startAgent(pending.first, pending.second)
+                        else -> {
+                            Dbg.e(TAG, "重试后无障碍服务仍未连接，提示重新开启服务")
+                            val prompt = "操作服务还没连上。请到 设置→无障碍→Pilot 关闭再打开，或重启 Pilot 后再说一次。"
+                            add(LogEntry.Kind.ERROR, prompt)
+                            val now = System.currentTimeMillis()
+                            if (now - lastAccessibilityPromptAt > 5_000L) {
+                                lastAccessibilityPromptAt = now
+                                AgentRuntime.speaker.speak(prompt)
+                            }
+                            openAccessibilitySettings()
+                            refreshStatus()
+                        }
+                    }
+                }
+            }
             return
         }
         running = true

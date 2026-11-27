@@ -663,7 +663,8 @@ object ChineseTimeParser {
                 if (hour < 12) hour + 12 else hour
             // P1：中午就是 12 点前后，10/11 点本就是上午。
             // 原来 hour<11 时 +12 会把"中午10点"变成 22:00 并非确定执行。
-            "中午" -> hour
+            // 审核 R-02：但“中午1点/中午两点”是 13:00/14:00，不能落成凌晨 01:00。
+            "中午" -> if (hour in 1..4) hour + 12 else hour
             else -> hour
         }
     }

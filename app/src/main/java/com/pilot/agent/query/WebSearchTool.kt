@@ -3,16 +3,17 @@ package com.pilot.agent.query
 import android.net.Uri
 import android.text.Html
 import com.pilot.agent.Dbg
+import com.pilot.agent.assistant.llm.LlmGateway
+import com.pilot.agent.tool.LaunchResults
+import com.pilot.agent.tool.ToolStatus
 import java.net.InetAddress
 import java.net.URLEncoder
-import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import okhttp3.Dns
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import okio.Buffer
 import org.json.JSONObject
@@ -21,11 +22,19 @@ import org.json.JSONObject
 class WebSearchTool : QueryTool {
     override val name = "web_search"
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(7, TimeUnit.SECONDS)
-        .readTimeout(9, TimeUnit.SECONDS)
-        .callTimeout(12, TimeUnit.SECONDS)
-        .build()
+    /** 与 LlmGateway 共享连接池（审核 arch D5）。 */
+    private val client = LlmGateway.derive(connectSeconds = 7, readSeconds = 9, callSeconds = 12)
+
+    /** 审核 Q-01：失败/没结果不当作答案，交给上层（Agent 模式改用浏览器）。 */
+    override suspend fun executeResult(goal: String): QueryResult {
+        val text = execute(goal)
+        return when {
+            text.startsWith("网页搜索：") -> QueryResult.Answer(text)
+            text.startsWith("请补充") -> QueryResult.NeedMoreInfo(text)
+            text.startsWith("没有找到") -> QueryResult.NoResult(text)
+            else -> QueryResult.Unavailable(text)
+        }
+    }
 
     override fun matches(goal: String): Boolean {
         val q = goal.lowercase()
@@ -99,6 +108,7 @@ class WebSearchTool : QueryTool {
                 }
             }
         } catch (t: Throwable) {
+            if (t is kotlinx.coroutines.CancellationException) throw t
             Dbg.e(TAG, "web search failed: ${t.javaClass.simpleName}")
             "网页搜索失败，请检查网络后重试。"
         }
@@ -206,34 +216,46 @@ class WebPageTool : QueryTool {
         }
     }
 
-    private val client = OkHttpClient.Builder()
+    private val client = LlmGateway.derive(connectSeconds = 6, readSeconds = 8, callSeconds = 12)
+        .newBuilder()
         .dns(safeDns)
         .followRedirects(false)
         .followSslRedirects(false)
-        .connectTimeout(6, TimeUnit.SECONDS)
-        .readTimeout(8, TimeUnit.SECONDS)
-        .callTimeout(12, TimeUnit.SECONDS)
         .build()
 
     override fun matches(goal: String): Boolean =
         goal.contains("https://", ignoreCase = true) &&
             listOf("打开", "浏览", "总结", "阅读", "读一下", "看看这个网页", "这篇文章").any(goal::contains)
 
-    override suspend fun execute(goal: String): String = withContext(Dispatchers.IO) {
+    override suspend fun execute(goal: String): String = executeResult(goal).displayText
+
+    /**
+     * 审核 D-01：只打开网页时经 VerifiedLauncher 回查前台，未确认如实说“未确认”；
+     * 正文抓取失败返回 Unavailable，不当作答案。
+     */
+    override suspend fun executeResult(goal: String): QueryResult = withContext(Dispatchers.IO) {
         val raw = Regex("https://[^\\s<>\"']+", RegexOption.IGNORE_CASE).find(goal)?.value
-            ?: return@withContext "请提供 HTTPS 网页链接。"
-        var url = raw.trimEnd('，', ',', '。', '.', ')', '）')
+            ?: return@withContext QueryResult.NeedMoreInfo("请提供 HTTPS 网页链接。")
+        val url = raw.trimEnd('，', ',', '。', '.', ')', '）')
         val isOpenOnly = listOf("打开", "浏览").any(goal::contains) &&
             listOf("总结", "阅读", "读一下", "提取", "概括").none(goal::contains)
         if (isOpenOnly) {
-            return@withContext runCatching {
-                val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, Uri.parse(url))
-                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                com.pilot.agent.PilotApp.instance.startActivity(intent)
-                "已在浏览器中打开网页。"
-            }.getOrElse { "无法打开这个网页链接。" }
+            val context = com.pilot.agent.PilotApp.instance
+            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, Uri.parse(url))
+                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            val result = LaunchResults.launch(
+                context,
+                intent,
+                label = "网页",
+                okMessage = "已在浏览器中打开网页。",
+            )
+            return@withContext when (result.status) {
+                ToolStatus.SUCCESS, ToolStatus.UNKNOWN -> QueryResult.Answer(result.message)
+                else -> QueryResult.Unavailable(result.message)
+            }
         }
-        extractArticle(url, MAX_TEXT)
+        val text = extractArticle(url, MAX_TEXT)
+        if (text.startsWith("正文抓取失败")) QueryResult.Unavailable(text) else QueryResult.Answer(text)
     }
 
     /** Fetch the result URL itself (including safe public redirects) and return readable article text. */
@@ -288,6 +310,7 @@ class WebPageTool : QueryTool {
                     return@withContext if (excerpt.isBlank()) "正文抓取失败：页面没有可读正文（可能需要登录或由脚本动态加载）。" else excerpt
                 }
             } catch (t: Throwable) {
+                if (t is kotlinx.coroutines.CancellationException) throw t
                 Dbg.w("PilotWebPage", "fetch failed: ${t.javaClass.simpleName}")
                 return@withContext "正文抓取失败：${t.javaClass.simpleName}。"
             }

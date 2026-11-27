@@ -23,6 +23,11 @@ enum class ToolStatus {
     DENIED,
     UNAVAILABLE,
     ERROR,
+    /**
+     * 已发出动作，但没能确认它真的生效（例如 startActivity 没抛异常、前台却没切过去）。
+     * 文案必须如实说“未确认”，不能当成功播报。
+     */
+    UNKNOWN,
 }
 
 data class ToolResult(
@@ -30,6 +35,11 @@ data class ToolResult(
     val message: String,
     val spoken: String = message,
     val activity: Activity? = null,
+    /**
+     * 结果含个人数据（通知、记忆、提醒、待办、文件内容）：只能用本机 TTS 播报，
+     * 不得交给云端 TTS；锁屏时不得读出。
+     */
+    val privateSpeech: Boolean = false,
 ) {
     companion object {
         fun success(message: String, spoken: String = message) =
@@ -43,6 +53,9 @@ data class ToolResult(
 
         fun error(message: String) =
             ToolResult(ToolStatus.ERROR, message, message)
+
+        fun unknown(message: String, spoken: String = message) =
+            ToolResult(ToolStatus.UNKNOWN, message, spoken)
     }
 }
 

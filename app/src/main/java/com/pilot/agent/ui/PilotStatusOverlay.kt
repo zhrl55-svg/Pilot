@@ -8,17 +8,28 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.RectF
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
+import android.os.SystemClock
 import android.provider.Settings
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.TextView
 import com.pilot.agent.Dbg
+import com.pilot.agent.agent.Risk
 import kotlin.math.abs
 import kotlin.math.sin
 
-/** Draggable status circle shown only while Pilot is working in the background. */
+/**
+ * Draggable status circle shown only while Pilot is working in the background,
+ * plus the cross-app floating confirmation card (审核 P0-3：跨 App 确认通道).
+ */
 object PilotStatusOverlay {
     private const val TAG = "PilotStatusOverlay"
     private const val PREFS = "floating_status_overlay_v2"
@@ -29,8 +40,25 @@ object PilotStatusOverlay {
     private var statusView: StatusGlyphView? = null
     private var latestStatus = "正在待命"
 
+    /** 主界面是否在前台（MainActivity onResume/onPause 维护）。 */
+    @Volatile
+    var isAppForeground: Boolean = false
+        private set
+
+    private var confirmView: View? = null
+    private var confirmId: Long = -1L
+
     fun onAppForeground(context: Context) {
+        isAppForeground = true
         remove(context)
+        // 主界面接管确认：悬浮卡收起，由界面弹窗显示同一个待确认请求。
+        ConfirmChannel.onAppForeground(context)
+    }
+
+    /** MainActivity.onPause 调用：界面不可见时，待确认请求改用悬浮卡。 */
+    fun onAppBackground(context: Context) {
+        isAppForeground = false
+        ConfirmChannel.onAppBackground(context)
     }
 
     fun show(context: Context, status: String) {
@@ -87,9 +115,144 @@ object PilotStatusOverlay {
 
     fun hide(context: Context) = remove(context)
 
-    private fun canDraw(context: Context): Boolean = runCatching {
+    fun canDraw(context: Context): Boolean = runCatching {
         Settings.canDrawOverlays(context)
     }.getOrDefault(false)
+
+    /**
+     * 悬浮确认卡：在任何 App 之上显示“动作 / 对象 / 后果”和确认、取消两个按钮。
+     * 必须在主线程调用。
+     *
+     * @return false = 没有悬浮窗权限或添加失败（调用方改用通知/语音）
+     */
+    fun showConfirmCard(context: Context, request: ConfirmRequest, onAnswer: (Boolean) -> Unit): Boolean {
+        if (!canDraw(context)) return false
+        dismissConfirmCard(context, null)
+        return try {
+            val appContext = context.applicationContext
+            val wm = appContext.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            val density = appContext.resources.displayMetrics.density
+            val shownAt = SystemClock.elapsedRealtime()
+            // 防误触：卡片刚出现的一小段时间内“确认”不生效（付款类更久）。
+            val armDelayMs = if (request.risk == Risk.MONEY) 1_500L else 700L
+            var answered = false
+            fun answerOnce(approved: Boolean) {
+                if (answered) return
+                answered = true
+                onAnswer(approved)
+            }
+
+            val card = LinearLayout(appContext).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(18, density), dp(14, density), dp(18, density), dp(10, density))
+                background = GradientDrawable().apply {
+                    setColor(Color.rgb(18, 24, 36))
+                    cornerRadius = 18f * density
+                    setStroke(dp(1, density), riskColor(request.risk))
+                }
+                elevation = 12f * density
+            }
+            card.addView(TextView(appContext).apply {
+                text = if (request.risk == Risk.MONEY) "Pilot 需要你确认（涉及付款）" else "Pilot 需要你确认"
+                setTextColor(riskColor(request.risk))
+                textSize = 15f
+                setTypeface(typeface, Typeface.BOLD)
+            })
+            fun row(label: String, value: String) {
+                if (value.isBlank()) return
+                card.addView(TextView(appContext).apply {
+                    text = "$label：${value.take(160)}"
+                    setTextColor(Color.rgb(226, 232, 240))
+                    textSize = 14f
+                    setPadding(0, dp(6, density), 0, 0)
+                })
+            }
+            row("动作", request.action)
+            row("对象", request.target.orEmpty())
+            row("后果", request.consequence)
+            card.addView(TextView(appContext).apply {
+                text = if (request.risk == Risk.MONEY) {
+                    "付款类操作只能点按钮确认；说“取消”可以放弃。"
+                } else {
+                    "也可以直接说“确认”或“取消”。"
+                }
+                setTextColor(Color.rgb(148, 163, 184))
+                textSize = 12f
+                setPadding(0, dp(8, density), 0, 0)
+            })
+            val buttons = LinearLayout(appContext).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.END
+                setPadding(0, dp(6, density), 0, 0)
+            }
+            buttons.addView(Button(appContext).apply {
+                text = "取消"
+                isAllCaps = false
+                setOnClickListener { answerOnce(false) }
+            })
+            buttons.addView(Button(appContext).apply {
+                text = "确认执行"
+                isAllCaps = false
+                // 被其他窗口遮挡时不接受点击，防点击劫持。
+                filterTouchesWhenObscured = true
+                setOnClickListener {
+                    if (SystemClock.elapsedRealtime() - shownAt < armDelayMs) return@setOnClickListener
+                    answerOnce(true)
+                }
+            })
+            card.addView(buttons)
+
+            val lp = WindowManager.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                PixelFormat.TRANSLUCENT,
+            ).apply {
+                gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                x = 0
+                y = dp(48, density)
+                horizontalMargin = 0.03f
+            }
+            wm.addView(card, lp)
+            confirmView = card
+            confirmId = request.id
+            Dbg.i(TAG, "悬浮确认卡已显示 id=${request.id} risk=${request.risk}")
+            true
+        } catch (t: Throwable) {
+            Dbg.w(TAG, "显示悬浮确认卡失败 ${t.message}")
+            confirmView = null
+            confirmId = -1L
+            false
+        }
+    }
+
+    /**
+     * 收起悬浮确认卡。[id] 为 null 时无条件收起；否则只收起对应请求的卡。
+     * 必须在主线程调用。
+     */
+    fun dismissConfirmCard(context: Context, id: Long?) {
+        val view = confirmView ?: return
+        if (id != null && id != confirmId) return
+        confirmView = null
+        confirmId = -1L
+        val wm = context.applicationContext.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+        runCatching { wm?.removeView(view) }
+            .onFailure { Dbg.w(TAG, "移除悬浮确认卡失败 ${it.message}") }
+    }
+
+    fun isConfirmCardShowing(id: Long): Boolean = confirmView != null && confirmId == id
+
+    private fun riskColor(risk: Risk): Int = when (risk) {
+        Risk.MONEY -> Color.rgb(255, 112, 122)
+        Risk.IRREVERSIBLE -> Color.rgb(255, 190, 94)
+        Risk.EXTERNAL, Risk.SENSITIVE -> Color.rgb(96, 165, 250)
+        Risk.NONE -> Color.rgb(84, 220, 166)
+    }
 
     private fun render() {
         val indicator = statusView ?: return

@@ -3,6 +3,9 @@ package com.pilot.agent.browser
 import android.content.Context
 import android.content.Intent
 import android.webkit.CookieManager
+import com.pilot.agent.action.LaunchOutcome
+import com.pilot.agent.action.VerifiedLauncher
+import java.lang.ref.WeakReference
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -24,15 +27,20 @@ data class BrowserResult(
  */
 object BrowserSessionManager {
 
+    /** 弱引用持有（审核 R3）：不再用静态强引用拖住已销毁的 Activity。 */
     @Volatile
-    private var activity: BrowserActivity? = null
+    private var activityRef: WeakReference<BrowserActivity>? = null
+
+    /** 只返回仍可用的页面：已 finish / destroy / 渲染进程崩溃的一律视为没有。 */
+    private val activity: BrowserActivity?
+        get() = activityRef?.get()?.takeIf { !it.isFinishing && !it.isDestroyed && !it.webViewGone }
 
     internal fun attach(value: BrowserActivity) {
-        activity = value
+        activityRef = WeakReference(value)
     }
 
     internal fun detach(value: BrowserActivity) {
-        if (activity === value) activity = null
+        if (activityRef?.get() === value) activityRef = null
     }
 
     suspend fun execute(
@@ -66,7 +74,7 @@ object BrowserSessionManager {
     suspend fun clearSessionData(context: Context) {
         withContext(Dispatchers.Main.immediate) {
             activity?.closeSession()
-            activity = null
+            activityRef = null
             CookieManager.getInstance().removeAllCookies(null)
             CookieManager.getInstance().flush()
         }
@@ -75,21 +83,25 @@ object BrowserSessionManager {
 
     private suspend fun open(context: Context, url: String): BrowserResult {
         var page = activity
-        if (page == null || page.isFinishing) {
-            val launched = runCatching {
-                context.startActivity(
-                    Intent(context, BrowserActivity::class.java)
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
-                        .setData(android.net.Uri.parse(url)),
-                )
-            }.isSuccess
-            if (!launched) return BrowserResult(false, "无法启动 Pilot 浏览器会话。")
+        if (page == null) {
+            // 审核 D-01：经 VerifiedLauncher 启动并回查；被后台拦截时如实返回失败。
+            val intent = Intent(context, BrowserActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+                .setData(android.net.Uri.parse(url))
+            val outcome = VerifiedLauncher.launch(context, intent, context.packageName, 1_500L)
+            when (outcome) {
+                is LaunchOutcome.Blocked ->
+                    return BrowserResult(false, "系统拦下了打开 Pilot 浏览器（${outcome.reason.take(60)}），请回到 Pilot 后再试。")
+                is LaunchOutcome.Failed ->
+                    return BrowserResult(false, "无法启动 Pilot 浏览器会话：${outcome.error.javaClass.simpleName}")
+                else -> Unit // Ok / Unknown：以 Activity 是否真的 attach 为准
+            }
             withTimeoutOrNull(6_000L) {
                 while (activity == null) delay(50L)
             }
             page = activity
         }
-        if (page == null) return BrowserResult(false, "浏览器会话启动超时。")
+        if (page == null) return BrowserResult(false, "浏览器会话没有启动起来（可能被系统的后台限制拦下），这次没有打开网页。")
         return page.navigate(url)
     }
 

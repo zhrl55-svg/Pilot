@@ -27,17 +27,26 @@ class LocalToolRuntime(
     val devices = DeviceTools(appContext)
     private val ssh = SshTool()
     val memory = MemoryStore(appContext)
+    /** 提醒 / 待办 / 日历 / 通知：本地优先，命中就不上云（审核 P0-7、产品 T2）。 */
+    private val personal = PersonalTools(appContext)
 
     fun match(text: String): ToolInvocation? {
         val t = text.trim()
         if (t.isEmpty()) return null
         val builtIn = matchScheduledTask(t)
+            ?: personal.match(t)
             ?: matchMemory(t)
             ?: matchScreenshot(t)
             ?: matchDevice(t)
         if (builtIn != null) return builtIn
         if (!prefersAgentExtension(t)) matchFiles(t)?.let { return it }
         return ssh.match(t)
+    }
+
+    /** 这句话是否命中了本机私人能力（提醒/待办/日历/通知/记忆）。命中的请求不得先发云端。 */
+    fun isPersonalLocal(text: String): Boolean {
+        val t = text.trim()
+        return t.isNotEmpty() && (personal.match(t) != null || matchMemory(t) != null)
     }
 
     /**
@@ -126,21 +135,30 @@ class LocalToolRuntime(
         invocation: ToolInvocation,
         decision: String,
     ): ToolResult {
-        val result = runCatching {
+        val personalRead = com.pilot.agent.assistant.PrivacyGate.isPersonalRead(invocation.name)
+        // 锁屏时不读出个人数据（审核 产品 T5）。
+        if (personalRead && com.pilot.agent.assistant.PrivacyGate.isDeviceLocked(appContext)) {
+            audit.record(invocation.name, invocation.group, "locked", ToolStatus.DENIED, invocation.summary)
+            return ToolResult.denied(com.pilot.agent.assistant.PrivacyGate.LOCKED_PERSONAL_REPLY)
+        }
+        // 审核 C4：原来 runCatching 把外部取消（点“停止”）也记成“工具执行失败”。
+        // TimeoutCancellationException 是本工具自己的超时，单独处理；其余取消一律向上抛。
+        val result = try {
             withTimeout(TIMEOUT_MS) {
                 invocation.execute(appContext) { _, _ -> false }
             }
-        }.getOrElse { error ->
+        } catch (error: TimeoutCancellationException) {
+            Dbg.w(TAG, "${invocation.name} timeout")
+            ToolResult.error("工具执行超时，已停止。")
+        } catch (error: Throwable) {
+            com.pilot.agent.runtime.rethrowIfCancellation(error)
             Dbg.w(TAG, "${invocation.name} failed: ${error.javaClass.simpleName}")
-            if (error is TimeoutCancellationException) {
-                ToolResult.error("工具执行超时，已停止。")
-            } else {
-                ToolResult.error("工具执行失败：${error.message?.take(160) ?: error.javaClass.simpleName}")
-            }
+            ToolResult.error("工具执行失败：${error.message?.take(160) ?: error.javaClass.simpleName}")
         }
         val capped = result.copy(
             message = result.message.take(MAX_RESULT_CHARS),
             spoken = result.spoken.take(MAX_SPOKEN_CHARS),
+            privateSpeech = result.privateSpeech || personalRead,
         )
         audit.record(
             invocation.name,

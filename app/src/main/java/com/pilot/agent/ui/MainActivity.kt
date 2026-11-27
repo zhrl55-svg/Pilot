@@ -180,6 +180,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         super.onPause()
+        // 界面不可见后，待确认请求改用悬浮确认卡（跨 App 确认通道）。
+        PilotStatusOverlay.onAppBackground(this)
         if (!isFinishing && vm.shouldShowStatusOverlay()) {
             PilotStatusOverlay.show(this, vm.statusForOverlay())
         } else {
@@ -1855,11 +1857,12 @@ private fun InputBar(
         }
     }
 
-    // ★ 老板要求：语音唤醒或长按激活后进入连续对话，只要麦克风还在收，
-    //   输入框就要显示「正在听…」+ 流光边框。
-    //   但排除 WAKE_WAIT/ASLEEP（常驻待命也在开麦，那不算"在听"）——
+    // ★ 老板要求：只要在聆听态（唤醒通过 / 打断 / AI 播报结束自动进入），
+    //   输入框就要显示「正在听…」+ 流光边框；聆听窗口由语音层按 5 秒/1 秒规则自动收起。
+    //   排除 WAKE_WAIT/ASLEEP（常驻待命也在开麦，那不算"在听"）——
     //   这正是之前"输入框一直显示正在听"的坑，靠 sessionListening 区分。
-    val live = recording || (sessionListening && !suppressListeningUi)
+    //   文本输入态（用户点了输入框在打字）不显示：动效会盖住正在编辑的字。
+    val live = recording || (sessionListening && !suppressListeningUi && !textMode)
     // 只在实际聆听时创建动画；进入休眠后立即销毁，避免隐藏边框继续空转。
     val phase = if (live) {
         val spin = rememberInfiniteTransition(label = "rec")

@@ -97,7 +97,11 @@ object ResultFormatter {
         result: ToolResult,
     ): Reply {
         val summary = title(capability, action, args)
-        val header = if (result.status == ToolStatus.SUCCESS) "✅ $summary" else "⚠️ $summary 失败"
+        val header = when (result.status) {
+            ToolStatus.SUCCESS -> "✅ $summary"
+            ToolStatus.UNKNOWN -> "❔ $summary 结果未确认"
+            else -> "⚠️ $summary 失败"
+        }
         val body = result.message.trim()
         val text = when {
             body.isEmpty() -> header
@@ -107,6 +111,7 @@ object ResultFormatter {
         val spoken = when {
             result.spoken.isNotBlank() -> result.spoken.take(MAX_SPOKEN_CHARS)
             result.status == ToolStatus.SUCCESS -> summary
+            result.status == ToolStatus.UNKNOWN -> "$summary 已发出，但结果没能确认。"
             else -> "$summary 失败：${result.message.take(80)}"
         }
         return Reply(text = text, spoken = spoken)

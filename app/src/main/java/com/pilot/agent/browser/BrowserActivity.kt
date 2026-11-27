@@ -10,9 +10,14 @@ import android.view.inputmethod.InputMethodManager
 import android.view.KeyEvent
 import android.view.ViewGroup
 import android.webkit.CookieManager
+import android.net.http.SslError
 import android.webkit.JavascriptInterface
+import android.webkit.RenderProcessGoneDetail
+import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -44,6 +49,15 @@ class BrowserActivity : ComponentActivity() {
     private lateinit var progress: ProgressBar
     private var pageLoaded = CompletableDeferred<Boolean>()
 
+    /** 当前这次主框架加载的错误（审核 B-01）；每次 load 重置。 */
+    @Volatile
+    private var mainFrameError: String? = null
+
+    /** WebView 已销毁 / 渲染进程已崩溃：后续操作一律失败返回，不再碰 WebView（审核 B-02 / R3）。 */
+    @Volatile
+    internal var webViewGone: Boolean = false
+        private set
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(buildContent())
@@ -64,9 +78,16 @@ class BrowserActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        runCatching { CookieManager.getInstance().flush() }
-        runCatching { webView.stopLoading() }
+        // 先解除会话引用，再销毁 WebView（审核 R3：原来只 stopLoading，不 destroy）。
         BrowserSessionManager.detach(this)
+        webViewGone = true
+        if (!pageLoaded.isCompleted) pageLoaded.complete(false)
+        runCatching { CookieManager.getInstance().flush() }
+        runCatching {
+            webView.stopLoading()
+            (webView.parent as? ViewGroup)?.removeView(webView)
+            webView.destroy()
+        }
         super.onDestroy()
     }
 
@@ -209,6 +230,43 @@ class BrowserActivity : ComponentActivity() {
                     updateAddress(url)
                     if (!pageLoaded.isCompleted) pageLoaded.complete(true)
                 }
+
+                override fun onReceivedError(
+                    view: WebView,
+                    request: WebResourceRequest,
+                    error: WebResourceError,
+                ) {
+                    if (!request.isForMainFrame) return
+                    mainFrameError = "${error.description}（错误码 ${error.errorCode}）"
+                }
+
+                override fun onReceivedHttpError(
+                    view: WebView,
+                    request: WebResourceRequest,
+                    errorResponse: WebResourceResponse,
+                ) {
+                    if (!request.isForMainFrame) return
+                    if (errorResponse.statusCode >= 400) mainFrameError = "HTTP ${errorResponse.statusCode}"
+                }
+
+                override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
+                    // 证书错误一律不放行（与 WebView 默认行为一致），但要如实记录给上层。
+                    handler.cancel()
+                    mainFrameError = "网站证书不受信任（SSL 错误 ${error.primaryError}）"
+                }
+
+                override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                    // 返回 true：渲染进程崩溃时不连带杀掉 Pilot 主进程（语音、导航都在里面）。
+                    webViewGone = true
+                    if (!pageLoaded.isCompleted) pageLoaded.complete(false)
+                    BrowserSessionManager.detach(this@BrowserActivity)
+                    runCatching {
+                        (view.parent as? ViewGroup)?.removeView(view)
+                        view.destroy()
+                    }
+                    finish()
+                    return true
+                }
             }
             webChromeClient = object : WebChromeClient() {
                 override fun onProgressChanged(view: WebView, newProgress: Int) {
@@ -230,18 +288,32 @@ class BrowserActivity : ComponentActivity() {
         return root
     }
 
+    /**
+     * 审核 B-01：原来固定 ok=true，打开失败也报“已打开”。
+     * 现在主框架出错、超时未加载完、渲染进程崩溃都如实返回 ok=false。
+     */
     suspend fun navigate(target: String): BrowserResult = runBlockingMain {
-        load(target)
+        if (webViewGone) return@runBlockingMain BrowserResult(false, "浏览器页面已关闭，请重新打开网页。")
+        if (!load(target)) return@runBlockingMain BrowserResult(false, "只允许打开 HTTP/HTTPS 网页。")
         val loaded = withTimeoutOrNull(12_000L) { pageLoaded.await() } ?: false
+        if (webViewGone) return@runBlockingMain BrowserResult(false, "网页渲染进程崩溃，页面已关闭，请重新打开。")
+        val error = mainFrameError
+        if (error != null) {
+            return@runBlockingMain BrowserResult(
+                false,
+                "网页打开失败：$error",
+                url = target,
+            )
+        }
         val result = read(20_000)
-        result.copy(
-            ok = true,
-            message = if (loaded) {
-                "已打开 ${result.title.ifBlank { result.url }}"
-            } else {
-                "网页仍在加载，已打开 ${target}"
-            },
-        )
+        if (!loaded) {
+            return@runBlockingMain result.copy(
+                ok = false,
+                message = "网页 12 秒内没有加载完成，结果未知（可能网络较慢）：$target",
+            )
+        }
+        if (!result.ok) return@runBlockingMain result
+        result.copy(ok = true, message = "已打开 ${result.title.ifBlank { result.url }}")
     }
 
     suspend fun read(maxChars: Int): BrowserResult = runBlockingMain {
@@ -257,7 +329,9 @@ class BrowserActivity : ComponentActivity() {
               });
             })()
         """.trimIndent()
-        val raw = decodeJsString(evaluate(js))
+        val evaluated = evaluate(js)
+            ?: return@runBlockingMain BrowserResult(false, EVAL_FAILED)
+        val raw = decodeJsString(evaluated)
         val obj = runCatching { JSONObject(raw) }.getOrElse {
             return@runBlockingMain BrowserResult(false, "网页正文读取失败：${it.message}")
         }
@@ -303,7 +377,11 @@ class BrowserActivity : ComponentActivity() {
               return JSON.stringify({ok:true,label:(el.innerText || el.value || locator).slice(0,80)});
             })()
         """.trimIndent()
-        val result = JSONObject(decodeJsString(evaluate(js)))
+        val evaluated = evaluate(js)
+            ?: return@runBlockingMain BrowserResult(false, EVAL_FAILED)
+        val result = runCatching { JSONObject(decodeJsString(evaluated)) }.getOrElse {
+            return@runBlockingMain BrowserResult(false, "网页点击结果解析失败。")
+        }
         BrowserResult(
             ok = result.optBoolean("ok"),
             message = if (result.optBoolean("ok")) {
@@ -359,7 +437,11 @@ class BrowserActivity : ComponentActivity() {
               return JSON.stringify({ok:true});
             })()
         """.trimIndent()
-        val result = JSONObject(decodeJsString(evaluate(js)))
+        val evaluated = evaluate(js)
+            ?: return@runBlockingMain BrowserResult(false, EVAL_FAILED)
+        val result = runCatching { JSONObject(decodeJsString(evaluated)) }.getOrElse {
+            return@runBlockingMain BrowserResult(false, "网页输入结果解析失败。")
+        }
         BrowserResult(
             ok = result.optBoolean("ok"),
             message = if (result.optBoolean("ok")) "已填写网页输入框"
@@ -371,9 +453,9 @@ class BrowserActivity : ComponentActivity() {
 
     suspend fun scroll(forward: Boolean): BrowserResult = runBlockingMain {
         val factor = if (forward) "0.82" else "-0.82"
-        val raw = decodeJsString(
-            evaluate("window.scrollBy({top: window.innerHeight * $factor, behavior:'smooth'}); true"),
-        )
+        val evaluated = evaluate("window.scrollBy({top: window.innerHeight * $factor, behavior:'smooth'}); true")
+            ?: return@runBlockingMain BrowserResult(false, EVAL_FAILED)
+        val raw = decodeJsString(evaluated)
         BrowserResult(
             ok = raw != "null",
             message = if (forward) "网页已向下滚动" else "网页已向上滚动",
@@ -383,6 +465,7 @@ class BrowserActivity : ComponentActivity() {
     }
 
     suspend fun goBack(): BrowserResult = runBlockingMain {
+        if (webViewGone) return@runBlockingMain BrowserResult(false, "浏览器页面已关闭。")
         if (!webView.canGoBack()) {
             return@runBlockingMain BrowserResult(false, "网页已经是第一页。")
         }
@@ -434,24 +517,40 @@ class BrowserActivity : ComponentActivity() {
         address.setSelection(address.text.length)
     }
 
-    private fun load(target: String) {
+    private fun load(target: String): Boolean {
+        if (webViewGone) return false
         val uri = android.net.Uri.parse(target)
         val scheme = uri.scheme?.lowercase()
         if (scheme != "http" && scheme != "https") {
             Toast.makeText(this, "只允许 HTTP/HTTPS 页面", Toast.LENGTH_SHORT).show()
-            return
+            return false
         }
+        // 每次加载一个新的 Deferred + 清空错误：上一页的 onPageFinished 不会提前完成这一次。
+        if (!pageLoaded.isCompleted) pageLoaded.complete(false)
         pageLoaded = CompletableDeferred()
+        mainFrameError = null
         address.setText(target)
         address.setSelection(address.text.length)
         webView.loadUrl(target)
+        return true
     }
 
-    private suspend fun evaluate(script: String): String =
+    /**
+     * 审核 B-02：加 8 秒超时。页面卡死、Activity 被回收或渲染进程崩溃时回调不会回来，
+     * 原实现会让 AgentLoop 永久挂起。@return null = 超时或 WebView 已不可用
+     */
+    private suspend fun evaluate(script: String): String? =
         withContext(Dispatchers.Main.immediate) {
-            suspendCancellableCoroutine { continuation ->
-                webView.evaluateJavascript(script) { value ->
-                    if (continuation.isActive) continuation.resume(value ?: "null")
+            if (webViewGone || isFinishing || isDestroyed) return@withContext null
+            withTimeoutOrNull(EVAL_TIMEOUT_MS) {
+                suspendCancellableCoroutine<String> { continuation ->
+                    try {
+                        webView.evaluateJavascript(script) { value ->
+                            if (continuation.isActive) continuation.resume(value ?: "null")
+                        }
+                    } catch (t: Throwable) {
+                        if (continuation.isActive) continuation.resume("null")
+                    }
                 }
             }
         }
@@ -474,5 +573,7 @@ class BrowserActivity : ComponentActivity() {
 
     companion object {
         private const val STATE_URL = "browser_url"
+        private const val EVAL_TIMEOUT_MS = 8_000L
+        private const val EVAL_FAILED = "网页脚本 8 秒内没有响应（页面可能卡死或已关闭），这一步没有执行成功。"
     }
 }

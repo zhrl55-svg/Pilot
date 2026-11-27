@@ -16,6 +16,9 @@ data class McpExecution(
     val output: String,
     val exitCode: Int,
     val durationMs: Long,
+    /** 沙箱执行状态：非 DONE 时结果不可信（未启动 / 结果未知），上层要如实报告、不得重跑。 */
+    val status: com.pilot.agent.sandbox.SandboxTerminal.Status =
+        com.pilot.agent.sandbox.SandboxTerminal.Status.DONE,
 )
 
 /**
@@ -93,6 +96,7 @@ class McpClient(private val context: Context) {
             output = result.output.trim(),
             exitCode = result.exitCode,
             durationMs = result.durationMs,
+            status = result.status,
         )
     }
 
@@ -116,8 +120,11 @@ class McpClient(private val context: Context) {
         "'" + value.replace("'", "'\"'\"'") + "'"
 
     companion object {
-        private const val COLD_START_TIMEOUT_MS = 420_000L
-        private const val CALL_TIMEOUT_MS = 330_000L
+        // 审核 P2：原来 420s/330s 会让一次 MCP 调用把语音/后台队列堵死好几分钟。
+        // 冷启动（首次解 rootfs）给 90 秒，普通调用给 60 秒；超时由 SandboxTerminal 如实返回
+        // Status.UNKNOWN，上层播报「结果未知」而不是继续干等或重跑（重跑可能产生重复副作用）。
+        private const val COLD_START_TIMEOUT_MS = 90_000L
+        private const val CALL_TIMEOUT_MS = 60_000L
         private val SERVER_RE = Regex("[A-Za-z0-9_.-]{1,96}")
         private val TOOL_RE = Regex("[A-Za-z0-9_.:/-]{1,160}")
     }

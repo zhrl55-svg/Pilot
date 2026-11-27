@@ -22,12 +22,19 @@ object QueryEngine {
         NotificationQueryTool(),
         trainTool,
         StockTool(),
-        WeatherTool(),
+        GuardedWeatherTool(WeatherTool()),
         NewsSearchTool(),
         NearbySearchTool(),
         WebSearchTool(),
         WebPageTool(),
     )
+
+    /**
+     * 最近一次查询失败的原因（[handle] 失败时返回 null，原因放这里，供调用方如实说明）。
+     */
+    @Volatile
+    var lastFailure: String? = null
+        private set
 
     /** 有没有工具能接这个需求。用来在意图门之后快速分流。 */
     fun canHandle(goal: String): Boolean =
@@ -79,26 +86,118 @@ object QueryEngine {
 
     /**
      * 执行查询。
-     * @return 播报文本；null = 没有工具接 / 执行失败
+     *
+     * 审核 Q-01：失败文案（“查询失败”“没配置 Key”）不再当作答案返回——
+     * 只有 [QueryResult.Answer] / [QueryResult.NeedMoreInfo] 返回文本；
+     * 失败返回 null（原因见 [lastFailure]），Agent 模式据此改用浏览器继续。
+     *
+     * @return 播报文本；null = 没有工具接 / 没查到 / 查询不可用
      */
     suspend fun handle(goal: String): String? {
+        return when (val r = handleResult(goal)) {
+            is QueryResult.Answer -> r.text
+            is QueryResult.NeedMoreInfo -> r.prompt
+            is QueryResult.NoResult -> null
+            is QueryResult.Unavailable -> null
+            null -> null
+        }
+    }
+
+    /**
+     * 结构化查询。@return null = 没有工具接这个需求
+     */
+    suspend fun handleResult(goal: String): QueryResult? {
+        lastFailure = null
         if (trainTool.hasPending() && trainTool.looksLikeReply(goal)) {
             Dbg.i(TAG, "继续补全 12306 查询（${goal.length} 字符）")
-            return try {
-                trainTool.execute(goal)
+            return record(try {
+                trainTool.executeResult(goal)
             } catch (t: Throwable) {
+                if (t is kotlinx.coroutines.CancellationException) throw t
                 Dbg.e(TAG, "12306 补全失败：${t.message}")
-                null
-            }
+                QueryResult.Unavailable("12306 查询失败，请稍后再试。")
+            })
         }
         val tool = tools.firstOrNull { it.matches(goal) } ?: return null
         if (tool !== trainTool) trainTool.discardPending()
         Dbg.i(TAG, "用 ${tool.name} 处理查询（${goal.length} 字符）")
-        return try {
-            tool.execute(goal)
+        return record(try {
+            tool.executeResult(goal)
         } catch (t: Throwable) {
+            if (t is kotlinx.coroutines.CancellationException) throw t
             Dbg.e(TAG, "${tool.name} 执行失败：${t.message}")
-            null
+            QueryResult.Unavailable("查询失败：${t.javaClass.simpleName}")
+        })
+    }
+
+    private fun record(result: QueryResult): QueryResult {
+        when (result) {
+            is QueryResult.NoResult -> lastFailure = result.why
+            is QueryResult.Unavailable -> lastFailure = result.why
+            else -> Unit
+        }
+        if (!result.isAnswered) Dbg.i(TAG, "查询未得到答案：${result.displayText.take(80)}")
+        return result
+    }
+}
+
+/**
+ * WeatherTool 的外层保护（WeatherTool 本身被锁定不能改）。
+ *
+ * 1. “手机温度 / 电池温度 / 体温”不是天气（审核 Q-03 其它）。
+ * 2. 用户点名了城市、但回答里根本没有这个城市 —— 说明内部回退成了定位城市，
+ *    不能静默把“当前位置的天气”当成“大理的天气”报出去（审核 Q-03）。
+ */
+internal class GuardedWeatherTool(private val inner: QueryTool) : QueryTool {
+    override val name: String get() = inner.name
+
+    override fun matches(goal: String): Boolean {
+        if (NOT_WEATHER.any { goal.contains(it, ignoreCase = true) }) return false
+        return inner.matches(goal)
+    }
+
+    override suspend fun execute(goal: String): String? = inner.execute(goal)
+
+    override suspend fun executeResult(goal: String): QueryResult {
+        val result = inner.executeResult(goal)
+        if (result !is QueryResult.Answer) return result
+        val city = candidateCity(goal) ?: return result
+        val answer = result.text
+        val mentioned = answer.contains(city) || (city.length >= 3 && answer.contains(city.take(2)))
+        if (mentioned) return result
+        return QueryResult.NeedMoreInfo(
+            "没查到「$city」的天气，我不会拿你当前所在地的天气冒充。" +
+                "请换个说法，比如说完整的城市名“${city}市天气”，或者说“本地天气”。",
+        )
+    }
+
+    companion object {
+        private val NOT_WEATHER = listOf(
+            "手机温度", "电池温度", "机身温度", "CPU温度", "cpu 温度", "处理器温度", "体温", "水温", "油温",
+        )
+        private val WEATHER_KEYWORD = Regex("(天气|气温|温度|下雨|下雪|刮风|空气质量|预报|冷不冷|热不热)")
+        private val LEADING = Regex("^(请|麻烦|帮我|给我|你)?(查一下|查查|查询|查|看一下|看看|看|问一下|告诉我|说一下|说说|播报一下|播报|报一下)?")
+        private val FILLERS = Regex(
+            "(大后天|后天|明天|今天|今晚|明晚|今早|明早|现在|当前|此刻|这几天|这两天|未来几天|未来一周|未来|一周|本周|这周|下周|周末|最近|近期|" +
+                "上午|下午|晚上|早上|中午|夜里|会不会|会|要不要|要|有没有|怎么样|如何|吗|呢|的)",
+        )
+        private val NOT_A_PLACE = setOf(
+            "本地", "当地", "这里", "这边", "我这", "我这里", "我们这", "我们这里", "附近", "外面", "家里",
+            "户外", "手机", "电池", "室内", "室外", "这", "那", "那边", "那里",
+        )
+
+        /** 抽出句子里点名的城市/地区；没有点名返回 null。 */
+        fun candidateCity(goal: String): String? {
+            val m = WEATHER_KEYWORD.find(goal) ?: return null
+            var head = goal.substring(0, m.range.first).trim()
+            head = LEADING.replace(head, "")
+            head = FILLERS.replace(head, "")
+            head = head.replace(Regex("[\\s，,。.？?！!：:、]"), "")
+            head = head.removeSuffix("市").removeSuffix("县").removeSuffix("区")
+            if (head.length !in 2..8) return null
+            if (head in NOT_A_PLACE) return null
+            if (!head.all { it in '\u4e00'..'\u9fa5' }) return null
+            return head
         }
     }
 }

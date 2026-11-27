@@ -11,8 +11,9 @@ import android.net.Uri
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import com.pilot.agent.Dbg
+import com.pilot.agent.query.EncryptedJsonStore
 import com.pilot.agent.query.QueryEngine
-import com.pilot.agent.query.SecretVault
+import com.pilot.agent.query.VaultUnavailableException
 import com.pilot.agent.runtime.AgentRuntime
 import java.text.SimpleDateFormat
 import java.util.Calendar
@@ -34,6 +35,8 @@ object ScheduledTaskManager {
     private const val TAG = "PilotScheduledTask"
     private const val KEY_ITEMS = "scheduled_tool_tasks_v1"
     private const val CHANNEL = "pilot_scheduled_tools"
+    /** 到点时存储读不出来：隔 15 分钟重试一次，避免每日任务链就此断掉。 */
+    private const val STORE_RETRY_MS = 15L * 60_000L
 
     data class Task(
         val id: String,
@@ -42,13 +45,29 @@ object ScheduledTaskManager {
         val daily: Boolean,
     )
 
+    /**
+     * E1：加密存储读/写失败时中止本次「读→改→写」，返回 [fallback]（如实告知没有做修改），
+     * 绝不把「读失败得到的空列表」写回去覆盖用户的定时任务。
+     */
+    private inline fun <T> guardStore(fallback: T, block: () -> T): T =
+        try {
+            block()
+        } catch (e: VaultUnavailableException) {
+            Dbg.e(TAG, "定时任务存储不可用，已中止本次操作：${e.name}")
+            fallback
+        }
+
     fun handles(text: String): Boolean =
         Regex("每天\\s*(?:早上|上午|中午|下午|晚上)?\\s*\\d{1,2}(?:[:：点时])")
             .containsMatchIn(text) ||
             Regex("\\d+\\s*(?:分钟|小时)后\\s*(?:执行|运行|查看|查询|播报)")
                 .containsMatchIn(text)
 
-    fun create(context: Context, rawText: String): String? {
+    @Synchronized
+    fun create(context: Context, rawText: String): String? =
+        guardStore(EncryptedJsonStore.UNAVAILABLE_MESSAGE) { createUnsafe(context, rawText) }
+
+    private fun createUnsafe(context: Context, rawText: String): String? {
         val text = rawText.trim()
         val dailyMatch = Regex(
             "每天\\s*(早上|上午|中午|下午|晚上)?\\s*(\\d{1,2})(?:[:：点时])(\\d{1,2})?分?\\s*" +
@@ -113,7 +132,11 @@ object ScheduledTaskManager {
      *
      * @return null = 参数不完整；否则为回话（成功以「已创建」开头，可直接据此判定）
      */
-    fun createFromParsed(context: Context, goal: String, atMillis: Long, daily: Boolean): String? {
+    @Synchronized
+    fun createFromParsed(context: Context, goal: String, atMillis: Long, daily: Boolean): String? =
+        guardStore(EncryptedJsonStore.UNAVAILABLE_MESSAGE) { createFromParsedUnsafe(context, goal, atMillis, daily) }
+
+    private fun createFromParsedUnsafe(context: Context, goal: String, atMillis: Long, daily: Boolean): String? {
         val text = cleanGoal(goal)
         if (text.isBlank()) return null
         if (atMillis <= System.currentTimeMillis()) return null
@@ -127,30 +150,44 @@ object ScheduledTaskManager {
             if (daily) "，之后每天同一时间执行。" else "执行。"
     }
 
-    /** 按 id 精确取消。@return null = 任务不存在 */
-    fun cancelById(context: Context, id: String): String? {
+    /** 按 id 精确取消。@return null = 任务不存在；存储不可用时返回不以「已」开头的说明 */
+    @Synchronized
+    fun cancelById(context: Context, id: String): String? =
+        guardStore(EncryptedJsonStore.UNAVAILABLE_MESSAGE) { cancelByIdUnsafe(context, id) }
+
+    private fun cancelByIdUnsafe(context: Context, id: String): String? {
         val tasks = load(context)
         val target = tasks.firstOrNull { it.id == id } ?: return null
         cancelAlarm(context, target)
         save(context, tasks.filterNot { it.id == id })
-        Dbg.i(TAG, "定时任务已取消：${target.goal}")
+        Dbg.i(TAG, "定时任务已取消：id=${target.id} ${com.pilot.agent.LogRedactor.text("goal", target.goal)}")
         return "已取消定时任务：${target.goal}"
     }
 
-    /** 列出全部任务（按触发时间升序）。UI 定时任务面板用。 */
+    /** 列出全部任务（按触发时间升序）。UI 定时任务面板用。存储读不出来时返回空列表（只读，不会覆盖）。 */
+    @Synchronized
     fun allTasks(context: Context): List<Task> =
-        load(context).sortedBy { it.at }
+        guardStore(emptyList()) { load(context).sortedBy { it.at } }
 
     /**
      * 改时间 / 改内容 / 切换每日。改完立即重排闹钟。
-     * @return 成功返回新任务，失败返回 null（任务不存在）。
+     * @return 成功返回新任务，失败返回 null（任务不存在或存储不可用）。
      */
+    @Synchronized
     fun updateTask(
         context: Context,
         id: String,
         goal: String = "",
         at: Long = 0L,
         daily: Boolean? = null,
+    ): Task? = guardStore<Task?>(null) { updateTaskUnsafe(context, id, goal, at, daily) }
+
+    private fun updateTaskUnsafe(
+        context: Context,
+        id: String,
+        goal: String,
+        at: Long,
+        daily: Boolean?,
     ): Task? {
         val tasks = load(context).toMutableList()
         val index = tasks.indexOfFirst { it.id == id }
@@ -165,17 +202,20 @@ object ScheduledTaskManager {
         cancelAlarm(context, old)
         save(context, tasks)
         schedule(context, next)
-        Dbg.i(TAG, "定时任务已更新：${next.goal} at=${next.at} daily=${next.daily}")
+        Dbg.i(TAG, "定时任务已更新：id=${next.id} ${com.pilot.agent.LogRedactor.text("goal", next.goal)} at=${next.at} daily=${next.daily}")
         return next
     }
 
-    /** 删除单条任务。@return 成功返回 true。 */
-    fun deleteTask(context: Context, id: String): Boolean {
+    /** 删除单条任务。@return 成功返回 true（存储不可用返回 false）。 */
+    @Synchronized
+    fun deleteTask(context: Context, id: String): Boolean = guardStore(false) { deleteTaskUnsafe(context, id) }
+
+    private fun deleteTaskUnsafe(context: Context, id: String): Boolean {
         val tasks = load(context)
         val target = tasks.firstOrNull { it.id == id } ?: return false
         cancelAlarm(context, target)
         save(context, tasks.filterNot { it.id == id })
-        Dbg.i(TAG, "定时任务已删除：${target.goal}")
+        Dbg.i(TAG, "定时任务已删除：id=${target.id} ${com.pilot.agent.LogRedactor.text("goal", target.goal)}")
         return true
     }
 
@@ -183,8 +223,13 @@ object ScheduledTaskManager {
      * 新建任务（UI 直接填表单）。
      * @param at 触发时间（epoch 毫秒）
      * @param daily true = 每天同一时间
+     * @return 存储不可用时返回 null
      */
-    fun createTask(context: Context, goal: String, at: Long, daily: Boolean): Task? {
+    @Synchronized
+    fun createTask(context: Context, goal: String, at: Long, daily: Boolean): Task? =
+        guardStore<Task?>(null) { createTaskUnsafe(context, goal, at, daily) }
+
+    private fun createTaskUnsafe(context: Context, goal: String, at: Long, daily: Boolean): Task? {
         val text = cleanGoal(goal)
         if (text.isBlank()) return null
         val task = Task(
@@ -195,11 +240,15 @@ object ScheduledTaskManager {
         )
         save(context, load(context) + task)
         schedule(context, task)
-        Dbg.i(TAG, "定时任务已创建：${task.goal} at=${task.at} daily=${task.daily}")
+        Dbg.i(TAG, "定时任务已创建：id=${task.id} ${com.pilot.agent.LogRedactor.text("goal", task.goal)} at=${task.at} daily=${task.daily}")
         return task
     }
 
-    fun list(context: Context): String {
+    @Synchronized
+    fun list(context: Context): String =
+        guardStore(EncryptedJsonStore.UNAVAILABLE_MESSAGE) { listUnsafe(context) }
+
+    private fun listUnsafe(context: Context): String {
         val tasks = load(context).sortedBy { it.at }
         if (tasks.isEmpty()) return "现在没有定时任务。"
         return buildString {
@@ -212,7 +261,11 @@ object ScheduledTaskManager {
         }
     }
 
-    fun cancel(context: Context, keyword: String): String {
+    @Synchronized
+    fun cancel(context: Context, keyword: String): String =
+        guardStore(EncryptedJsonStore.UNAVAILABLE_MESSAGE) { cancelUnsafe(context, keyword) }
+
+    private fun cancelUnsafe(context: Context, keyword: String): String {
         val clean = keyword.trim()
         // 空关键词不猜（旧实现会直接取消最早一条，太危险）。
         if (clean.isBlank()) return "要取消哪条定时任务？说“查看定时任务”可以先看看列表。"
@@ -225,7 +278,8 @@ object ScheduledTaskManager {
         return "已取消定时任务：${target.goal}"
     }
 
-    fun rescheduleAll(context: Context) {
+    @Synchronized
+    fun rescheduleAll(context: Context) = guardStore(Unit) {
         val now = System.currentTimeMillis()
         val tasks = load(context).mapNotNull { task ->
             if (!task.daily && task.at <= now) {
@@ -241,15 +295,23 @@ object ScheduledTaskManager {
         save(context, tasks)
     }
 
+    @Synchronized
     fun fire(context: Context, id: String) {
-        val tasks = load(context)
+        val tasks = try {
+            load(context)
+        } catch (e: VaultUnavailableException) {
+            // 读不出来就不知道任务内容，也无法为每日任务排下一次：稍后重试同一个 id。
+            Dbg.e(TAG, "定时任务到点但存储不可读，${STORE_RETRY_MS / 60_000} 分钟后重试：${e.name}")
+            schedule(context, Task(id = id, goal = "", at = System.currentTimeMillis() + STORE_RETRY_MS, daily = false))
+            return
+        }
         val task = tasks.firstOrNull { it.id == id } ?: return
         if (task.daily) {
             val next = task.copy(at = nextDailyAt(task.at, after = System.currentTimeMillis()))
-            save(context, tasks.map { if (it.id == id) next else it })
+            guardStore(Unit) { save(context, tasks.map { if (it.id == id) next else it }) }
             schedule(context, next)
         } else {
-            save(context, tasks.filterNot { it.id == id })
+            guardStore(Unit) { save(context, tasks.filterNot { it.id == id }) }
         }
         Thread {
             val answer = runCatching { runTask(context, task.goal) }
@@ -272,7 +334,8 @@ object ScheduledTaskManager {
         }
         return runBlocking { QueryEngine.handle(goal) }
             ?.let { QueryEngine.speechSummary(it) ?: it }
-            ?: "这个任务当前没有可用的数据源。"
+            // 审核 Q-01：查询失败不当作答案，如实报出原因。
+            ?: (QueryEngine.lastFailure?.let { "定时任务这次没查到结果：$it" } ?: "这个任务当前没有可用的数据源。")
     }
 
     private fun isSafeBackgroundGoal(goal: String): Boolean {
@@ -333,9 +396,10 @@ object ScheduledTaskManager {
         )
     }
 
-    private fun load(context: Context): List<Task> = runCatching {
-        val array = JSONArray(SecretVault.get(KEY_ITEMS).ifBlank { "[]" })
-        (0 until array.length()).mapNotNull { index ->
+    /** 读失败抛 [VaultUnavailableException]（由 [guardStore] 接住）；JSON 损坏会先备份再按空处理。 */
+    private fun load(context: Context): List<Task> {
+        val array = EncryptedJsonStore.readArray(KEY_ITEMS)
+        return (0 until array.length()).mapNotNull { index ->
             val obj = array.optJSONObject(index) ?: return@mapNotNull null
             Task(
                 id = obj.optString("id"),
@@ -344,7 +408,7 @@ object ScheduledTaskManager {
                 daily = obj.optBoolean("daily"),
             )
         }
-    }.getOrDefault(emptyList())
+    }
 
     private fun save(context: Context, tasks: List<Task>) {
         val array = JSONArray()
@@ -357,7 +421,7 @@ object ScheduledTaskManager {
                     .put("daily", task.daily)
             )
         }
-        SecretVault.put(KEY_ITEMS, array.toString())
+        EncryptedJsonStore.writeArray(KEY_ITEMS, array)
     }
 
     private fun nextDailyAt(previous: Long, after: Long = previous): Long {

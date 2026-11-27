@@ -10,7 +10,8 @@ import android.net.Uri
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import com.pilot.agent.Dbg
-import com.pilot.agent.query.SecretVault
+import com.pilot.agent.query.EncryptedJsonStore
+import com.pilot.agent.query.VaultUnavailableException
 import com.pilot.agent.ui.MainActivity
 import java.text.SimpleDateFormat
 import java.util.Calendar
@@ -30,6 +31,18 @@ object ReminderManager {
 
     data class Reminder(val id: String, val title: String, val at: Long)
 
+    /**
+     * E1：加密存储读/写失败时中止本次「读→改→写」，返回 [fallback]（如实告知没有做修改），
+     * 绝不把「读失败得到的空列表」写回去覆盖用户的提醒。
+     */
+    private inline fun <T> guardStore(fallback: T, block: () -> T): T =
+        try {
+            block()
+        } catch (e: VaultUnavailableException) {
+            Dbg.e(TAG, "提醒存储不可用，已中止本次操作：${e.name}")
+            fallback
+        }
+
     fun handles(text: String): Boolean =
         text.contains("提醒我") || text.contains("记得提醒") ||
             text.contains("我的提醒") || text.contains("取消提醒") || text.contains("删除提醒") ||
@@ -42,7 +55,10 @@ object ReminderManager {
      * @param atMillis UTC epoch 毫秒；@return null = 时间无效
      */
     @Synchronized
-    fun createFromParsed(context: Context, title: String, atMillis: Long): String? {
+    fun createFromParsed(context: Context, title: String, atMillis: Long): String? =
+        guardStore(EncryptedJsonStore.UNAVAILABLE_MESSAGE) { createFromParsedUnsafe(context, title, atMillis) }
+
+    private fun createFromParsedUnsafe(context: Context, title: String, atMillis: Long): String? {
         if (title.isBlank()) return null
         if (atMillis <= System.currentTimeMillis() ||
             atMillis > System.currentTimeMillis() + TimeUnit.DAYS.toMillis(30)
@@ -58,7 +74,10 @@ object ReminderManager {
     }
 
     @Synchronized
-    fun handle(context: Context, text: String): String {
+    fun handle(context: Context, text: String): String =
+        guardStore(EncryptedJsonStore.UNAVAILABLE_MESSAGE) { handleUnsafe(context, text) }
+
+    private fun handleUnsafe(context: Context, text: String): String {
         if (text.contains("我的提醒")) {
             return listText(context)
         }
@@ -83,7 +102,10 @@ object ReminderManager {
 
     /** 列出待触发提醒。快路径 `reminder/list` 直接调用，不再靠关键词嗅探。 */
     @Synchronized
-    fun listText(context: Context): String {
+    fun listText(context: Context): String =
+        guardStore(EncryptedJsonStore.UNAVAILABLE_MESSAGE) { listTextUnsafe(context) }
+
+    private fun listTextUnsafe(context: Context): String {
         val all = load(context).sortedBy { it.at }
         return if (all.isEmpty()) "现在没有待触发的提醒。" else buildString {
             append("你的提醒：")
@@ -96,7 +118,10 @@ object ReminderManager {
      * 两者都为空时**不猜**（旧实现会直接取消最早一条），要求用户先查看列表。
      */
     @Synchronized
-    fun cancel(context: Context, idOrKeyword: String): String {
+    fun cancel(context: Context, idOrKeyword: String): String =
+        guardStore(EncryptedJsonStore.UNAVAILABLE_MESSAGE) { cancelUnsafe(context, idOrKeyword) }
+
+    private fun cancelUnsafe(context: Context, idOrKeyword: String): String {
         val clean = idOrKeyword.trim().trim(' ', '：', ':', '，', ',', '。')
         if (clean.isBlank()) return "要取消哪条提醒？说“我的提醒”可以先看看列表。"
         val target = load(context).firstOrNull { it.id == clean }
@@ -106,17 +131,26 @@ object ReminderManager {
         return "已取消提醒：${target.title}"
     }
 
-    fun rescheduleAll(context: Context) {
+    @Synchronized
+    fun rescheduleAll(context: Context) = guardStore(Unit) {
         load(context).forEach { item ->
             if (item.at <= System.currentTimeMillis()) remove(context, item.id) else schedule(context, item)
         }
     }
 
+    @Synchronized
     fun fire(context: Context, id: String) {
-        val item = load(context).firstOrNull { it.id == id } ?: return
+        // E1：存储读不出来时仍然发一条通用通知，不能让到点的提醒静默消失。
+        val item = try {
+            load(context).firstOrNull { it.id == id } ?: return
+        } catch (e: VaultUnavailableException) {
+            Dbg.e(TAG, "提醒到点但存储不可读：${e.name}")
+            null
+        }
         if (Build.VERSION.SDK_INT >= 33 &&
             context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) return
-        remove(context, id)
+        if (item != null) guardStore(Unit) { remove(context, id) }
+        val body = item?.title ?: "有一条提醒到点了，但内容暂时读不出来。请打开 Pilot 说“我的提醒”查看。"
         val open = PendingIntent.getActivity(
             context, id.hashCode(), Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
@@ -128,8 +162,8 @@ object ReminderManager {
         manager.notify(id.hashCode(), NotificationCompat.Builder(context, CHANNEL)
             .setSmallIcon(com.pilot.agent.R.drawable.ic_pilot)
             .setContentTitle("Pilot 提醒")
-            .setContentText(item.title)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(item.title))
+            .setContentText(body)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
             .setContentIntent(open).setAutoCancel(true).setPriority(NotificationCompat.PRIORITY_HIGH).build())
     }
 
@@ -265,18 +299,19 @@ object ReminderManager {
         return total + current
     }
 
-    private fun load(context: Context): List<Reminder> = runCatching {
-        val array = JSONArray(SecretVault.get(KEY_ITEMS).ifBlank { "[]" })
-        (0 until array.length()).mapNotNull { i ->
+    /** 读失败抛 [VaultUnavailableException]（由 [guardStore] 接住）；JSON 损坏会先备份再按空处理。 */
+    private fun load(context: Context): List<Reminder> {
+        val array = EncryptedJsonStore.readArray(KEY_ITEMS)
+        return (0 until array.length()).mapNotNull { i ->
             val o = array.optJSONObject(i) ?: return@mapNotNull null
             Reminder(o.optString("id"), o.optString("title"), o.optLong("at"))
         }
-    }.getOrDefault(emptyList())
+    }
 
     private fun save(context: Context, items: List<Reminder>) {
         val array = JSONArray()
         items.take(100).forEach { array.put(JSONObject().put("id", it.id).put("title", it.title).put("at", it.at)) }
-        SecretVault.put(KEY_ITEMS, array.toString())
+        EncryptedJsonStore.writeArray(KEY_ITEMS, array)
     }
 
     private fun remove(context: Context, id: String) = save(context, load(context).filterNot { it.id == id })
