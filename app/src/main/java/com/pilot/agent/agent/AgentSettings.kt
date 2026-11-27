@@ -1,8 +1,14 @@
 package com.pilot.agent.agent
 
 import android.content.Context
+import android.content.SharedPreferences
+import android.os.SystemClock
+import com.pilot.agent.Dbg
+import com.pilot.agent.LogRedactor
 import com.pilot.agent.PilotApp
 import com.pilot.agent.query.SecretVault
+import com.pilot.agent.query.VaultRead
+import java.util.concurrent.atomic.AtomicLong
 
 data class AgentSettings(
     val baseUrl: String = DEFAULT_BASE_URL,
@@ -201,14 +207,81 @@ data class AgentSettings(
                 .apply()
         }
 
+        // ---------- 内存缓存（审核报告 code.md C9 / arch.md D4）----------
+        //
+        // load() 有 47 个调用点（每句播报、每步规划、每个网易云请求都会调），以前每次都要
+        // 3 次 Keystore 解密。这里缓存不可变的 AgentSettings 快照：
+        //   · save() 主动失效；
+        //   · 本进程任何代码改了 "pilot" SharedPreferences → 监听器失效；
+        //   · SecretVault 写入了这三个凭据 → 监听器失效。
+        // 有凭据读失败时只缓存 [FAILED_SECRET_CACHE_MS]，Keystore 恢复后尽快重新读取。
+        // SharedPreferences 本身就是进程内缓存，:sandbox 等副进程本来就看不到主进程的新值，
+        // 缓存不会引入新的跨进程不一致（跨进程下发见 fix/security.md 未完成项）。
+        private const val TAG = "AgentSettings"
+        private const val FAILED_SECRET_CACHE_MS = 5_000L
+        private val SECRET_KEYS = setOf(K_KEY, K_WEB_SEARCH_KEY, K_NETEASE_COOKIE)
+
+        private class Snapshot(val value: AgentSettings, val validUntil: Long)
+
+        private val cacheLock = Any()
+        @Volatile
+        private var cached: Snapshot? = null
+        private val generation = AtomicLong()
+        @Volatile
+        private var listenersInstalled = false
+
+        // 必须强引用：SharedPreferences 只弱引用监听器。
+        private val prefsListener =
+            SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> invalidateCache() }
+        private val vaultListener: (String) -> Unit = { name -> if (name in SECRET_KEYS) invalidateCache() }
+
+        /** 让下一次 [load] 重新从磁盘读取。 */
+        fun invalidateCache() {
+            generation.incrementAndGet()
+            cached = null
+        }
+
+        /** 有凭据当前读不出来（Keystore 异常）。设置页可据此提示「安全存储暂时不可用」。 */
+        fun secretsUnavailable(): Boolean = SECRET_KEYS.any { SecretVault.isReadBlocked(it) }
+
+        private fun installListeners() {
+            if (listenersInstalled) return
+            synchronized(cacheLock) {
+                if (listenersInstalled) return
+                runCatching { PilotApp.prefs.registerOnSharedPreferenceChangeListener(prefsListener) }
+                    .onFailure { Dbg.w(TAG, "注册设置变更监听失败：${LogRedactor.error(it)}") }
+                SecretVault.addChangeListener(vaultListener)
+                listenersInstalled = true
+            }
+        }
+
         fun load(): AgentSettings {
+            val hit = cached
+            if (hit != null && SystemClock.elapsedRealtime() < hit.validUntil) return hit.value
+            installListeners()
+            val gen = generation.get()
+            val failures = mutableSetOf<String>()
+            val fresh = loadFromDisk(failures)
+            if (failures.isNotEmpty()) Dbg.w(TAG, "凭据读取失败（已保留原数据，暂停覆盖）：$failures")
+            synchronized(cacheLock) {
+                // 读的过程中有人 save/改了设置：这份结果可能是旧的，不放进缓存。
+                if (generation.get() == gen) {
+                    val until = if (failures.isEmpty()) Long.MAX_VALUE
+                    else SystemClock.elapsedRealtime() + FAILED_SECRET_CACHE_MS
+                    cached = Snapshot(fresh, until)
+                }
+            }
+            return fresh
+        }
+
+        private fun loadFromDisk(failures: MutableSet<String>): AgentSettings {
             val p = PilotApp.prefs
             migrateVoiceAutoV2(p)
             return AgentSettings(
                 baseUrl = p.getString(K_URL, null) ?: DEFAULT_BASE_URL,
                 // P0：API Key 从 Keystore 读；首次运行迁移旧版明文并清除。
-                apiKey = readMigratedSecret(p, K_KEY),
-                webSearchApiKey = SecretVault.get(K_WEB_SEARCH_KEY),
+                apiKey = readMigratedSecret(p, K_KEY, failures),
+                webSearchApiKey = readSecret(K_WEB_SEARCH_KEY, failures),
                 model = p.getString(K_MODEL, null) ?: DEFAULT_MODEL,
                 // 自动路由：忽略旧版保存的助理/Agent 选择，统一按 Agent 语义执行
                 // （快路径仍在前置，命中规则的确定性指令不会进 Agent）。
@@ -246,17 +319,30 @@ data class AgentSettings(
                     ?: DEFAULT_MUSIC_URL,
                 musicFallbackUrl = p.getString(K_MUSIC_FALLBACK_URL, null)
                     ?: DEFAULT_MUSIC_FALLBACK_URL,
-                neteaseCookie = readMigratedSecret(p, K_NETEASE_COOKIE),
+                neteaseCookie = readMigratedSecret(p, K_NETEASE_COOKIE, failures),
                 assistantFastPath = p.getBoolean(K_ASSISTANT_FAST_PATH, true),
             )
         }
 
+        /** 兼容旧调用点（返回 Unit）。需要把失败告诉用户的调用方请改用 [saveChecked]。 */
         fun save(s: AgentSettings) {
-            PilotApp.prefs.edit()
+            saveChecked(s)
+        }
+
+        /**
+         * 保存设置。
+         *
+         * E1：凭据（API Key / 搜索 Key / 网易云 Cookie）**先写密文并确认落盘，成功后才删旧明文**；
+         * 写失败保留明文、旧密文不动。某个凭据当前读不出来（Keystore 异常）而用户也没输入新值时，
+         * 绝不用空串覆盖它。
+         *
+         * @return null = 全部保存成功；否则是给用户看的中文说明（普通设置项已经保存）。
+         */
+        fun saveChecked(s: AgentSettings): String? {
+            val p = PilotApp.prefs
+            p.edit()
                 .putString(K_URL, s.baseUrl)
-                // P0：敏感凭据不再写明文，迁移后清除旧值
-                .remove(K_KEY)
-                .remove(K_NETEASE_COOKIE)
+                // P0：敏感凭据不写明文；旧明文在密文写入成功后由 persistSecret 清除
                 .putString(K_MODEL, s.model)
                 .putString(K_MODE, AssistantMode.AGENT.storageValue)
                 .putInt(K_TURNS, s.maxTurns.coerceIn(MIN_AGENT_TURNS, MAX_AGENT_TURNS))
@@ -290,36 +376,134 @@ data class AgentSettings(
                 .putString(K_MUSIC_FALLBACK_URL, s.musicFallbackUrl)
                 .putBoolean(K_ASSISTANT_FAST_PATH, s.assistantFastPath)
                 .apply()
-            runCatching {
-                SecretVault.put(K_WEB_SEARCH_KEY, s.webSearchApiKey)
-                SecretVault.put(K_KEY, s.apiKey)
-                SecretVault.put(K_NETEASE_COOKIE, s.neteaseCookie)
-            }
+            val problems = mutableListOf<String>()
+            persistSecret(p, K_WEB_SEARCH_KEY, s.webSearchApiKey, hasLegacyPlaintext = false, label = "搜索 API Key", problems = problems)
+            persistSecret(p, K_KEY, s.apiKey, hasLegacyPlaintext = true, label = "API Key", problems = problems)
+            persistSecret(p, K_NETEASE_COOKIE, s.neteaseCookie, hasLegacyPlaintext = true, label = "网易云登录信息", problems = problems)
+            invalidateCache()
+            if (problems.isEmpty()) return null
+            Dbg.w(TAG, "设置已保存，但有 ${problems.size} 项凭据未写入")
+            return problems.joinToString("；") + "。"
         }
 
         /**
-         * P0 迁移：优先从 Keystore 读；为空时取旧版明文值，写入 Keystore 后立即清除明文。
+         * 只在凭据真的变化时写入；顺序固定为「写密文（commit）→ 成功后删旧明文」。
+         */
+        private fun persistSecret(
+            p: SharedPreferences,
+            key: String,
+            value: String,
+            hasLegacyPlaintext: Boolean,
+            label: String,
+            problems: MutableList<String>,
+        ) {
+            val legacy = if (hasLegacyPlaintext) p.getString(key, null) else null
+            when (val current = SecretVault.read(key)) {
+                is VaultRead.Ok -> if (current.value == value) {
+                    // 没变：只顺手清掉残留的旧明文（密文可用，删明文安全）。
+                    if (legacy != null) p.edit().remove(key).apply()
+                    return
+                }
+                VaultRead.Absent -> if (value.isBlank()) {
+                    // 用户清空了该凭据：旧明文一起清掉。
+                    if (legacy != null) p.edit().remove(key).apply()
+                    return
+                }
+                is VaultRead.Failed -> if (value.isBlank() || value == legacy) {
+                    // 旧值读不出来、用户也没有输入新值：保持原密文与明文不动，绝不用空串覆盖。
+                    problems += "$label 暂时读不出来，已保留原有数据，没有覆盖"
+                    return
+                }
+            }
+            // 走到这里 = 用户输入了新值（或需要把旧明文迁入密文）。
+            // 之前读失败时，用户新输入的值是明确意图，允许覆盖（force）。
+            val force = SecretVault.isReadBlocked(key)
+            if (SecretVault.putChecked(key, value, force = force)) {
+                if (legacy != null) p.edit().remove(key).apply()
+            } else {
+                problems += "$label 没能写入安全存储，原有数据保持不变"
+                Dbg.w(TAG, "凭据写入安全存储失败（保留原数据）：$key")
+            }
+        }
+
+        private fun readSecret(key: String, failures: MutableSet<String>): String =
+            when (val r = SecretVault.read(key)) {
+                is VaultRead.Ok -> r.value
+                VaultRead.Absent -> ""
+                is VaultRead.Failed -> {
+                    failures += key
+                    ""
+                }
+            }
+
+        /**
+         * P0 迁移：优先从 Keystore 读；没有密文时取旧版明文，**写入 Keystore 成功后**才清除明文。
+         * Keystore 读失败时密文、明文都不动（有旧明文就先用着），并记入 [failures]。
          */
         private fun readMigratedSecret(
-            p: android.content.SharedPreferences,
+            p: SharedPreferences,
             key: String,
+            failures: MutableSet<String>,
         ): String {
-            val encrypted = SecretVault.get(key)
-            if (encrypted.isNotBlank()) return encrypted
             val legacy = p.getString(key, null).orEmpty()
+            when (val r = SecretVault.read(key)) {
+                is VaultRead.Ok -> if (r.value.isNotBlank()) {
+                    if (legacy.isNotEmpty()) p.edit().remove(key).apply()
+                    return r.value
+                }
+                is VaultRead.Failed -> {
+                    failures += key
+                    return legacy
+                }
+                VaultRead.Absent -> Unit
+            }
             if (legacy.isBlank()) return ""
-            runCatching { SecretVault.put(key, legacy) }
-            p.edit().remove(key).apply()
+            if (SecretVault.putChecked(key, legacy)) {
+                p.edit().remove(key).apply()
+            } else {
+                Dbg.w(TAG, "凭据迁移到安全存储失败，保留旧值待下次重试：$key")
+            }
             return legacy
         }
 
         fun isAccessibilityEnabled(ctx: Context): Boolean {
-            val expected = "${ctx.packageName}/${com.pilot.agent.service.AgentAccessibilityService::class.java.name}"
-            val enabled = android.provider.Settings.Secure.getString(
-                ctx.contentResolver,
-                android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
-            ) ?: return false
-            return enabled.split(':').any { it.equals(expected, ignoreCase = true) }
+            val expectedPkg = ctx.packageName
+            val expectedCls = com.pilot.agent.service.AgentAccessibilityService::class.java.name
+
+            // ★ 先问 AccessibilityManager 要「当前已启用并在运行的列表」。
+            //   原来只读 Settings.Secure，EMUI/HarmonyOS 上偶尔读到 null 或被裁剪的值，
+            //   于是权限明明开着、服务也 Bound 了，界面仍提示"未开启"（11-26 真机反馈）。
+            runCatching {
+                val am = ctx.getSystemService(Context.ACCESSIBILITY_SERVICE)
+                    as? android.view.accessibility.AccessibilityManager
+                val list = am?.getEnabledAccessibilityServiceList(
+                    android.accessibilityservice.AccessibilityServiceInfo.FEEDBACK_ALL_MASK,
+                )
+                val hit = list?.any { info ->
+                    val si = info?.resolveInfo?.serviceInfo ?: return@any false
+                    si.packageName == expectedPkg &&
+                        (si.name == expectedCls || si.name == "$expectedPkg.service.AgentAccessibilityService")
+                } == true
+                if (hit) return true
+            }
+
+            // 兜底：读 Secure 键。系统可能把组件名写成 "pkg/.service.Class" 的简写，
+            // 所以不能直接整串 equals，要拆开把 "." 开头的类名补全后再比。
+            val enabled = runCatching {
+                android.provider.Settings.Secure.getString(
+                    ctx.contentResolver,
+                    android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+                )
+            }.getOrNull() ?: return false
+            return enabled.split(':').any { entry ->
+                val trimmed = entry.trim()
+                if (trimmed.equals("$expectedPkg/$expectedCls", ignoreCase = true)) return@any true
+                val pkg = trimmed.substringBefore('/', "")
+                val cls = trimmed.substringAfter('/', "")
+                pkg.equals(expectedPkg, ignoreCase = true) &&
+                    (cls.equals(expectedCls, ignoreCase = true) ||
+                        (cls.startsWith(".") && cls.equals(expectedCls.removePrefix(expectedPkg), ignoreCase = true)))
+            }
         }
     }
 }

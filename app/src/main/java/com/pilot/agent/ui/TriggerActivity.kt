@@ -5,26 +5,38 @@ import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import android.os.Process
+import com.pilot.agent.BuildConfig
 import com.pilot.agent.Dbg
+import com.pilot.agent.LogRedactor
 import com.pilot.agent.runtime.AgentRuntime
+import com.pilot.agent.service.DebugCommands
+import com.pilot.agent.service.TriggerAuth
+import com.pilot.agent.service.dispatchBackgroundGoal
 
 /**
  * 触发入口（用 `am start` 而不是广播）。
  *
  * ## 为什么要有这个
  * 华为/EMUI 的**广播队列会卡死**：实测 `am broadcast` 显示
- * `dispatchClockTime=1970-01-01`——广播入队了但永远不派发，
- * logcat 里还有 `HwBroadcastQueue: process has died, drop BroadcastRecord`。
- * 这时候 RunReceiver 收不到任何东西（goal / sandbox_test / llm_test 全哑）。
- *
+ * `dispatchClockTime=1970-01-01`——广播入队了但永远不派发。
  * `am start` 走的是 Activity 启动路径，不经过广播队列，稳定得多。
+ *
+ * ## 安全（审核报告 code.md S1）
+ * - 本组件在**所有构建类型**都要求 signature 权限 `com.pilot.agent.permission.TRIGGER`；
+ *   `:navigation` 进程与主进程同 UID，不受影响。
+ * - 正式入口只接受：`start_voice`、`speak_text`、`stop_speaking`（导航界面用）和 `goal`。
+ *   `goal` 与广播/后台语音走同一条 [dispatchBackgroundGoal]（快路径 + 策略判定），不再直接塞给 AgentLoop。
+ * - 调试指令只能经 debug 包的别名 `com.pilot.agent.ui.DebugTriggerActivity` 进入
+ *   （`android.permission.DUMP` 保护，仅 adb shell 持有），并且要显式打开开关，见 [DebugCommands]。
+ * - API 34+ 能拿到 `launchedFromUid` 时做签名比对；API<34 拿不到可信 UID，不再「按自身 UID 放行」，
+ *   只依赖系统强制的 signature 权限。
  *
  * ## 用法
  * ```
- * adb shell am start -n com.pilot.agent.debug/com.pilot.agent.ui.TriggerActivity \
- *     --es goal "导航去张掖西站"
- * adb shell am start -n com.pilot.agent.debug/com.pilot.agent.ui.TriggerActivity \
- *     --es sandbox_test "df -h"
+ * # 同签名组件 / 导航进程
+ * am start -n com.pilot.agent/.ui.TriggerActivity --es goal "导航去张江"
+ * # adb 调试（debug 包，先打开开关）
+ * adb shell am start -n com.pilot.agent/.ui.DebugTriggerActivity --es sandbox_test "df -h"
  * ```
  *
  * 走完立刻 finish()，不留界面。
@@ -40,7 +52,7 @@ class TriggerActivity : Activity() {
         try {
             handle(intent)
         } catch (t: Throwable) {
-            Dbg.e(TAG, "触发失败", t)
+            Dbg.e(TAG, "触发失败：${LogRedactor.error(t)}")
         } finally {
             finish()
         }
@@ -48,7 +60,27 @@ class TriggerActivity : Activity() {
 
     private fun handle(intent: Intent?) {
         val i = intent ?: return
-        if (!isTrustedCaller()) return
+
+        // 调试别名（仅 debug 包启用；manifest 用 DUMP 权限把关，只有 adb shell 能启动）。
+        if (i.component?.className == DebugCommands.ALIAS_CLASS) {
+            if (!BuildConfig.DEBUG) {
+                Dbg.w(TAG, "release 包不提供调试入口，已忽略")
+                return
+            }
+            DebugCommands.handle(applicationContext, i)
+            return
+        }
+
+        val caller = callerIdentity()
+        if (caller is TriggerAuth.Caller.Rejected) {
+            Dbg.w(TAG, "拒绝来自 uid=${caller.uid} 的触发请求")
+            return
+        }
+
+        if (DebugCommands.hasDebugExtra(i)) {
+            Dbg.w(TAG, "正式触发入口不接受调试指令，已忽略（调试请用 debug 包的 DebugTriggerActivity）")
+            return
+        }
 
         // 开始一次语音识别（导航界面点了麦克风）
         if (i.getBooleanExtra("start_voice", false)) {
@@ -59,150 +91,49 @@ class TriggerActivity : Activity() {
             runCatching {
                 // ★ 点麦克风 = 用户要说话：先把 TTS 停掉，否则放音闸门会把
                 //   这几秒麦克风全静音，用户说完什么也没录到（表现为「聆听」不动）。
-                com.pilot.agent.runtime.AgentRuntime.speaker.stop()
-                com.pilot.agent.runtime.AgentRuntime.ensureVoiceInput().startListening()
-            }.onFailure { Dbg.e(TAG, "开始语音识别失败", it) }
+                AgentRuntime.speaker.stop()
+                AgentRuntime.ensureVoiceInput().startListening()
+            }.onFailure { Dbg.e(TAG, "开始语音识别失败：${LogRedactor.error(it)}") }
             return
         }
 
         // 让主进程播一句话（导航界面的候选播报）
         val speakText = i.getStringExtra("speak_text")
         if (!speakText.isNullOrBlank()) {
-            Dbg.i(TAG, "请求播报：$speakText")
-            runCatching { com.pilot.agent.runtime.AgentRuntime.speaker.speakNav(speakText) }
+            Dbg.i(TAG, "请求播报：${LogRedactor.text("text", speakText)}")
+            runCatching { AgentRuntime.speaker.speakNav(speakText) }
+                .onFailure { Dbg.e(TAG, "播报失败：${LogRedactor.error(it)}") }
             return
         }
 
         // 停止播报（导航界面点「停止播报」时通知过来）
         if (i.getBooleanExtra("stop_speaking", false)) {
             Dbg.i(TAG, "收到停止播报指令")
-            runCatching { com.pilot.agent.runtime.AgentRuntime.speaker.stop() }
+            runCatching { AgentRuntime.speaker.stop() }
             return
         }
 
-        // 语音链路自检（不用说话就能测打断/活跃期/休眠）
-        val voiceTest = i.getStringExtra("voice_test")
-        if (!voiceTest.isNullOrBlank()) {
-            val v = com.pilot.agent.runtime.AgentRuntime.voiceInput
-            Thread {
-                val vv = v ?: com.pilot.agent.runtime.AgentRuntime.ensureVoiceInput()
-                when (voiceTest) {
-                    "wake" -> vv.debugHit("小派")
-                    "end" -> vv.debugEndTurn()
-                    "status" -> Dbg.i(TAG, "自检状态：${vv.debugStatus()}")
-                    "enroll" -> {
-                        val ok = vv.startEnroll()
-                        Dbg.i(TAG, "自检：声纹注册 startEnroll=$ok")
-                    }
-                    // 自检：模拟识别到一句话（测意图分流用）
-                    "say" -> {
-                        val text = i.getStringExtra("say_text").orEmpty()
-                        com.pilot.agent.runtime.AgentRuntime.voiceInput?.debugSay(text)
-                    }
-                    // 自检：直接进免打扰
-                    "dnd" -> {
-                        vv.enterDoNotDisturb()
-                        Dbg.i(TAG, "自检：进入免打扰")
-                    }
-                    else -> vv.debugHit(voiceTest)
-                }
-                Dbg.i(TAG, "自检后：${vv.debugStatus()}")
-            }.apply { name = "trigger-voice"; isDaemon = true }.start()
-            return
-        }
-
-        // 沙箱自检
-        val sandboxTest = i.getStringExtra("sandbox_test")?.trim()
-        if (!sandboxTest.isNullOrEmpty()) {
-            Thread {
-                val ctx = applicationContext
-                com.pilot.agent.sandbox.SandboxTerminal.init(ctx)
-                val r = kotlinx.coroutines.runBlocking {
-                    com.pilot.agent.sandbox.SandboxTerminal.run(ctx, sandboxTest, 420_000)
-                }
-                Dbg.i(TAG, "沙箱自检 exit=${r.exitCode} ${r.durationMs}ms out=${r.output.take(300)}")
-            }.apply { name = "trigger-sandbox"; isDaemon = true }.start()
-            return
-        }
-
-        // LLM 自检
-        val llmTest = i.getStringExtra("llm_test")
-        if (!llmTest.isNullOrBlank()) {
-            Thread {
-                val llm = AgentRuntime.localLlm
-                if (!llm.ensureReady()) {
-                    Dbg.w(TAG, "LLM 自检：加载失败 ${llm.lastError}")
-                    return@Thread
-                }
-                val noThink = if (llm.wantsNoThink) "/no_think" else ""
-                val out = llm.generate(
-                    "system\n你是手机助手 Pilot。用一句中文介绍你自己。$noThink\n" +
-                        "user\n用一句中文介绍你自己\nassistant\n",
-                )
-                Dbg.i(TAG, "LLM 自检结果: ${out ?: "null"}")
-            }.apply { name = "trigger-llm"; isDaemon = true }.start()
-            return
-        }
-
-        // 设备端导航模拟测试入口。标记文件位于 App 私有目录，主/导航进程共享。
-        val simulateNav = i.getStringExtra("simulate_nav")?.trim().orEmpty()
-        if (simulateNav.isNotBlank()) {
-            Dbg.i(TAG, "启动模拟导航测试：目的地=$simulateNav")
-            val loop = AgentRuntime.loop
-            if (loop != null) {
-                val marker = java.io.File(filesDir, "nav_simulate_next")
-                if (!runCatching { marker.writeText("1"); true }.getOrDefault(false)) {
-                    Dbg.e(TAG, "写入模拟导航标记失败")
-                    return
-                }
-                loop.start(AgentRuntime.scope, "导航去$simulateNav", ui = false)
-                Dbg.i(TAG, "模拟导航请求已交给 AgentLoop")
-                return
-            }
-            val appContext = applicationContext
-            Thread {
-                val jobId = kotlinx.coroutines.runBlocking {
-                    com.pilot.agent.navigation.NavigationClient.startSimulatedNavi(appContext, simulateNav)
-                }
-                Dbg.i(TAG, "模拟导航服务已返回 jobId=$jobId")
-            }.apply { name = "simulate-navigation-test"; isDaemon = true }.start()
-            return
-        }
-
-        // 正式指令
+        // 正式指令：与广播 / 后台语音走同一条分发链（快路径 → 本地只读工具 → 意图判定 → Agent），
+        // 以前这里直接 loop.start(ui=false)，绕过了快路径和策略判定（code.md S1 补充）。
         val goal = i.getStringExtra("goal")?.trim().orEmpty()
         if (goal.isEmpty()) {
-            Dbg.w(TAG, "触发请求缺少 goal / sandbox_test / llm_test")
+            Dbg.w(TAG, "触发请求缺少 goal")
             return
         }
-        val loop = AgentRuntime.loop
-        if (loop == null) {
-            Dbg.e(TAG, "无障碍服务未连接，无法执行：$goal")
-            return
-        }
-        Dbg.i(TAG, "trigger run goal=$goal")
-        loop.start(AgentRuntime.scope, goal, ui = false)
+        dispatchBackgroundGoal(applicationContext, goal, "trigger ${TriggerAuth.label(caller)}")
     }
 
     /**
-     * 纵深防御：manifest 已用 signature 权限挡住第三方，这里再校验一次调用方。
-     * 允许 root / shell / system / 自身 UID（:navigation 与本应用同 UID）。
+     * 调用方身份。API 34+ 用 `launchedFromUid`（同 UID 的 :navigation 进程总能拿到；
+     * 其他调用方未共享身份时为 INVALID_UID）。API<34 没有可信来源 → [TriggerAuth.Caller.Unknown]，
+     * 此时由 manifest 的 signature 权限把关。
      */
-    private fun isTrustedCaller(): Boolean {
-        // getLaunchedFromUid 是 API 34 新增；低版本（本项目 minSdk 30，绝大多数设备）没有此方法，
-        // 直接调用会抛 NoSuchMethodError。低版本只能依赖 manifest 的 signature 权限挡第三方，
-        // 这里按「自身 UID」放行，把校验交给系统。
-        val caller = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+    private fun callerIdentity(): TriggerAuth.Caller {
+        val uid = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             launchedFromUid
         } else {
-            applicationInfo.uid
+            Process.INVALID_UID
         }
-        if (caller == Process.ROOT_UID || caller == Process.SHELL_UID ||
-            caller == Process.SYSTEM_UID || caller == applicationInfo.uid
-        ) {
-            return true
-        }
-        Dbg.w(TAG, "拒绝来自 uid=$caller 的触发请求")
-        return false
+        return TriggerAuth.classify(this, uid)
     }
 }

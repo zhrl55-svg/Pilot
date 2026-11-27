@@ -3,7 +3,9 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <!-- 触发入口专用权限：signature 级，只有同签名应用（含 :navigation 子进程）能调用。
-         调试包在 src/debug/AndroidManifest.xml 里移除该权限，保留 adb 调试入口。 -->
+         所有构建类型（含 debug）都保留该权限；adb 调试改走 debug 包专用的
+         DebugTriggerActivity 别名（DUMP 权限 + 显式开关，见 service/DebugCommands.kt）。
+         注意：release 平台签名必须是私有密钥，若使用 AOSP 公开 testkey，任何人都能拿到该权限。 -->
     <permission
         android:name="com.pilot.agent.permission.TRIGGER"
         android:protectionLevel="signature" />
@@ -197,7 +199,8 @@
                 android:resource="@xml/file_paths" />
         </provider>
 
-        <!-- 触发入口：am start 走 Activity 而不是广播（华为 ROM 的广播队列会卡死） -->
+        <!-- 触发入口：am start 走 Activity 而不是广播（华为 ROM 的广播队列会卡死）。
+             只接受 goal / start_voice / speak_text / stop_speaking。 -->
         <activity
             android:name=".ui.TriggerActivity"
             android:excludeFromRecents="true"
@@ -205,6 +208,15 @@
             android:noHistory="true"
             android:permission="com.pilot.agent.permission.TRIGGER"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- adb 调试入口（别名 → TriggerActivity）。默认禁用，只在 src/debug 清单里启用；
+             DUMP 权限只有 adb shell / 系统持有，普通 App 无法获得。必须声明在 TriggerActivity 之后。 -->
+        <activity-alias
+            android:name=".ui.DebugTriggerActivity"
+            android:enabled="false"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:targetActivity=".ui.TriggerActivity" />
 
         <!-- Agent 的可见浏览器会话：保留 Cookie、登录状态和连续 DOM 操作。 -->
         <activity

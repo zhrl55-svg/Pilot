@@ -1,18 +1,23 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  调试包专用：移除触发入口的 signature 权限，保留 `adb shell am start / am broadcast`
-  调试能力。release 包仍由 src/main/AndroidManifest.xml 的
-  com.pilot.agent.permission.TRIGGER 保护，第三方 App 无法触发。
+  调试包专用（审核报告 code.md S1）。
+
+  以前这里用 tools:remove 去掉了 TriggerActivity / RunReceiver 的 signature 权限，
+  结果 debug 包里任何 App 都能让 Pilot 以无障碍身份执行指令、跑沙箱 shell、改 Cookie、删记忆。
+  现在两个正式入口在所有构建类型都保留 com.pilot.agent.permission.TRIGGER。
+
+  adb 调试改走下面启用的别名 DebugTriggerActivity：
+    - android.permission.DUMP 保护：adb shell 天然持有，普通 App 拿不到；
+    - 还要求显式开关文件 no_backup/pilot_debug_commands（只能用 run-as 创建，见 DebugCommands.kt）；
+    - release 包里该别名保持 enabled=false，且代码侧有 BuildConfig.DEBUG 双重判断。
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
     <application>
-        <activity
-            android:name=".ui.TriggerActivity"
-            tools:remove="android:permission" />
-        <receiver
-            android:name=".service.RunReceiver"
-            tools:remove="android:permission" />
+        <activity-alias
+            android:name=".ui.DebugTriggerActivity"
+            android:enabled="true"
+            tools:replace="android:enabled" />
     </application>
 </manifest>

@@ -3,17 +3,18 @@ package com.pilot.agent.service
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.os.Binder
 import android.os.Build
 import android.os.Process
 import com.pilot.agent.Dbg
+import com.pilot.agent.LogRedactor
 import kotlinx.coroutines.runBlocking
 import okhttp3.MediaType.Companion.toMediaType
-import com.pilot.agent.agent.AgentSettings
 import com.pilot.agent.assistant.AssistantFastPath
 import com.pilot.agent.assistant.exec.FastPathTrace
 import com.pilot.agent.assistant.exec.ResultFormatter
 import com.pilot.agent.runtime.AgentRuntime
+import com.pilot.agent.runtime.await
+import com.pilot.agent.runtime.catchingNonCancel
 
 /**
  * 后台触发入口：不开界面，直接让 agent 在当前前台应用上干活。
@@ -21,292 +22,44 @@ import com.pilot.agent.runtime.AgentRuntime
  * 为什么需要它：agent 自己的界面在前台时，无障碍抓到的屏幕就是 agent 自己，
  * 什么也操作不了。系统级助理的正确形态是「常驻后台 + 被唤起」，而不是「开着 App 再去操作别人」。
  *
- * 语音、系统键、通知栏按钮、外部程序都通过这里触发。
+ * ## 安全（审核报告 code.md S1）
+ * - manifest 在**所有构建类型**都要求 signature 级权限 `com.pilot.agent.permission.TRIGGER`
+ *   （debug 包不再移除），第三方 App 无法投递；
+ * - API 34+ 能拿到发送方 UID 时，再用 [TriggerAuth] 做签名比对；拿不到时不再冒充「自身 UID」；
+ * - 只接受正式指令 `goal`。所有 adb 调试指令（沙箱 shell、改 Cookie、删记忆……）已迁到
+ *   [DebugCommands]，只能从 debug 包的 `DebugTriggerActivity` 别名、并在显式开关打开后使用；
+ * - 日志不记录用户原话（[LogRedactor]）。
  *
- * 只接受 root / shell / 自身 UID 的广播——避免任意第三方 App 能遥控用户的手机。
- * 产品化时建议改成 signature 级自定义权限。
- *
- * 用法：
- *   adb shell am broadcast -a com.pilot.agent.RUN -p com.pilot.agent.debug --es goal "打开设置"
+ * 用法（同签名 App / 系统组件）：
+ *   am broadcast -a com.pilot.agent.RUN -p com.pilot.agent --es goal "打开设置"
+ * adb 调试请改用：
+ *   adb shell am start -n com.pilot.agent/.ui.DebugTriggerActivity --es goal "打开设置"
+ *   （需先打开调试开关，见 DebugCommands）
  */
 class RunReceiver : BroadcastReceiver() {
 
-    /**
-     * 发送方 UID。API 34+ 用 `sentFromUid`（可靠）；低版本 `getCallingUid()` 在
-     * onReceive 里已脱离发送方 Binder 事务，只能作为兜底，真正防线是 manifest 的
-     * signature 权限 `com.pilot.agent.permission.TRIGGER`。
-     */
-    private fun senderUid(): Int =
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) sentFromUid
-        else Binder.getCallingUid()
-
     override fun onReceive(context: Context, intent: Intent) {
-        val caller = senderUid()
-        val self = context.applicationInfo.uid
-        if (caller != Process.ROOT_UID && caller != Process.SHELL_UID &&
-            caller != Process.SYSTEM_UID && caller != self
-        ) {
-            Dbg.w(TAG, "拒绝来自 uid=$caller 的触发请求")
+        // API 34+：sentFromUid 只有在发送方共享身份时才有值，否则是 INVALID_UID。
+        // 低版本没有可靠来源（onReceive 不在发送方的 Binder 事务里，getCallingUid() 拿到的是自己）。
+        val uid = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) sentFromUid
+        else Process.INVALID_UID
+        val caller = TriggerAuth.classify(context, uid)
+        if (caller is TriggerAuth.Caller.Rejected) {
+            Dbg.w(TAG, "拒绝来自 uid=${caller.uid} 的触发请求")
+            return
+        }
+
+        if (DebugCommands.hasDebugExtra(intent)) {
+            Dbg.w(TAG, "正式触发入口不接受调试指令，已忽略（调试请用 debug 包的 DebugTriggerActivity）")
             return
         }
 
         val goal = intent.getStringExtra("goal")?.trim().orEmpty()
-
-        // P4 调试：设置某个能力的执行权归属（LEGACY / SHADOW / ROUTE）
-        //   adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent \
-        //       --es fastpath_owner 'device=SHADOW'"
-        val ownerSpec = intent.getStringExtra("fastpath_owner")
-        if (!ownerSpec.isNullOrBlank()) {
-            val capability = ownerSpec.substringBefore('=').trim()
-            val owner = com.pilot.agent.assistant.routing.DefaultOwners
-                .parse(ownerSpec.substringAfter('=', ""))
-            runCatching {
-                com.pilot.agent.assistant.routing.RouteStore.get(context)
-                    .setOwner(capability, owner)
-                Dbg.i(TAG, "快路径归属：$capability=$owner")
-            }.onFailure {
-                Dbg.w(TAG, "设置快路径归属失败：${it.message}")
-            }
-            return
-        }
-
-        // 快路径 / 遗留链路两侧对照：同一句话，两边各判一次，**都不执行**。
-        //   用来做影子对照 —— 快路径认不认、抽成什么样，遗留匹配器接不接。
-        //   adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent \
-        //       --es fastpath_compare '记住我喜欢喝咖啡'"
-        val compareText = intent.getStringExtra("fastpath_compare")
-        if (!compareText.isNullOrBlank()) {
-            Thread {
-                val fast = runCatching {
-                    val router = com.pilot.agent.assistant.routing.AssistantRouter()
-                    val routes = com.pilot.agent.assistant.routing.RouteStore.get(context).snapshot()
-                    when (val d = router.route(compareText, routes)) {
-                        is com.pilot.agent.assistant.routing.RouteDecision.Local ->
-                            "fast=${d.capability}/${d.action} args=${d.args} " +
-                                "missing=${d.missingSlots} needsLlm=${d.needsModelExtraction} " +
-                                "confirm=${d.needsConfirmation}"
-                        is com.pilot.agent.assistant.routing.RouteDecision.Cloud ->
-                            "fast=cloud(${d.reason})"
-                    }
-                }.getOrElse { "fast=error(${it.javaClass.simpleName})" }
-                val legacy = runCatching {
-                    AgentRuntime.localTools.match(compareText)
-                }.getOrNull()
-                val legacyText = legacy?.let {
-                    "legacy=${it.name} group=${it.group} summary=${it.summary}"
-                } ?: "legacy=none"
-                Dbg.i(TAG, "对照「$compareText」$fast | $legacyText")
-            }.apply { name = "fastpath-compare"; isDaemon = true }.start()
-            return
-        }
-
-        // 提醒维护：按标题关键词取消提醒。
-        //   DELETE 组在无界面场景一律拒绝确认，清理测试提醒只能走这里。
-        //   adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent \
-        //       --es reminder_cancel '快路径验收样本'"
-        val reminderKeyword = intent.getStringExtra("reminder_cancel")
-        if (!reminderKeyword.isNullOrBlank()) {
-            Thread {
-                val message = runCatching {
-                    com.pilot.agent.action.ReminderManager.handle(
-                        context,
-                        "取消提醒 ${reminderKeyword.trim()}",
-                    )
-                }.getOrNull()
-                Dbg.i(TAG, "提醒维护：取消「$reminderKeyword」→ ${message ?: "失败"}")
-            }.apply { name = "reminder-cancel"; isDaemon = true }.start()
-            return
-        }
-
-        // 记忆维护（按 id 精确删除）：清理测试数据用这个。
-        //   adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent \
-        //       --es memory_delete_id 7"
-        // ★ 不要用 memory_forget 做清理 —— 它是模糊匹配，
-        //   实测「忘掉 shadow-probe-S」把一条无关的中文记忆一起删了。
-        val deleteId = intent.getStringExtra("memory_delete_id")
-        if (!deleteId.isNullOrBlank()) {
-            Thread {
-                val id = deleteId.trim().toLongOrNull()
-                val ok = id != null && AgentRuntime.localTools.deleteMemoryFromUi(id)
-                Dbg.i(TAG, "记忆维护：删除 #$deleteId → ${if (ok) "已删除" else "未找到"}")
-            }.apply { name = "memory-delete-id"; isDaemon = true }.start()
-            return
-        }
-
-        // 记忆维护：按关键词删除（模糊，谨慎使用）。
-        //   DELETE 组在无界面场景一律拒绝确认，所以清理测试数据只能走这里。
-        //   adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent \
-        //       --es memory_forget '影子对照样本'"
-        val forgetKeyword = intent.getStringExtra("memory_forget")
-        if (!forgetKeyword.isNullOrBlank()) {
-            Thread {
-                val removed = runCatching {
-                    AgentRuntime.localTools.memory.forget(forgetKeyword)
-                }.getOrNull()
-                Dbg.i(TAG, "记忆维护：删除「$forgetKeyword」→ ${removed?.size ?: 0} 条")
-                removed?.forEach { Dbg.i(TAG, "  已删除 #${it.id} ${it.content}") }
-            }.apply { name = "memory-forget"; isDaemon = true }.start()
-            return
-        }
-
-        // 端侧补值自检：走完整 plan → complete 流程，但**不执行**工具。
-        //   adb shell "am broadcast -a com.pilot.agent.RUN -p com.pilot.agent \
-        //       --es fastpath_fill_test '保存到 /sdcard/Download/a.txt 内容 hello'"
-        val fillTest = intent.getStringExtra("fastpath_fill_test")
-        if (!fillTest.isNullOrBlank()) {
-            Thread {
-                val plan = AssistantFastPath.plan(context, fillTest, "selftest")
-                val completed = plan?.let {
-                    runCatching { runBlocking { AssistantFastPath.complete(context, it) } }.getOrNull()
-                }
-                Dbg.i(
-                    TAG,
-                    "补值自检：plan=${plan?.capability}/${plan?.action} " +
-                        "missing=${plan?.decision?.missingSlots} " +
-                        "completed=${completed?.invocation?.name} args=${completed?.args}",
-                )
-            }.apply { name = "fastpath-fill-test"; isDaemon = true }.start()
-            return
-        }
-
-        // 从服务器侧写入网易云 cookie（扫码/验证码在电脑上完成，不用在 App 里走一遍）
-        //   adb shell am broadcast -a com.pilot.agent.RUN -p com.pilot.agent.debug \
-        //       --es set_netease_cookie "MUSIC_U=xxx; __csrf=yyy"
-        val injectedCookie = intent.getStringExtra("set_netease_cookie")
-        if (!injectedCookie.isNullOrBlank()) {
-            AgentSettings.save(AgentSettings.load().copy(neteaseCookie = injectedCookie))
-            Dbg.i(TAG, "已写入网易云 cookie（${injectedCookie.length} 字符）")
-            return
-        }
-
-        // KWS 自检：验证唤醒词能否转成模型认识的音素行
-        //   adb shell am broadcast -a com.pilot.agent.RUN -p com.pilot.agent.debug --ez kws_test true
-        if (intent.getBooleanExtra("kws_test", false)) {
-            Thread {
-                val words = AgentSettings.load().wakeWordList()
-                Dbg.i(TAG, "KWS 自检: 唤醒词=$words")
-                words.forEach { w ->
-                    Dbg.i(TAG, "KWS 拼音行「$w」→ ${com.pilot.agent.voice.KwsKeywords.line(w)}")
-                }
-                val d = com.pilot.agent.voice.WakeWordDetector(context)
-                val ok = d.load(words)
-                Dbg.i(
-                    TAG,
-                    "KWS 自检: load=$ok labels=${d.labels} err=${d.lastError ?: "无"}",
-                )
-                // 声纹模型也顺手验一下
-                val gate = com.pilot.agent.voice.VoiceprintGate(context)
-                val vp = gate.ensureReady()
-                Dbg.i(TAG, "声纹自检: ready=$vp 模板=${gate.hasTemplate()} err=${gate.lastError ?: "无"}")
-            }.apply { name = "kws-test"; isDaemon = true }.start()
-            return
-        }
-
-        // 播报自检：直接念一段，验证 TTS 引擎
-        //   adb shell am broadcast -a com.pilot.agent.RUN -p com.pilot.agent.debug \
-        //       --es tts_test "你好，我是 Pilot"
-        val ttsTest = intent.getStringExtra("tts_test")
-        if (!ttsTest.isNullOrBlank()) {
-            val override = intent.getStringExtra("tts_engine")
-            Dbg.i(TAG, "TTS 自检: 引擎=${override ?: AgentSettings.load().ttsEngine} 文本=$ttsTest")
-            if (override == AgentSettings.TTS_MINIMAX) {
-                // 临时绕过设置，直接验云端合成，不动用户配置
-                Thread {
-                    val mm = com.pilot.agent.voice.MiniMaxTts(context)
-                    mm.speak(ttsTest, onDone = { Dbg.i(TAG, "TTS 自检: MiniMax 播完") }) { err ->
-                        Dbg.e(TAG, "TTS 自检: MiniMax 失败 $err")
-                    }
-                }.apply { name = "tts-test"; isDaemon = true }.start()
-            } else {
-                AgentRuntime.speaker.speak(ttsTest)
-            }
-            return
-        }
-
-        // 手动触发模型导入（脚本用，避免为了触发 onCreate 去 force-stop 把无障碍踢掉）
-        if (intent.getBooleanExtra("import_models", false)) {
-            Thread {
-                Dbg.i(TAG, "模型导入: 开始")
-                val n = com.pilot.agent.voice.ModelStore.ensure(context)
-                Dbg.i(TAG, "模型导入: $n 个文件 · ${com.pilot.agent.voice.ModelStore.diagnose(context)}")
-            }.apply { name = "model-import"; isDaemon = true }.start()
-            return
-        }
-
-        // ASR 自检：拿 files 目录下的 wav 喂一遍，验证端侧识别链路
-        //   adb shell am broadcast -a com.pilot.agent.RUN -p com.pilot.agent.debug \
-        //       --es asr_test test.wav
-        val asrTest = intent.getStringExtra("asr_test")
-        if (!asrTest.isNullOrBlank()) {
-            Thread {
-                // 先找私有目录，再找外部私有目录（adb push 只能写后者）
-                val f = listOfNotNull(
-                    java.io.File(context.filesDir, asrTest),
-                    context.getExternalFilesDir(null)?.let { java.io.File(it, asrTest) },
-                ).firstOrNull { it.isFile }
-                val pcm = f?.let { com.pilot.agent.voice.WavReader.read(it) }
-                if (pcm == null) {
-                    Dbg.e(TAG, "ASR 自检: 读不到 wav（$asrTest），已试 private + external files 目录")
-                    return@Thread
-                }
-                Dbg.i(TAG, "ASR 自检: ${pcm.samples.size} 采样 ${pcm.sampleRate}Hz ${pcm.channels}ch")
-                val t0 = System.currentTimeMillis()
-                val text = AgentRuntime.asr.transcribe(pcm.samples, pcm.sampleRate)
-                Dbg.i(
-                    TAG,
-                    "ASR 自检结果(${System.currentTimeMillis() - t0}ms): " +
-                        (text ?: "null（不可用：${AgentRuntime.asr.lastError}）"),
-                )
-            }.apply { name = "asr-selftest"; isDaemon = true }.start()
-            return
-        }
-
-        // LLM 自检：验证端侧模型加载与生成
-        //   adb shell am broadcast -a com.pilot.agent.RUN -p com.pilot.agent.debug \
-        //       --es llm_test "打开设置"
-        val llmTest = intent.getStringExtra("llm_test")
-        if (!llmTest.isNullOrBlank()) {
-            Thread {
-                val llm = AgentRuntime.localLlm
-                Dbg.i(TAG, "LLM 自检: 开始加载，模型目录=${llm.modelDir().absolutePath}")
-                val t0 = System.currentTimeMillis()
-                if (!llm.ensureReady()) {
-                    Dbg.e(TAG, "LLM 自检: 加载失败 ${llm.lastError}")
-                    return@Thread
-                }
-                Dbg.i(TAG, "LLM 自检: 加载 ${System.currentTimeMillis() - t0}ms，开始生成")
-                // 模型带思考模式时必须加 /no_think，否则会先写一大段推理再给答案
-                // （实测 3765ms → 关掉后 800ms 内）。和正式链路的 buildPrompt 保持一致。
-                val noThink = if (llm.wantsNoThink) "/no_think" else ""
-                val prompt = "<|im_start|>user\n用一句中文介绍你自己。$noThink<|im_end|>\n" +
-                    "<|im_start|>assistant\n"
-                val out = llm.generate(prompt)
-                Dbg.i(TAG, "LLM 自检结果: ${out ?: "null（${llm.lastError}）"}")
-            }.apply { name = "llm-selftest"; isDaemon = true }.start()
-            return
-        }
-
-        // 沙箱自检：解包 rootfs + 起 proot 跑一条命令
-        //   adb shell am broadcast -a com.pilot.agent.RUN -p com.pilot.agent.debug \
-        //       --es sandbox_test "uname -a; echo PILOT_SANDBOX_OK"
-        val sandboxTest = intent.getStringExtra("sandbox_test")
-        if (!sandboxTest.isNullOrBlank()) {
-            Thread {
-                val term = com.pilot.agent.sandbox.SandboxTerminal
-                term.init(context)
-                kotlinx.coroutines.runBlocking {
-                    val r = term.run(context, sandboxTest, timeoutMs = 420_000)
-                    Dbg.i(TAG, "沙箱自检 exit=${r.exitCode} ${r.durationMs}ms mode=${com.pilot.agent.sandbox.SandboxClient.mode()} out=${r.output.take(400)}")
-                }
-            }.apply { name = "sandbox-selftest"; isDaemon = true }.start()
-            return
-        }
-
         if (goal.isEmpty()) {
-            Dbg.w(TAG, "触发请求缺少 goal / asr_test / llm_test")
+            Dbg.w(TAG, "触发请求缺少 goal")
             return
         }
-        dispatchBackgroundGoal(context, goal, "broadcast uid=$caller")
+        dispatchBackgroundGoal(context, goal, "broadcast ${TriggerAuth.label(caller)}")
     }
 }
 
@@ -321,9 +74,9 @@ private suspend fun answerByModel(text: String): String {
             .format(java.util.Date())
         val memory = AgentRuntime.localTools.memory.promptContext(text, 5)
         val memoryPrompt = if (memory.isBlank()) "" else "\n相关长期记忆：\n$memory"
-        // 云端
+        // 云端（可取消：点停止会立刻断开底层请求，不再吞取消信号）
         if (s.cloudReady) {
-            runCatching {
+            catchingNonCancel {
                 val body = org.json.JSONObject().apply {
                     put("model", s.model)
                     put("stream", false)
@@ -351,7 +104,7 @@ private suspend fun answerByModel(text: String): String {
                     .addHeader("Content-Type", "application/json")
                     .post(okhttp3.RequestBody.create("application/json".toMediaType(), body))
                     .build()
-                com.pilot.agent.agent.CloudHttp.client.newCall(req).execute().use { resp ->
+                com.pilot.agent.agent.CloudHttp.client.newCall(req).await().use { resp ->
                     if (resp.isSuccessful) {
                         org.json.JSONObject(resp.body?.string().orEmpty())
                             .optJSONArray("choices")?.optJSONObject(0)
@@ -390,7 +143,7 @@ internal fun dispatchBackgroundGoal(
     // 助理快路径：规则选能力 → 确定性抽参 → 本机执行，不调云端。
     // 接管了就不走下面的遗留匹配器，避免同一个请求被执行两遍。
     // 需要端侧模型补值的请求在无界面场景不处理（保持确定性），照旧走原链路。
-    Dbg.i(TAG, "dispatch plan begin goal=$goal caller=$callerLabel")
+    Dbg.i(TAG, "dispatch plan begin ${LogRedactor.text("goal", goal)} caller=$callerLabel")
     val fastPlan = AssistantFastPath.plan(context, goal, callerLabel)
     Dbg.i(
         TAG,
@@ -415,14 +168,15 @@ internal fun dispatchBackgroundGoal(
         val action = fastPlan.action
         val args = fastPlan.args
         Thread {
-            val result = runCatching {
+            val outcome = runCatching {
                 runBlocking {
                     AgentRuntime.localTools.execute(fastInvocation) { question, _ ->
-                        Dbg.w(TAG, "快路径无人确认，已拒绝：$question")
+                        Dbg.w(TAG, "快路径无人确认，已拒绝：${LogRedactor.text("question", question)}")
                         false
                     }
                 }
-            }.getOrNull()
+            }
+            val result = outcome.getOrNull()
             if (result != null) {
                 val reply = ResultFormatter.format(capability, action, args, result)
                 FastPathTrace.handled(
@@ -434,7 +188,13 @@ internal fun dispatchBackgroundGoal(
                 )
                 AgentRuntime.speaker.speak(reply.spoken)
             } else {
-                Dbg.e(TAG, "快路径没有返回结果")
+                // 结果未知：可能执行了一半，不能说成功也不能说没做。
+                Dbg.e(
+                    TAG,
+                    "快路径没有返回结果：${capability}/${action} " +
+                        "err=${LogRedactor.error(outcome.exceptionOrNull())}",
+                )
+                AgentRuntime.speaker.speak(UNKNOWN_RESULT_SPOKEN)
             }
         }.apply { name = "fast-path"; isDaemon = true }.start()
         return
@@ -448,15 +208,25 @@ internal fun dispatchBackgroundGoal(
         com.pilot.agent.tool.ToolPolicy.ALLOW
     ) {
         Thread {
-            val result = runCatching {
+            val outcome = runCatching {
                 runBlocking {
                     AgentRuntime.localTools.execute(localInvocation) { question, _ ->
-                        Dbg.w(TAG, "本地工具无人确认，已拒绝：$question")
+                        Dbg.w(TAG, "本地工具无人确认，已拒绝：${LogRedactor.text("question", question)}")
                         false
                     }
                 }
-            }.getOrNull()
-            result?.let { AgentRuntime.speaker.speak(it.spoken) }
+            }
+            val result = outcome.getOrNull()
+            if (result != null) {
+                AgentRuntime.speaker.speak(result.spoken)
+            } else {
+                Dbg.e(
+                    TAG,
+                    "本地工具没有返回结果：${localInvocation.name} " +
+                        "err=${LogRedactor.error(outcome.exceptionOrNull())}",
+                )
+                AgentRuntime.speaker.speak(UNKNOWN_RESULT_SPOKEN)
+            }
         }.apply { name = "local-tool"; isDaemon = true }.start()
         return
     }
@@ -490,13 +260,13 @@ internal fun dispatchBackgroundGoal(
 
         if (decision != null) {
             if (decision.execute) {
-                Dbg.i(TAG, "后台路由 → 执行 thought=${decision.thought}")
+                Dbg.i(TAG, "后台路由 → 执行 ${LogRedactor.text("thought", decision.thought)}")
                 executeBackgroundTask(goal, callerLabel)
                 return@Thread
             }
             val answer = decision.answer?.trim().orEmpty()
             if (answer.isNotBlank()) {
-                Dbg.i(TAG, "后台路由 → 回答 chars=${answer.length} thought=${decision.thought}")
+                Dbg.i(TAG, "后台路由 → 回答 chars=${answer.length} ${LogRedactor.text("thought", decision.thought)}")
                 AgentRuntime.speaker.speak(answer)
                 return@Thread
             }
@@ -536,7 +306,7 @@ private fun answerOrExecuteByKeyword(
         return
     }
     if (kind != com.pilot.agent.agent.IntentGate.Kind.TASK) {
-        Dbg.i(TAG, "非操作指令（$kind），交给模型回答：$goal")
+        Dbg.i(TAG, "非操作指令（$kind），交给模型回答：${LogRedactor.text("goal", goal)}")
         val reply = runCatching { runBlocking { answerByModel(goal) } }
             .getOrDefault("我暂时没法回答。")
         AgentRuntime.speaker.speak(reply)
@@ -549,10 +319,12 @@ private fun answerOrExecuteByKeyword(
 private fun executeBackgroundTask(goal: String, callerLabel: String) {
     val loop = AgentRuntime.loop
     if (loop == null) {
-        Dbg.e(TAG, "无障碍服务未连接，无法执行：$goal")
+        Dbg.e(TAG, "无障碍服务未连接，无法执行：${LogRedactor.text("goal", goal)}")
+        // 以前只写日志，用户什么反馈都没有（arch.md 观察）。
+        AgentRuntime.speaker.speak("无障碍服务没有开启，这个操作暂时没法在后台执行。请先在系统设置里打开 Pilot 的无障碍服务。")
         return
     }
-    Dbg.i(TAG, "background run goal=$goal caller=$callerLabel")
+    Dbg.i(TAG, "background run ${LogRedactor.text("goal", goal)} caller=$callerLabel")
     loop.start(
         AgentRuntime.scope,
         goal,
@@ -566,3 +338,6 @@ fun runBackgroundGoal(context: Context, goal: String, callerLabel: String = "voi
     dispatchBackgroundGoal(context, goal, callerLabel)
 
 private const val TAG = "Pilot"
+
+/** 后台执行拿不到结果时的如实播报：不声称成功，也不声称没做。 */
+private const val UNKNOWN_RESULT_SPOKEN = "这次操作没有拿到执行结果，不确定是否已经完成，请看一下手机确认。"

@@ -40,14 +40,26 @@ android {
     signingConfigs {
         // 自研 ROM 的关键一步：平台签名才能拿 signature|privileged 权限。
         // 不把平台密钥放进仓库，构建机通过 keystore/platform.jks + 环境变量注入。
+        //
+        // 安全（审核报告 code.md S1-c）：不再有默认密码 "android"。
+        //   密码/别名按「环境变量 → local.properties（不入库）」读取：
+        //     PILOT_STORE_PASSWORD / PILOT_KEY_PASSWORD / PILOT_KEY_ALIAS（别名缺省 platform）
+        //   缺任何一个密码就不创建 platform 签名配置，release 任务会在执行期报错。
+        //   "android" 是 AOSP 公开 testkey 的密码 —— 用公开平台密钥签名时，任何人都能签出
+        //   同签名 App 拿到 TRIGGER 及全部 signature|privileged 权限，所以默认拒绝。
         val platformStore = file("../keystore/platform.jks")
-        if (platformStore.exists()) {
+        val storePass = signingSecret("PILOT_STORE_PASSWORD")
+        val keyPass = signingSecret("PILOT_KEY_PASSWORD")
+        val alias = signingSecret("PILOT_KEY_ALIAS").ifBlank { "platform" }
+        if (platformStore.exists() && storePass.isNotBlank() && keyPass.isNotBlank()) {
             create("platform") {
                 storeFile = platformStore
-                storePassword = System.getenv("PILOT_STORE_PASSWORD") ?: "android"
-                keyAlias = System.getenv("PILOT_KEY_ALIAS") ?: "platform"
-                keyPassword = System.getenv("PILOT_KEY_PASSWORD") ?: "android"
+                storePassword = storePass
+                keyAlias = alias
+                keyPassword = keyPass
             }
+        } else if (platformStore.exists()) {
+            logger.warn("keystore/platform.jks 存在，但未配置 PILOT_STORE_PASSWORD / PILOT_KEY_PASSWORD（环境变量或 local.properties），release 将无法打包")
         }
     }
 
@@ -118,9 +130,25 @@ android {
 tasks.matching { it.name.startsWith("assembleRelease") || it.name.startsWith("bundleRelease") }
     .configureEach {
         doFirst {
-            val ext = extensions.getByType<com.android.build.gradle.AppExtension>()
-            if (ext.signingConfigs.findByName("platform") == null) {
-                error("keystore/platform.jks 缺失：release 必须使用平台签名，禁止回退 debug")
+            // 注意：doFirst 的接收者是 Task（Task 本身也是 ExtensionAware），
+            // 必须显式取 project 的扩展，否则 getByType 会在 task 扩展里找不到 AppExtension。
+            val ext = project.extensions.getByType<com.android.build.gradle.AppExtension>()
+            val platform = ext.signingConfigs.findByName("platform")
+                ?: error(
+                    "release 必须使用平台签名，禁止回退 debug：请提供 keystore/platform.jks，" +
+                        "并通过环境变量或 local.properties 配置 PILOT_STORE_PASSWORD / PILOT_KEY_PASSWORD",
+                )
+            // S1-c：拒绝 AOSP 公开 testkey 的默认密码。确属私有密钥且密码恰好相同时，
+            // 显式加 -PpilotAllowWeakSigningPassword=true 才放行（并请尽快更换密码）。
+            val weak = setOf("android", "")
+            val allowWeak = project.providers.gradleProperty("pilotAllowWeakSigningPassword").orNull == "true"
+            if (!allowWeak &&
+                ((platform.storePassword ?: "") in weak || (platform.keyPassword ?: "") in weak)) {
+                error(
+                    "平台签名密码是 AOSP 公开 testkey 的默认值 \"android\"：请确认平台密钥不是公开 testkey " +
+                        "（keytool -list -v -keystore keystore/platform.jks 与 AOSP build/target/product/security/platform.x509.pem 比对），" +
+                        "并更换为私有密钥/密码",
+                )
             }
         }
     }
@@ -173,3 +201,11 @@ fun localProp(key: String): String {
     f.inputStream().use { props.load(it) }
     return props.getProperty(key) ?: ""
 }
+
+/**
+ * 签名用的机密值：优先环境变量（CI），其次 local.properties（本机，不入库）。
+ * 读不到返回空串 —— **没有任何默认值**（S1-c）。
+ */
+fun signingSecret(key: String): String =
+    System.getenv(key)?.takeIf { it.isNotBlank() }
+        ?: localProp(key)
