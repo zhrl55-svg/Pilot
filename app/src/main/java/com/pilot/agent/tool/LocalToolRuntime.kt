@@ -144,7 +144,7 @@ class LocalToolRuntime(
         // 审核 C4：原来 runCatching 把外部取消（点“停止”）也记成“工具执行失败”。
         // TimeoutCancellationException 是本工具自己的超时，单独处理；其余取消一律向上抛。
         val result = try {
-            withTimeout(TIMEOUT_MS) {
+            withTimeout(timeoutFor(invocation.name)) {
                 invocation.execute(appContext) { _, _ -> false }
             }
         } catch (error: TimeoutCancellationException) {
@@ -480,6 +480,16 @@ class LocalToolRuntime(
     companion object {
         private const val TAG = "PilotLocalTools"
         private const val TIMEOUT_MS = 20_000L
+
+        /**
+         * 单个工具的预算。open_app 在「后台启动被系统拦截」时要依次走
+         * 悬浮窗豁免 → 回桌面重试 → 系统搜索 → 桌面图标手势，20s 根本跑不完，
+         * 结果被 withTimeout 直接砍断（日志「open_app timeout」），用户只看到失败。
+         */
+        private fun timeoutFor(name: String): Long = when (name) {
+            "open_app" -> 45_000L
+            else -> TIMEOUT_MS
+        }
         private const val MAX_RESULT_CHARS = 16_000
         private const val MAX_SPOKEN_CHARS = 600
     }

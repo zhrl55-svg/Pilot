@@ -96,11 +96,13 @@ class CapabilityExecutor(
                     timeoutMs = 6_000L,
                 )
             }
-            // 2) App 内入口：需要无障碍服务才能可靠启动。
+            // 2) 普通 App：交给 DeviceActions.openApp —— 它内置「悬浮豁免 → 回桌面重试 →
+            //    桌面图标手势 → 系统搜索」的降级链。HarmonyOS 冷启动设置主页这类受保护页时，
+            //    只有由桌面（系统应用）拉起才放行；launchComponent 没有这条兜底，会直接失败。
             val launchable = entry ?: return@ToolInvocation ToolResult.error("没找到「$app」")
             val actions = actionsProvider()
             if (actions != null) {
-                val ok = actions.launchComponent(launchable.pkg, launchable.component.className)
+                actions.openApp(launchable.pkg)
                 val outcome = actions.lastLaunchOutcome
                 return@ToolInvocation if (outcome != null) {
                     LaunchResults.toResult(
@@ -109,8 +111,6 @@ class CapabilityExecutor(
                         "已打开「${launchable.appLabel}」",
                         "已打开${launchable.appLabel}",
                     )
-                } else if (ok) {
-                    ToolResult.success("已打开「${launchable.appLabel}」")
                 } else {
                     ToolResult.error("没能打开「${launchable.appLabel}」。")
                 }
