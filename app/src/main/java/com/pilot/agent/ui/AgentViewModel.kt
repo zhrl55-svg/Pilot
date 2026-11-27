@@ -1444,6 +1444,32 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
      * 由模型决定回答还是执行。不再让遗留匹配器插在中间。
      */
     private fun dispatchRequest(g: String) {
+        // C 类「要我带你到开关页吗」的肯定回答：不交给模型，直接开页面（m-20261127-104）。
+        AgentRuntime.loop?.takePendingGuide()?.let { guide ->
+            if (com.pilot.agent.action.CommandSemantics.isAffirmative(g)) {
+                running = true
+                justSent = true
+                activeTaskLabel = "打开${guide.label}设置页"
+                publishNotificationStatus()
+                viewModelScope.launch {
+                    val outcome = com.pilot.agent.action.VerifiedLauncher.launch(
+                        getApplication(),
+                        com.pilot.agent.action.CommandSemantics.guideIntent(guide),
+                        expectPackage = null,
+                        timeoutMs = 4_000L,
+                    )
+                    add(
+                        LogEntry.Kind.OBSERVE,
+                        com.pilot.agent.action.CommandSemantics.guideOpenedText(guide, outcome),
+                    )
+                    running = false
+                    justSent = false
+                    activeTaskLabel = ""
+                    publishNotificationStatus()
+                }
+                return
+            }
+        }
         if (tryRunFastPath(g, allowConfirmation = true)) return
         if (tryRunLocalTool(g)) return
         dispatchToAgent(g)

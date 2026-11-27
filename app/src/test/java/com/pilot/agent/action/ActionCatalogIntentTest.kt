@@ -30,9 +30,7 @@ class ActionCatalogIntentTest {
             "设置主页" to "设置",
             "打开蓝牙设置" to "蓝牙",
             "打开 WiFi 设置" to "WLAN",
-            "打开wifi" to "WLAN",
             "打开电池" to "电池用量",
-            "把蓝牙打开" to "蓝牙",
             "请打开通知" to "通知",
             "打开应用管理" to "应用",
             "看看存储空间" to "存储",
@@ -42,6 +40,14 @@ class ActionCatalogIntentTest {
         cases.forEach { (goal, expected) ->
             assertEquals("「$goal」应当直达「$expected」", expected, labelOf(goal))
         }
+    }
+
+    @Test
+    fun `toggle phrasing is a result command not navigation`() {
+        // m-20261127-104：「打开wifi」「把蓝牙打开」要的是开关状态，不是打开设置页。
+        assertNull(labelOf("打开wifi"))
+        assertNull(labelOf("把蓝牙打开"))
+        assertNull(labelOf("把蓝牙关掉"))
     }
 
     @Test

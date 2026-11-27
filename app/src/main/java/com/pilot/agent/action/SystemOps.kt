@@ -1,10 +1,10 @@
 package com.pilot.agent.action
 
+import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.media.AudioManager
 import android.net.Uri
-import android.provider.AlarmClock
 import android.provider.Settings
 import com.pilot.agent.Dbg
 
@@ -133,8 +133,9 @@ class SystemOps(private val ctx: Context) {
         atMax: Boolean,
         atMin: Boolean,
     ): String {
-        val from = fromRaw * 100 / maxRaw
-        val to = toRaw * 100 / maxRaw
+        // 四舍五入到整数百分比：255 里的 76 应该是 30%，不是 29%（截断会少报一档）。
+        val from = Math.round(fromRaw * 100f / maxRaw)
+        val to = Math.round(toRaw * 100f / maxRaw)
         val delta = to - from
         if (delta == 0) {
             val msg = when {
@@ -156,59 +157,75 @@ class SystemOps(private val ctx: Context) {
         return msg
     }
 
-    fun openWriteSettingsPage() {
-        runCatching {
-            ctx.startActivity(
-                Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, Uri.parse("package:${ctx.packageName}"))
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            )
+    /** 打开「修改系统设置」授权页（只是导航；由用户在页里自己打开开关）。 */
+    suspend fun openWriteSettingsPage(): LaunchOutcome =
+        VerifiedLauncher.launch(
+            ctx,
+            Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, Uri.parse("package:${ctx.packageName}"))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            expectPackage = null,
+            timeoutMs = 4_000L,
+        )
+
+    // ------------------------------------------------------------ 勿扰
+
+    /**
+     * 直接改勿扰状态。需要「通知策略访问权」（用户手动授予）。
+     *
+     * @return 回执文案；[NEED_DND_ACCESS] = 缺权限；null = 写失败
+     */
+    fun setDnd(on: Boolean): String? {
+        val nm = ctx.getSystemService(NotificationManager::class.java) ?: return null
+        if (!nm.isNotificationPolicyAccessGranted) {
+            Dbg.w(TAG, "勿扰：缺通知策略访问权")
+            return NEED_DND_ACCESS
         }
+        return runCatching {
+            nm.setInterruptionFilter(
+                if (on) {
+                    NotificationManager.INTERRUPTION_FILTER_PRIORITY
+                } else {
+                    NotificationManager.INTERRUPTION_FILTER_ALL
+                },
+            )
+            // 回读确认，别把「请求发出去了」当成功
+            val now = nm.currentInterruptionFilter
+            val expected = if (on) {
+                NotificationManager.INTERRUPTION_FILTER_PRIORITY
+            } else {
+                NotificationManager.INTERRUPTION_FILTER_ALL
+            }
+            Dbg.i(TAG, "勿扰 ${if (on) "开" else "关"} → filter=$now")
+            when {
+                now == expected && on -> "勿扰已开启（优先联系人仍可打扰）。"
+                now == expected -> "勿扰已关闭。"
+                else -> null
+            }
+        }.getOrNull()
     }
 
     // ------------------------------------------------------------ 打电话
 
     /**
      * 直接拨号（不是打开拨号盘）。
-     * 需要 `CALL_PHONE` 运行时权限；没有就退化成 ACTION_DIAL（只填号码，等用户按拨出）。
+     * 启动后回查前台；CALL_PHONE 不可用或被系统拒绝时退回 ACTION_DIAL。
+     * @return 如实的结果（[LaunchOutcome]），由调用方决定怎么说，不再以「Intent 没抛异常」当成功。
      */
-    fun call(number: String): String? {
+    suspend fun call(number: String): LaunchOutcome {
         val tel = "tel:${number.trim()}"
         val direct = Intent(Intent.ACTION_CALL, Uri.parse(tel)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        if (runCatching { ctx.startActivity(direct) }.isSuccess) {
-            return "正在呼叫 $number"
-        }
+        val first = VerifiedLauncher.launch(ctx, direct, expectPackage = null, timeoutMs = 4_000L)
+        if (first.isOk) return first
         val dial = Intent(Intent.ACTION_DIAL, Uri.parse(tel)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        return if (runCatching { ctx.startActivity(dial) }.isSuccess) {
-            "已填好号码 $number，需要你按一下拨出（缺通话权限）"
-        } else {
-            null
-        }
-    }
-
-    // ------------------------------------------------------------ 闹钟 / 计时器
-
-    fun setAlarm(hour: Int, minute: Int, label: String = "手机助手"): Boolean {
-        val intent = Intent(AlarmClock.ACTION_SET_ALARM)
-            .putExtra(AlarmClock.EXTRA_HOUR, hour)
-            .putExtra(AlarmClock.EXTRA_MINUTES, minute)
-            .putExtra(AlarmClock.EXTRA_MESSAGE, label)
-            .putExtra(AlarmClock.EXTRA_SKIP_UI, true)
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        return runCatching { ctx.startActivity(intent) }.isSuccess
-    }
-
-    fun setTimer(seconds: Int, label: String = "手机助手"): Boolean {
-        val intent = Intent(AlarmClock.ACTION_SET_TIMER)
-            .putExtra(AlarmClock.EXTRA_LENGTH, seconds)
-            .putExtra(AlarmClock.EXTRA_MESSAGE, label)
-            .putExtra(AlarmClock.EXTRA_SKIP_UI, true)
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        return runCatching { ctx.startActivity(intent) }.isSuccess
+        return VerifiedLauncher.launch(ctx, dial, expectPackage = null, timeoutMs = 4_000L)
     }
 
     companion object {
         private const val TAG = "Pilot"
+
         const val NEED_WRITE_SETTINGS = "__need_write_settings__"
+
+        const val NEED_DND_ACCESS = "__need_dnd_access__"
 
         /** 屏幕最低亮度别调到 0，那样就黑屏了，用户以为死机 */
         private const val MIN_BRIGHTNESS = 15

@@ -130,6 +130,13 @@ class AgentLoop(
     @Volatile
     private var lastActionResult: String? = null
 
+    /**
+     * C 类命令（做不到）问过「要我带你去开关页吗」之后，等用户点头。
+     * 用户没点头之前绝不跳页面（m-20261127-104）。
+     */
+    @Volatile
+    private var pendingGuide: com.pilot.agent.action.CommandTarget? = null
+
     /** 当前任务目标（供浏览器判断「用户是否要亲眼看网页」）。 */
     @Volatile
     private var activeGoal: String = ""
@@ -279,6 +286,13 @@ class AgentLoop(
             emit(AgentEvent.Finished(com.pilot.agent.action.CalendarTool.create(
                 com.pilot.agent.PilotApp.instance, goal,
             )))
+            return
+        }
+
+        // A/B/C 语义（m-20261127-104）：结果型系统命令直接执行或如实拒绝；
+        // C 类先把「做不到 + 原因 + 要不要带路」说清楚，用户点头前不跳页面。
+        handleSystemCommand(goal)?.let { handled ->
+            emit(AgentEvent.Finished(handled))
             return
         }
 
@@ -851,6 +865,110 @@ class AgentLoop(
     }
 
     /**
+     * 取走「待带路」标记（用户对 C 类命令的下一步回答在这里判断）。
+     * UI 入口在任何路由之前调用：肯定回答直接开页面，其他话把标记清掉，避免过期。
+     */
+    fun takePendingGuide(): com.pilot.agent.action.CommandTarget? {
+        val g = pendingGuide
+        pendingGuide = null
+        return g
+    }
+
+    /**
+     * A/B/C 语义闸（m-20261127-104）。
+     *
+     * @return 最终回执；null = 不是结果型系统命令（导航或普通请求交回原链路）
+     */
+    private suspend fun handleSystemCommand(goal: String): String? {
+        val ctx = com.pilot.agent.PilotApp.instance
+        val semantics = com.pilot.agent.action.CommandSemantics
+        val guide = pendingGuide
+        if (guide != null) {
+            pendingGuide = null
+            if (semantics.isAffirmative(goal)) {
+                val outcome = com.pilot.agent.action.VerifiedLauncher.launch(
+                    ctx,
+                    semantics.guideIntent(guide),
+                    expectPackage = null,
+                    timeoutMs = 4_000L,
+                )
+                return semantics.guideOpenedText(guide, outcome)
+            }
+        }
+        val cmd = semantics.classify(goal) ?: return null
+        return when (cmd.kind) {
+            com.pilot.agent.action.CommandKind.NAVIGATE -> null
+            com.pilot.agent.action.CommandKind.IMPOSSIBLE -> {
+                pendingGuide = cmd.target
+                semantics.needsUserText(cmd)
+            }
+
+            com.pilot.agent.action.CommandKind.RESULT -> when (cmd.target) {
+                com.pilot.agent.action.CommandTarget.BRIGHTNESS -> runBrightness(goal)
+                com.pilot.agent.action.CommandTarget.VOLUME -> runVolume(goal)
+                com.pilot.agent.action.CommandTarget.DND -> runDnd(cmd.on == true)
+                else -> null
+            }
+        }
+    }
+
+    private fun runBrightness(goal: String): String? {
+        val change = com.pilot.agent.action.SystemOps.parseLevelChange(goal) ?: return null
+        val r = when (change) {
+            is com.pilot.agent.action.LevelChange.Delta -> actions.systemOps.adjustBrightness(change.percent)
+            is com.pilot.agent.action.LevelChange.Absolute -> actions.systemOps.setBrightness(change.percent)
+        }
+        return when (r) {
+            null -> "调亮度失败了，系统没有接受这次修改。"
+            com.pilot.agent.action.SystemOps.NEED_WRITE_SETTINGS -> {
+                pendingGuide = com.pilot.agent.action.CommandTarget.BRIGHTNESS
+                com.pilot.agent.action.CommandSemantics.needsUserText(
+                    com.pilot.agent.action.SystemCommand(
+                        com.pilot.agent.action.CommandKind.IMPOSSIBLE,
+                        com.pilot.agent.action.CommandTarget.BRIGHTNESS,
+                        null,
+                        "需要「修改系统设置」权限才能改亮度",
+                    ),
+                )
+            }
+
+            else -> r
+        }
+    }
+
+    private fun runVolume(goal: String): String? {
+        val silent = goal.contains("静音")
+        val change = com.pilot.agent.action.SystemOps.parseLevelChange(goal)
+        val r = when {
+            change is com.pilot.agent.action.LevelChange.Delta -> actions.systemOps.adjustVolume(change.percent)
+            change is com.pilot.agent.action.LevelChange.Absolute -> actions.systemOps.setVolume(change.percent)
+            silent -> actions.systemOps.setVolume(0)
+            else -> return null
+        }
+        return r ?: "调音量失败了，系统没有接受这次修改。"
+    }
+
+    private fun runDnd(on: Boolean): String? {
+        val r = actions.systemOps.setDnd(on)
+        return when (r) {
+            null -> "没改成：系统没有接受勿扰切换。"
+            com.pilot.agent.action.SystemOps.NEED_DND_ACCESS -> {
+                pendingGuide = com.pilot.agent.action.CommandTarget.DND
+                com.pilot.agent.action.CommandSemantics.needsUserText(
+                    com.pilot.agent.action.SystemCommand(
+                        com.pilot.agent.action.CommandKind.IMPOSSIBLE,
+                        com.pilot.agent.action.CommandTarget.DND,
+                        on,
+                        "需要通知策略访问权限才能改勿扰",
+                    ),
+                )
+            }
+
+            else -> r
+        }
+    }
+
+    /**
      * 系统能力直调。
      *
      * 返回值只有成功/失败，但**过程必须说出来**——用户要知道"音量从 30% 调到了 50%"，
@@ -876,8 +994,18 @@ class AgentLoop(
                 when (r) {
                     null -> false
                     com.pilot.agent.action.SystemOps.NEED_WRITE_SETTINGS -> {
-                        emit(AgentEvent.Observe("调亮度需要「修改系统设置」权限，正在打开授权页"))
-                        actions.systemOps.openWriteSettingsPage()
+                        // C 类纪律：先说改不了 + 原因，问要不要带路；用户点头前不跳页面。
+                        pendingGuide = com.pilot.agent.action.CommandTarget.BRIGHTNESS
+                        emit(AgentEvent.Observe(
+                            com.pilot.agent.action.CommandSemantics.needsUserText(
+                                com.pilot.agent.action.SystemCommand(
+                                    com.pilot.agent.action.CommandKind.IMPOSSIBLE,
+                                    com.pilot.agent.action.CommandTarget.BRIGHTNESS,
+                                    null,
+                                    "需要「修改系统设置」权限才能改亮度",
+                                ),
+                            ),
+                        ))
                         false
                     }
 
@@ -893,8 +1021,17 @@ class AgentLoop(
                 when (r) {
                     null -> false
                     com.pilot.agent.action.SystemOps.NEED_WRITE_SETTINGS -> {
-                        emit(AgentEvent.Observe("调亮度需要「修改系统设置」权限，正在打开授权页"))
-                        actions.systemOps.openWriteSettingsPage()
+                        pendingGuide = com.pilot.agent.action.CommandTarget.BRIGHTNESS
+                        emit(AgentEvent.Observe(
+                            com.pilot.agent.action.CommandSemantics.needsUserText(
+                                com.pilot.agent.action.SystemCommand(
+                                    com.pilot.agent.action.CommandKind.IMPOSSIBLE,
+                                    com.pilot.agent.action.CommandTarget.BRIGHTNESS,
+                                    null,
+                                    "需要「修改系统设置」权限才能改亮度",
+                                ),
+                            ),
+                        ))
                         false
                     }
 
@@ -914,19 +1051,26 @@ class AgentLoop(
                     emit(AgentEvent.Observe("通讯录里找不到「$arg」"))
                     false
                 } else {
-                    // ★ 坑 #18：HarmonyOS 后台拦截 ACTION_CALL 是静默失败
-                    //   （startActivity 不抛异常）。判据=起前后前台包有没有动过：
-                    //   没动 = 被拦，报失败；动了 = 进了通话/拨号界面（含华为变体）。
-                    val before = actions.foregroundPackage()
-                    val r = actions.systemOps.call(number)
-                    if (r == null) false
-                    else {
-                        kotlinx.coroutines.delay(800)
-                        val fg = actions.foregroundPackage()
-                        if (fg != null && fg != before) {
-                            emit(AgentEvent.Observe(r)); true
-                        } else {
-                            emit(AgentEvent.Observe("拨号被系统后台拦截（前台未切换），未拨出"))
+                    // SystemOps.call 自己走 VerifiedLauncher 回查前台（CALL 被拦再退拨号盘），
+                    // 不再用「startActivity 没抛异常」当成功（m-20261127-104）。
+                    when (val outcome = actions.systemOps.call(number)) {
+                        is com.pilot.agent.action.LaunchOutcome.Ok -> {
+                            emit(AgentEvent.Observe("正在呼叫 $number"))
+                            true
+                        }
+
+                        is com.pilot.agent.action.LaunchOutcome.Blocked -> {
+                            emit(AgentEvent.Observe("拨号没有成功：${outcome.reason.take(60)}"))
+                            false
+                        }
+
+                        is com.pilot.agent.action.LaunchOutcome.Failed -> {
+                            emit(AgentEvent.Observe("拨号失败：没有可用的电话应用"))
+                            false
+                        }
+
+                        com.pilot.agent.action.LaunchOutcome.Unknown -> {
+                            emit(AgentEvent.Observe("已发出拨号请求，但没能确认到了通话界面（结果未知）"))
                             false
                         }
                     }

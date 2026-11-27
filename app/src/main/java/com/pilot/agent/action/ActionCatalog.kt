@@ -128,6 +128,9 @@ object ActionCatalog {
         val g = goal.lowercase().trim()
         if (g.isEmpty()) return null
         if (TOPIC_CUES.any { g.contains(it) }) return null
+        // 「把蓝牙关掉」这类结果型命令不是「打开设置页」：交给语义层（执行或如实拒绝），
+        // 目录只负责「打开/看看 X」这种导航（m-20261127-104）。
+        if (CommandSemantics.blocksNavigation(g)) return null
         return TABLE.firstOrNull { e -> e.keywords.any { isDirectiveReference(g, it.lowercase()) } }
     }
 
