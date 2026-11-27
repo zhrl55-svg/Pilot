@@ -33,6 +33,8 @@ data class AgentSettings(
     val ttsEngine: String = TTS_MINIMAX,
     /** 播报时音乐的处理：duck（降音量不断歌）/ stop（直接停） */
     val musicPolicy: String = MUSIC_DUCK,
+    /** 网页打开方式：background（无头不占屏）/ overlay（悬浮小窗，默认）/ fullscreen（全屏） */
+    val browserMode: String = BROWSER_MODE_OVERLAY,
     /** 沙箱进程空闲回收阈值（分钟），0 = 不回收。回收释放 guest 内存（~130MB）。 */
     val sandboxIdleMinutes: Int = 5,
     /**
@@ -152,6 +154,11 @@ data class AgentSettings(
         /** 播报时直接停掉音乐 */
         const val MUSIC_STOP = "stop"
 
+        /** 网页打开方式 */
+        const val BROWSER_MODE_BACKGROUND = "background"
+        const val BROWSER_MODE_OVERLAY = "overlay"
+        const val BROWSER_MODE_FULLSCREEN = "fullscreen"
+
         const val DEFAULT_WAKE_WORDS = "小派,小派小派,你好小派"
 
         /** 自建 NeteaseCloudMusicApi 地址（部署在 buntu:3001） */
@@ -171,6 +178,7 @@ data class AgentSettings(
         private const val K_REPLAY = "allow_replay"
         private const val K_TTS_ENGINE = "tts_engine"
         private const val K_MUSIC_POLICY = "music_policy"
+        private const val K_BROWSER_MODE = "browser_mode"
         private const val K_SANDBOX_IDLE = "sandbox_idle_minutes"
         private const val K_CHAT_CONTEXT = "chat_context_turns"
         private const val K_TTS_VOICE = "tts_voice_id"
@@ -297,6 +305,7 @@ data class AgentSettings(
                 allowSkillReplay = p.getBoolean(K_REPLAY, true),
                 ttsEngine = p.getString(K_TTS_ENGINE, null) ?: TTS_MINIMAX,
                 musicPolicy = p.getString(K_MUSIC_POLICY, null) ?: MUSIC_DUCK,
+                browserMode = p.getString(K_BROWSER_MODE, null) ?: BROWSER_MODE_OVERLAY,
                 sandboxIdleMinutes = p.getInt(K_SANDBOX_IDLE, 5),
                 chatContextTurns = p.getInt(K_CHAT_CONTEXT, 4),
                 ttsVoiceId = p.getString(K_TTS_VOICE, null) ?: "male-qn-qingse",
@@ -357,6 +366,7 @@ data class AgentSettings(
                 .putBoolean(K_REPLAY, s.allowSkillReplay)
                 .putString(K_TTS_ENGINE, s.ttsEngine)
                 .putString(K_MUSIC_POLICY, s.musicPolicy)
+                .putString(K_BROWSER_MODE, s.browserMode)
                 .putInt(K_SANDBOX_IDLE, s.sandboxIdleMinutes)
                 .putInt(K_CHAT_CONTEXT, s.chatContextTurns)
                 .putString(K_TTS_VOICE, s.ttsVoiceId)

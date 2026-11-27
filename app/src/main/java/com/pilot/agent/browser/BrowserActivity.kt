@@ -1,6 +1,8 @@
 package com.pilot.agent.browser
 
 import android.annotation.SuppressLint
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
@@ -123,6 +125,22 @@ class BrowserActivity : ComponentActivity() {
             isAllCaps = false
             setOnClickListener {
                 if (webView.canGoBack()) webView.goBack() else finish()
+            }
+        })
+        topRow.addView(Button(this).apply {
+            text = "小窗"
+            isAllCaps = false
+            setOnClickListener {
+                val u = webView.url ?: intent?.dataString
+                if (u.isNullOrBlank()) return@setOnClickListener
+                lifecycleScope.launch {
+                    val ok = BrowserSessionManager.collapseToOverlay(applicationContext, u)
+                    if (ok) {
+                        finish()
+                    } else {
+                        Toast.makeText(this@BrowserActivity, "没有悬浮窗权限，无法转入小窗", Toast.LENGTH_SHORT).show()
+                    }
+                }
             }
         })
         topRow.addView(Button(this).apply {

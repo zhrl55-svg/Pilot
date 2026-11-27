@@ -192,6 +192,7 @@ private class SettingsDraft(initial: AgentSettings) {
     var ttsRate by mutableStateOf(initial.ttsRate)
 
     var musicPolicy by mutableStateOf(initial.musicPolicy)
+    var browserMode by mutableStateOf(initial.browserMode)
     var musicBaseUrl by mutableStateOf(initial.musicBaseUrl)
     var musicFallbackUrl by mutableStateOf(initial.musicFallbackUrl)
     var sandboxIdleMinutes by mutableStateOf(initial.sandboxIdleMinutes.toString())
@@ -230,6 +231,7 @@ private class SettingsDraft(initial: AgentSettings) {
             AgentSettings.MAX_TTS_RATE,
         ),
         musicPolicy = musicPolicy,
+        browserMode = browserMode,
         musicBaseUrl = musicBaseUrl.trim().trimEnd('/'),
         musicFallbackUrl = musicFallbackUrl.trim().trimEnd('/'),
         sandboxIdleMinutes =
@@ -1292,6 +1294,16 @@ private fun AgentSettingsPage(vm: AgentViewModel, draft: SettingsDraft) {
                 title = "浏览器会话",
                 description = "Agent 使用可见 WebView，保留登录 Cookie；只允许 HTTP/HTTPS，本地文件访问已关闭。",
             ) {
+                Text("网页打开方式", fontSize = 10.sp, color = SettingsMuted)
+                SegmentChoice(
+                    value = draft.browserMode,
+                    options = listOf(
+                        AgentSettings.BROWSER_MODE_OVERLAY to "小窗",
+                        AgentSettings.BROWSER_MODE_BACKGROUND to "后台",
+                        AgentSettings.BROWSER_MODE_FULLSCREEN to "全屏",
+                    ),
+                    onSelect = { draft.browserMode = it },
+                )
                 StatusActionRow(
                     title = "持久登录状态",
                     value = "Cookie 保留在 Pilot 私有目录",
