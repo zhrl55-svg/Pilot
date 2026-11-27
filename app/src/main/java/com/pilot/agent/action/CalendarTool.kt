@@ -5,11 +5,21 @@ import android.content.Intent
 import android.provider.CalendarContract
 import java.util.Calendar
 
-/** Hands event creation to the user's calendar app; nothing is saved until the user presses Save. */
+/**
+ * Hands event creation to the user's calendar app; nothing is saved until the user presses Save.
+ *
+ * ★ 审核 P0-5：**不能**用 `runCatching { startActivity }.isSuccess` 当「已打开日历」。
+ *   HarmonyOS / EMUI 的后台启动拦截是静默的（不抛异常、前台也不动），旧写法会把
+ *   「被拦下」播报成「已打开新建页面，点保存即可」。现在统一走
+ *   [VerifiedLauncher] 回查前台：确认才说打开，拦下/无法回查一律如实说「没确认」。
+ */
 object CalendarTool {
     fun handles(text: String): Boolean = listOf("添加日程", "新建日程", "创建日程", "加到日历", "日历里安排", "安排会议").any(text::contains)
 
-    fun create(context: Context, text: String): String {
+    /** 回查等待：日历 App 冷启动可能 3 秒以上，比应用启动的默认值放宽。 */
+    private const val LAUNCH_VERIFY_MS = 5_000L
+
+    suspend fun create(context: Context, text: String): String {
         val title = text.substringAfter("日程", "").ifBlank {
             text.substringAfter("安排", "").ifBlank { text.substringAfter("日历", "") }
         }.replace(Regex("(?:(?:今天|明天|后天)?(?:上午|下午|晚上|中午)?\\s*\\d{1,2}(?::|点)\\d{0,2}分?)"), "")
@@ -27,10 +37,24 @@ object CalendarTool {
             putExtra(CalendarContract.Events.EVENT_TIMEZONE, java.util.TimeZone.getDefault().id)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        return runCatching {
-            context.startActivity(intent)
+        return messageFor(VerifiedLauncher.launch(context, intent, expectPackage = null, timeoutMs = LAUNCH_VERIFY_MS))
+    }
+
+    /**
+     * 启动结果 → 回执文案。纯函数，单测直接覆盖四种结局。
+     *
+     * 只有 [LaunchOutcome.Ok] 能说「已打开」；[LaunchOutcome.Unknown] 必须说「没确认」，
+     * 不能被当成成功（审核 D-01 / P0-5）。
+     */
+    internal fun messageFor(outcome: LaunchOutcome): String = when (outcome) {
+        is LaunchOutcome.Ok ->
             "已打开日历新建页面，确认日期和标题后点保存即可。"
-        }.getOrElse { "没有找到可用的日历应用，请先安装或启用日历。" }
+        is LaunchOutcome.Blocked ->
+            "没能打开日历新建页面（${outcome.reason.take(60)}），日程没有创建；解锁手机后在屏幕上再说一次。"
+        is LaunchOutcome.Failed ->
+            "没有找到可用的日历应用，请先安装或启用日历。"
+        LaunchOutcome.Unknown ->
+            "已发出打开日历新建页面的请求，但没能确认它到了前台（结果未知）；请看一眼手机，没有的话再说一次。"
     }
 
     private fun parseTime(text: String): Long? {
