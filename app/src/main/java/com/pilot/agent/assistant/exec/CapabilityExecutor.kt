@@ -82,35 +82,52 @@ class CapabilityExecutor(
             summary = summary,
             confirmation = "允许打开「$app」吗？",
         ) { ctx, _ ->
+            // ★ 所有启动都经 [VerifiedLauncher] 回查（LaunchResults）：HarmonyOS/EMUI 后台拦截
+            //   startActivity 不抛异常，旧的 `runCatching { startActivity }.isSuccess` 会谎报「已打开」。
             // 1) 系统设置页 / 系统动作 / deep link。
             if (catalog != null) {
                 val intent = ActionCatalog.toIntent(catalog)
-                return@ToolInvocation runCatching { ctx.startActivity(intent) }
-                    .fold(
-                        onSuccess = { ToolResult.success("已打开「${catalog.label}」") },
-                        onFailure = { ToolResult.error("打开「${catalog.label}」失败：${it.message}") },
-                    )
+                return@ToolInvocation LaunchResults.launch(
+                    ctx,
+                    intent,
+                    label = catalog.label,
+                    okMessage = "已打开「${catalog.label}」",
+                    okSpoken = "已打开${catalog.label}",
+                    timeoutMs = 6_000L,
+                )
             }
             // 2) App 内入口：需要无障碍服务才能可靠启动。
             val launchable = entry ?: return@ToolInvocation ToolResult.error("没找到「$app」")
             val actions = actionsProvider()
             if (actions != null) {
                 val ok = actions.launchComponent(launchable.pkg, launchable.component.className)
-                return@ToolInvocation if (ok) {
+                val outcome = actions.lastLaunchOutcome
+                return@ToolInvocation if (outcome != null) {
+                    LaunchResults.toResult(
+                        outcome,
+                        launchable.appLabel,
+                        "已打开「${launchable.appLabel}」",
+                        "已打开${launchable.appLabel}",
+                    )
+                } else if (ok) {
                     ToolResult.success("已打开「${launchable.appLabel}」")
                 } else {
                     ToolResult.error("没能打开「${launchable.appLabel}」。")
                 }
             }
-            // 3) 没有无障碍服务：退回包名主入口。
+            // 3) 没有无障碍服务：退回包名主入口（同样回查，不谎报）。
             val launch = ctx.packageManager.getLaunchIntentForPackage(launchable.pkg)
                 ?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 ?: return@ToolInvocation ToolResult.error("没找到「$app」的主入口。")
-            runCatching { ctx.startActivity(launch) }
-                .fold(
-                    onSuccess = { ToolResult.success("已打开「${launchable.appLabel}」") },
-                    onFailure = { ToolResult.error("打开「${launchable.appLabel}」失败：${it.message}") },
-                )
+            LaunchResults.launch(
+                ctx,
+                launch,
+                label = launchable.appLabel,
+                okMessage = "已打开「${launchable.appLabel}」",
+                okSpoken = "已打开${launchable.appLabel}",
+                expectPackage = launchable.pkg,
+                timeoutMs = 6_000L,
+            )
         }
     }
 
