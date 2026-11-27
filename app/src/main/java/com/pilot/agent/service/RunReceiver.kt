@@ -7,6 +7,11 @@ import android.os.Build
 import android.os.Process
 import com.pilot.agent.Dbg
 import com.pilot.agent.LogRedactor
+import com.pilot.agent.action.CommandRoute
+import com.pilot.agent.action.CommandSemantics
+import com.pilot.agent.action.ScreenlessOutcome
+import com.pilot.agent.action.ScreenlessTasks
+import com.pilot.agent.action.ScreenRequirements
 import kotlinx.coroutines.runBlocking
 import okhttp3.MediaType.Companion.toMediaType
 import com.pilot.agent.assistant.AssistantFastPath
@@ -274,7 +279,7 @@ internal fun dispatchBackgroundGoal(
         if (decision != null) {
             if (decision.execute) {
                 Dbg.i(TAG, "后台路由 → 执行 ${LogRedactor.text("thought", decision.thought)}")
-                executeBackgroundTask(goal, callerLabel)
+                executeBackgroundTask(context, goal, callerLabel)
                 return@Thread
             }
             val answer = decision.answer?.trim().orEmpty()
@@ -286,7 +291,7 @@ internal fun dispatchBackgroundGoal(
         }
 
         Dbg.i(TAG, "后台路由云端不可用或未给出结论（$kind），关键词兜底")
-        answerOrExecuteByKeyword(goal, kind, callerLabel)
+        answerOrExecuteByKeyword(context, goal, kind, callerLabel)
     }.apply { name = "background-route"; isDaemon = true }.start()
 }
 
@@ -298,6 +303,7 @@ internal fun dispatchBackgroundGoal(
  * 注意：本函数运行在后台线程，内部可以放心使用 runBlocking。
  */
 private fun answerOrExecuteByKeyword(
+    context: Context,
     goal: String,
     kind: com.pilot.agent.agent.IntentGate.Kind,
     callerLabel: String,
@@ -325,16 +331,74 @@ private fun answerOrExecuteByKeyword(
         AgentRuntime.speaker.speak(reply)
         return
     }
-    executeBackgroundTask(goal, callerLabel)
+    executeBackgroundTask(context, goal, callerLabel)
 }
 
-/** 交给 Agent 循环执行；后台无人确认，ui=false 时遇到确认动作会快速放弃。 */
-private fun executeBackgroundTask(goal: String, callerLabel: String) {
+/**
+ * 后台通道执行一条命令（m-20261127-106）。
+ *
+ * 与 UI 共用 [ScreenRequirements.route] 的判定：
+ * - NONE 类（日程/提醒/待办/查询/音乐/B 类）直接本机办，回执必须播报出去；
+ * - C 类（命令本身做不到）如实说明，不赖无障碍；
+ * - SCREEN 类才因缺操作权限被拒；
+ * - 权限就绪时才交给 Agent 循环（后台无人确认，ui=false）。
+ */
+private fun executeBackgroundTask(context: Context, goal: String, callerLabel: String) {
+    val loopReady = AgentRuntime.loop != null
+    when (ScreenRequirements.route(goal, loopReady)) {
+        CommandRoute.IMPOSSIBLE -> {
+            val cmd = CommandSemantics.classify(goal)
+            val text = cmd?.let { CommandSemantics.needsUserText(it, askGuide = false) }
+                ?: "这个操作我做不到。"
+            Dbg.i(TAG, "后台 C 类命令如实说明：${LogRedactor.text("goal", goal)}")
+            AgentRuntime.speaker.speak(text)
+            return
+        }
+
+        CommandRoute.LOCAL -> {
+            val outcome = if (ScreenlessTasks.canRun(goal)) {
+                runCatching { runBlocking { ScreenlessTasks.run(context, goal) } }.getOrNull()
+            } else {
+                null
+            }
+            when (outcome) {
+                is ScreenlessOutcome.Done -> {
+                    Dbg.i(TAG, "后台本机执行 → 回执：${LogRedactor.text("goal", goal)}")
+                    speakBackgroundReceipt(goal, outcome.message)
+                    postBackgroundReceipt(context, goal, outcome.message)
+                    return
+                }
+                is ScreenlessOutcome.NeedsGuide -> {
+                    Dbg.i(TAG, "后台本机执行 → 缺权限说明：${LogRedactor.text("goal", goal)}")
+                    AgentRuntime.speaker.speak(outcome.message)
+                    postBackgroundReceipt(context, goal, outcome.message)
+                    return
+                }
+                null -> Unit // 本机接不了，按原链路继续
+            }
+            if (!loopReady) {
+                Dbg.e(TAG, "后台本机接不了且无障碍未连接：${LogRedactor.text("goal", goal)}")
+                AgentRuntime.speaker.speak("这条命令这次没能在后台执行，请检查 Pilot 的运行状态后再试。")
+                return
+            }
+        }
+
+        CommandRoute.NEEDS_SCREEN -> {
+            Dbg.e(TAG, "后台要读屏但无障碍未连接：${LogRedactor.text("goal", goal)}")
+            AgentRuntime.speaker.speak(
+                "这个动作要读屏幕，Pilot 的操作权限没有开启，后台没法执行。开启后再试。",
+            )
+            return
+        }
+
+        CommandRoute.AGENT -> Unit
+    }
+
     val loop = AgentRuntime.loop
     if (loop == null) {
+        // route 已兜过缺权限，这里只防御竞态（判定后服务刚好断开）。
         Dbg.e(TAG, "无障碍服务未连接，无法执行：${LogRedactor.text("goal", goal)}")
-        // 以前只写日志，用户什么反馈都没有（arch.md 观察）。
-        AgentRuntime.speaker.speak("无障碍服务没有开启，这个操作暂时没法在后台执行。请先在系统设置里打开 Pilot 的无障碍服务。")
+        AgentRuntime.speaker.speak("这个动作暂时没法在后台执行，请检查 Pilot 的操作权限后再试。")
         return
     }
     Dbg.i(TAG, "background run ${LogRedactor.text("goal", goal)} caller=$callerLabel")
@@ -346,11 +410,58 @@ private fun executeBackgroundTask(goal: String, callerLabel: String) {
     )
 }
 
+/** 后台回执落点：查询类长答案走扩展播报，其余直接播；不能静默成功。 */
+private fun speakBackgroundReceipt(goal: String, message: String) {
+    val summary = if (com.pilot.agent.query.QueryEngine.canHandle(goal)) {
+        com.pilot.agent.query.QueryEngine.speechSummary(message)
+    } else {
+        null
+    }
+    if (summary != null) AgentRuntime.speaker.speakExpanded(summary)
+    else AgentRuntime.speaker.speak(message)
+}
+
+/**
+ * 后台回执的持久落点（m-20261127-106）：播报可能被静音/锁屏错过，
+ * 再用一条低优先级通知把「做了什么、结果是什么」留在通知栏。
+ */
+private fun postBackgroundReceipt(context: Context, goal: String, message: String) {
+    runCatching {
+        val manager = context.getSystemService(Context.NOTIFICATION_SERVICE)
+            as android.app.NotificationManager
+        if (manager.getNotificationChannel(CHANNEL_RECEIPT) == null) {
+            manager.createNotificationChannel(
+                android.app.NotificationChannel(
+                    CHANNEL_RECEIPT,
+                    "后台回执",
+                    android.app.NotificationManager.IMPORTANCE_LOW,
+                ),
+            )
+        }
+        manager.notify(
+            goal.hashCode(),
+            androidx.core.app.NotificationCompat.Builder(context, CHANNEL_RECEIPT)
+                .setSmallIcon(com.pilot.agent.R.drawable.ic_pilot)
+                .setContentTitle("Pilot 已完成")
+                .setContentText(message.take(120))
+                .setStyle(
+                    androidx.core.app.NotificationCompat.BigTextStyle()
+                        .bigText("$goal\n$message"),
+                )
+                .setAutoCancel(true)
+                .build(),
+        )
+    }.onFailure { Dbg.w(TAG, "后台回执通知失败：${LogRedactor.error(it)}") }
+}
+
 /** 供后台语音（界面已销毁、没有 ViewModel）复用同一套执行链。 */
 fun runBackgroundGoal(context: Context, goal: String, callerLabel: String = "voice") =
     dispatchBackgroundGoal(context, goal, callerLabel)
 
 private const val TAG = "Pilot"
+
+/** 后台回执通知渠道（低优先级，不打扰）。 */
+private const val CHANNEL_RECEIPT = "pilot_background_receipt"
 
 /** 后台执行拿不到结果时的如实播报：不声称成功，也不声称没做。 */
 private const val UNKNOWN_RESULT_SPOKEN = "这次操作没有拿到执行结果，不确定是否已经完成，请看一下手机确认。"

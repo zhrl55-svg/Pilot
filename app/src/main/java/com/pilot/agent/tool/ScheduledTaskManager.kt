@@ -11,6 +11,12 @@ import android.net.Uri
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import com.pilot.agent.Dbg
+import com.pilot.agent.action.CommandKind
+import com.pilot.agent.action.CommandSemantics
+import com.pilot.agent.action.ScreenRequirement
+import com.pilot.agent.action.ScreenRequirements
+import com.pilot.agent.action.ScreenlessOutcome
+import com.pilot.agent.action.ScreenlessTasks
 import com.pilot.agent.query.EncryptedJsonStore
 import com.pilot.agent.query.QueryEngine
 import com.pilot.agent.query.VaultUnavailableException
@@ -331,6 +337,23 @@ object ScheduledTaskManager {
                 AgentRuntime.localTools.execute(goal) { _, _ -> false }
             }
             return result?.spoken ?: result?.message ?: "定时任务没有返回结果。"
+        }
+        // 到点执行没有界面，与 UI/后台共用同一套判定（m-20261127-106）：
+        // NONE 类照常办，C 类说清做不到，SCREEN 类才因缺读屏被拒。
+        val requirement = ScreenRequirements.requirement(goal)
+        if (requirement == ScreenRequirement.NONE && ScreenlessTasks.canRun(goal)) {
+            val outcome = runCatching { runBlocking { ScreenlessTasks.run(context, goal) } }.getOrNull()
+            when (outcome) {
+                is ScreenlessOutcome.Done -> return outcome.message
+                is ScreenlessOutcome.NeedsGuide -> return outcome.message
+                null -> Unit
+            }
+        } else if (requirement == ScreenRequirement.SCREEN) {
+            val cmd = CommandSemantics.classify(goal)
+            if (cmd?.kind == CommandKind.IMPOSSIBLE) {
+                return CommandSemantics.needsUserText(cmd, askGuide = false)
+            }
+            return "这个定时任务要读屏幕才能执行，Pilot 的操作权限没开，到点没法做。"
         }
         return runBlocking { QueryEngine.handle(goal) }
             ?.let { QueryEngine.speechSummary(it) ?: it }

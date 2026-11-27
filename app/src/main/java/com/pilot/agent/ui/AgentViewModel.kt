@@ -1508,37 +1508,15 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     private fun runScreenless(goal: String): Boolean {
         val app = getApplication<Application>()
         val g = goal.trim()
-        val requirements = com.pilot.agent.action.ScreenRequirements
-        when {
-            com.pilot.agent.action.CalendarTool.handlesCancel(g) ->
-                answerScreenless { com.pilot.agent.action.CalendarTool.cancelLastCreated(app) }
-            com.pilot.agent.action.CalendarTool.handles(g) ->
-                answerScreenless { com.pilot.agent.action.CalendarTool.create(app, g) }
-            com.pilot.agent.action.ReminderManager.handles(g) ->
-                answerScreenless { com.pilot.agent.action.ReminderManager.handle(app, g) }
-            com.pilot.agent.action.PersonalTodoStore.handles(g) ->
-                answerScreenless { com.pilot.agent.action.PersonalTodoStore.handle(g) }
-            com.pilot.agent.query.QueryEngine.canHandle(g) ->
-                answerScreenless {
-                    com.pilot.agent.query.QueryEngine.handle(g)
-                        ?: "没能查到「$g」的结果，可能是网络不可用或暂时没有相关内容。"
-                }
-            requirements.isMusicCommand(g) ->
-                answerScreenless { playMusicScreenless(g) }
-            else -> {
-                val cmd = com.pilot.agent.action.CommandSemantics.classify(g)
-                if (cmd == null || cmd.kind != com.pilot.agent.action.CommandKind.RESULT) return false
-                answerScreenless {
-                    when (val r = com.pilot.agent.action.SystemCommandRunner.run(
-                        com.pilot.agent.action.SystemOps(app), cmd, g,
-                    )) {
-                        null -> null
-                        is com.pilot.agent.action.SystemRunOutcome.Done -> r.message
-                        is com.pilot.agent.action.SystemRunOutcome.NeedsGuide -> {
-                            pendingViewGuide = r.target
-                            r.message
-                        }
-                    }
+        // 执行器与后台通道共用（m-20261127-106）；判定仍由 ScreenRequirements 负责。
+        if (!com.pilot.agent.action.ScreenlessTasks.canRun(g)) return false
+        answerScreenless {
+            when (val r = com.pilot.agent.action.ScreenlessTasks.run(app, g)) {
+                null -> null
+                is com.pilot.agent.action.ScreenlessOutcome.Done -> r.message
+                is com.pilot.agent.action.ScreenlessOutcome.NeedsGuide -> {
+                    pendingViewGuide = r.target
+                    r.message
                 }
             }
         }
@@ -1570,40 +1548,6 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             AgentRuntime.speaker.speak(clean)
             refreshStatus()
         }
-    }
-
-    /** 无障碍未连上时的最小音乐播放：搜索/热歌 → 直接拉起播放器。 */
-    private suspend fun playMusicScreenless(goal: String): String {
-        val s = AgentSettings.load()
-        val query = goal
-            .replace(Regex("^(帮我|给我|请)?(播放|放首|放一下|来首|来一首|放歌|听歌)"), "")
-            .replace(Regex("(这首歌|的歌|歌曲|音乐|吧|呗)$"), "")
-            .trim()
-        val songs = withContext(Dispatchers.IO) {
-            if (query.isBlank()) {
-                com.pilot.agent.music.NeteaseApi.chartSongs(s.musicBaseUrl, 3778678L, s.neteaseCookie, 20)
-            } else {
-                com.pilot.agent.music.NeteaseApi.search(s.musicBaseUrl, query, 5, s.neteaseCookie)
-            }
-        }
-        if (songs.isEmpty()) return "没搜到「${query.ifBlank { "热门" }}」，检查音乐服务或网络后再说一次。"
-        val tracks = songs.map { song ->
-            com.pilot.agent.music.MusicPlayer.Track(
-                title = song.name,
-                artist = song.artist,
-                resolver = {
-                    com.pilot.agent.music.NeteaseApi.playUrl(s.musicBaseUrl, song.id, s.neteaseCookie)
-                        ?.let { com.pilot.agent.music.MusicPlayer.Source.Remote(it) }
-                },
-                lyricProvider = {
-                    com.pilot.agent.music.NeteaseApi.lyrics(s.musicBaseUrl, song.id, s.neteaseCookie)
-                },
-            )
-        }
-        val started = withContext(Dispatchers.Main.immediate) {
-            com.pilot.agent.music.MusicPlayer.get(getApplication()).playQueue(tracks)
-        }
-        return if (started) "正在播放：${songs.first().display}" else "音乐播放失败，检查音乐服务后再说一次。"
     }
 
     /**

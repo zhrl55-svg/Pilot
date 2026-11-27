@@ -19,6 +19,25 @@ enum class ScreenRequirement {
     SCREEN,
 }
 
+/**
+ * 一条命令在某个通道上应该怎么走（m-20261127-106）。
+ *
+ * UI 与后台/语音/定时/调试共用：[ScreenRequirements.route] 是唯一的判定入口。
+ */
+enum class CommandRoute {
+    /** 本机直办，不需要屏幕（日程/提醒/待办/查询/音乐/B 类）。 */
+    LOCAL,
+
+    /** 命令本身做不到（C 类）：如实说明，别把锅甩给无障碍。 */
+    IMPOSSIBLE,
+
+    /** 真要读屏，但当前没有操作权限：拒绝并说明缺权限。 */
+    NEEDS_SCREEN,
+
+    /** 需要读屏且权限已就绪：交给 Agent 执行。 */
+    AGENT,
+}
+
 object ScreenRequirements {
 
     private val MUSIC_WORDS = listOf(
@@ -49,4 +68,16 @@ object ScreenRequirements {
         MUSIC_WORDS.any { goal.contains(it) } && !goal.contains("打开")
 
     fun needsScreen(goal: String): Boolean = requirement(goal) == ScreenRequirement.SCREEN
+
+    /**
+     * 通道无关的统一路由（m-20261127-106）。
+     *
+     * C 类先判——「做不到」与「缺权限」是两回事，不能都怪无障碍。
+     * NONE 类一律本机直办，与 [screenReady] 无关；只有 SCREEN 类才看权限。
+     */
+    fun route(goal: String, screenReady: Boolean): CommandRoute {
+        if (CommandSemantics.classify(goal)?.kind == CommandKind.IMPOSSIBLE) return CommandRoute.IMPOSSIBLE
+        if (requirement(goal) == ScreenRequirement.NONE) return CommandRoute.LOCAL
+        return if (screenReady) CommandRoute.AGENT else CommandRoute.NEEDS_SCREEN
+    }
 }

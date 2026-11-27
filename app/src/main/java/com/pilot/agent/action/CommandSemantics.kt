@@ -118,14 +118,20 @@ object CommandSemantics {
         SystemCommand(CommandKind.IMPOSSIBLE, target, on, reason)
 
     /** C 类回执：先说做不到 + 原因，再问要不要带路。 */
-    fun needsUserText(cmd: SystemCommand): String {
+    fun needsUserText(cmd: SystemCommand, askGuide: Boolean = true): String {
         val verb = when (cmd.on) {
             true -> "打开${cmd.target.label}"
             false -> "关闭${cmd.target.label}"
             null -> "调整${cmd.target.label}"
         }
         val reason = cmd.reason ?: "这个能力受限"
-        return "我现在没办法直接$verb：$reason。要我带你到开关页自己拨一下吗？"
+        val base = "我现在没办法直接$verb：$reason。"
+        // 后台通道没有「等你回答」的上下文，别问一个没人接的问题（m-20261127-106）。
+        return if (askGuide) {
+            base + "要我带你到开关页自己拨一下吗？"
+        } else {
+            base + "解锁后在界面里让我带你到开关页。"
+        }
     }
 
     /** B 类回执：改成功后的统一说法（附回读值）。 */
