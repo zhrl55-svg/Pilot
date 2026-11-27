@@ -42,3 +42,9 @@ review/
 # 那些是 v0.1 交付说明用的，误删过一次）
 shots/tmp_*
 shots/*.xml
+
+# local security scanner config (added 2026-11-27)
+.security/
+
+# one-off audit reports, same policy as review/ (added 2026-11-27)
+fix/
