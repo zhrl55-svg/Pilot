@@ -3,6 +3,7 @@ package com.pilot.agent.assistant.exec
 import android.content.Context
 import com.pilot.agent.assistant.routing.AssistantRoute
 import com.pilot.agent.assistant.routing.RouteDecision
+import com.pilot.agent.query.SecretVault
 import com.pilot.agent.testutil.FakeContext
 import com.pilot.agent.tool.LocalToolRuntime
 import com.pilot.agent.tool.ToolConfirmer
@@ -34,8 +35,15 @@ class CapabilityExecutorTest {
     @Before
     fun setUp() {
         context = FakeContext()
+        // JVM 单测没有 AndroidKeyStore：注入 FakeContext + 明文模式，只验证能力执行语义。
+        SecretVault.installForTest(context)
         tools = LocalToolRuntime(context) { null }
         executor = CapabilityExecutor(context = context, tools = tools)
+    }
+
+    @org.junit.After
+    fun tearDown() {
+        SecretVault.resetForTest()
     }
 
     private fun localDecision(

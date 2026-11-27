@@ -1,6 +1,7 @@
 package com.pilot.agent.action
 
 import android.content.Context
+import com.pilot.agent.query.SecretVault
 import com.pilot.agent.testutil.FakeContext
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
@@ -24,6 +25,13 @@ class ReminderManagerTest {
     @Before
     fun setUp() {
         context = FakeContext()
+        // JVM 单测没有 AndroidKeyStore：注入 FakeContext + 明文模式，只验证提醒业务语义。
+        SecretVault.installForTest(context)
+    }
+
+    @org.junit.After
+    fun tearDown() {
+        SecretVault.resetForTest()
     }
 
     // Test scenario: 空字符串关键词不得删除任何提醒，必须先要求用户查看列表。

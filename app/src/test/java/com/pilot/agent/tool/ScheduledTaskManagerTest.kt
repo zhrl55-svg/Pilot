@@ -1,6 +1,7 @@
 package com.pilot.agent.tool
 
 import android.content.Context
+import com.pilot.agent.query.SecretVault
 import com.pilot.agent.testutil.FakeContext
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -24,6 +25,13 @@ class ScheduledTaskManagerTest {
     @Before
     fun setUp() {
         context = FakeContext()
+        // JVM 单测没有 AndroidKeyStore：注入 FakeContext + 明文模式，只验证定时任务业务语义。
+        SecretVault.installForTest(context)
+    }
+
+    @org.junit.After
+    fun tearDown() {
+        SecretVault.resetForTest()
     }
 
     // Test scenario: 空关键词不得取消任何任务，先要求用户查看列表。
