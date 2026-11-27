@@ -41,6 +41,44 @@ class FileTools(
         }.distinctBy { it.absolutePath }
     }
 
+    /**
+     * 应用内部受保护的文件/目录（审核 code S5）：审计日志、运行日志、模型、技能、
+     * 沙箱 rootfs 与会话数据、路由表、声纹模板。文件工具不能删除、覆盖、移动、
+     * 复制外发、打开或分享它们（读取仍走 [readFile] 的大小/二进制限制）。
+     */
+    private val protectedInternal: List<File> by lazy {
+        listOf(
+            "audit.log",
+            "tool-audit.log",
+            "pilot.log",
+            "assistant_fastpath.log",
+            "models",
+            "skills",
+            "minis-global",
+            "minis-sessions",
+            "alpine-rootfs",
+            "sandbox",
+            "assistant",
+            "voiceprint_template.bin",
+        ).mapNotNull { name ->
+            runCatching { File(context.filesDir, name).canonicalFile }.getOrNull()
+        }
+    }
+
+    /** 目标是受保护项本身、位于其内部，或是包含受保护项的上级目录（例如 filesDir 本身）。 */
+    private fun isProtected(file: File): Boolean {
+        val path = runCatching { file.canonicalPath }.getOrNull() ?: return true
+        return protectedInternal.any { p ->
+            val pp = p.path
+            path == pp ||
+                path.startsWith(pp + File.separator) ||
+                pp.startsWith(path.trimEnd(File.separatorChar) + File.separator)
+        }
+    }
+
+    private fun protectedDenied(): ToolResult =
+        ToolResult.denied("这是 Pilot 的受保护数据（审计日志、运行日志、模型或沙箱数据），不能通过文件工具修改、删除或外发。")
+
     fun listFiles(rawPath: String): ToolResult {
         val target = resolve(rawPath, mustExist = true)
             ?: return ToolResult.denied("这个路径不在 Pilot 可访问的范围内，或路径包含越界跳转。")
@@ -92,6 +130,7 @@ class FileTools(
     fun writeFile(rawPath: String, content: String, overwrite: Boolean = false): ToolResult {
         val target = resolve(rawPath, mustExist = false)
             ?: return ToolResult.denied("这个路径不在 Pilot 可访问的范围内，或路径包含越界跳转。")
+        if (isProtected(target)) return protectedDenied()
         if (!hasAllFilesAccess() && !isInsideAppStorage(target)) {
             return ToolResult.unavailable(
                 "共享存储写入需要“所有文件访问”权限。请到 Pilot 设置里的“本机工具与长期记忆”开启。"
@@ -120,8 +159,10 @@ class FileTools(
         val destination = resolve(rawDestination, mustExist = false)
             ?: return ToolResult.denied("目标路径不在 Pilot 可访问的范围内。")
         if (!source.isFile) return ToolResult.error("源文件不存在。")
+        if (isProtected(source)) return protectedDenied()
         val finalTarget = if (destination.isDirectory) File(destination, source.name) else destination
         if (!isAllowed(finalTarget)) return ToolResult.denied("目标路径越界，已拒绝。")
+        if (isProtected(finalTarget)) return protectedDenied()
         if (!hasAllFilesAccess() && !isInsideAppStorage(finalTarget)) {
             return ToolResult.unavailable("复制到共享存储需要“所有文件访问”权限。")
         }
@@ -141,8 +182,10 @@ class FileTools(
         val destination = resolve(rawDestination, mustExist = false)
             ?: return ToolResult.denied("目标路径不在 Pilot 可访问的范围内。")
         if (!source.exists()) return ToolResult.error("源文件不存在。")
+        if (isProtected(source)) return protectedDenied()
         val finalTarget = if (destination.isDirectory) File(destination, source.name) else destination
         if (!isAllowed(finalTarget)) return ToolResult.denied("目标路径越界，已拒绝。")
+        if (isProtected(finalTarget)) return protectedDenied()
         if (!hasAllFilesAccess() && !isInsideAppStorage(finalTarget)) {
             return ToolResult.unavailable("移动到共享存储需要“所有文件访问”权限。")
         }
@@ -165,6 +208,7 @@ class FileTools(
         if (target == externalRoot || allowedRoots.any { it == target }) {
             return ToolResult.denied("不能删除根目录或应用保护区。")
         }
+        if (isProtected(target)) return protectedDenied()
         val ok = runCatching {
             if (target.isDirectory) target.deleteRecursively() else target.delete()
         }.getOrElse { return errorResult("删除失败", it) }
@@ -189,27 +233,35 @@ class FileTools(
         )
     }
 
-    fun openFile(rawPath: String): ToolResult {
+    /** 审核 D-01：经 VerifiedLauncher 回查，未确认打开时如实说“未确认”。 */
+    suspend fun openFile(rawPath: String): ToolResult {
         val target = resolve(rawPath, mustExist = true)
             ?: return ToolResult.denied("这个路径不在 Pilot 可访问的范围内。")
         if (!target.isFile) return ToolResult.error("没有找到这个文件。")
+        if (isProtected(target)) return protectedDenied()
         val uri = uriFor(target) ?: return ToolResult.error("无法为这个文件创建安全访问链接。")
         val intent = Intent(Intent.ACTION_VIEW)
             .setDataAndType(uri, mimeType(target))
             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-        return runCatching {
-            context.startActivity(intent)
-            ToolResult.success("已请求系统打开 ${target.name}。", "正在打开 ${target.name}。")
-        }.getOrElse {
-            Dbg.w(TAG, "open failed: ${it.javaClass.simpleName}")
-            ToolResult.error("没有应用能打开 ${target.name}。")
+        if (intent.resolveActivity(context.packageManager) == null) {
+            Dbg.w(TAG, "open failed: no handler")
+            return ToolResult.error("没有应用能打开 ${target.name}。")
         }
+        return LaunchResults.launch(
+            context,
+            intent,
+            label = target.name,
+            okMessage = "已用系统应用打开 ${target.name}。",
+            okSpoken = "已打开 ${target.name}。",
+        )
     }
 
-    fun shareFile(rawPath: String): ToolResult {
+    /** 审核 D-01：分享面板经 VerifiedLauncher 回查（期望包名置空，只看前台是否切换）。 */
+    suspend fun shareFile(rawPath: String): ToolResult {
         val target = resolve(rawPath, mustExist = true)
             ?: return ToolResult.denied("这个路径不在 Pilot 可访问的范围内。")
         if (!target.isFile) return ToolResult.error("没有找到这个文件。")
+        if (isProtected(target)) return protectedDenied()
         val uri = uriFor(target) ?: return ToolResult.error("无法为这个文件创建安全访问链接。")
         val send = Intent(Intent.ACTION_SEND)
             .setType(mimeType(target))
@@ -218,13 +270,14 @@ class FileTools(
             .apply { clipData = ClipData.newRawUri(target.name, uri) }
         val chooser = Intent.createChooser(send, "分享 ${target.name}")
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        return runCatching {
-            context.startActivity(chooser)
-            ToolResult.success("已打开分享面板。", "请选择要分享到的应用。")
-        }.getOrElse {
-            Dbg.w(TAG, "share failed: ${it.javaClass.simpleName}")
-            ToolResult.error("无法打开分享面板。")
-        }
+        return LaunchResults.launch(
+            context,
+            chooser,
+            label = "分享面板",
+            okMessage = "已打开分享面板。",
+            okSpoken = "请选择要分享到的应用。",
+            expectPackage = null,
+        )
     }
 
     fun defaultDirectoryFor(rawHint: String): String {
@@ -250,8 +303,11 @@ class FileTools(
         Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()
 
     private fun resolve(raw: String, mustExist: Boolean): File? {
+        // 只去掉首尾的引号/空白，标点只去结尾：开头的点有意义（.nomedia、./Download），
+        // 以前整体 trim('.') 会把 "./Download" 变成绝对路径 "/Download"（审核 code S5）。
         val clean = raw.trim()
-            .trim('"', '\'', '“', '”', '‘', '’', ' ', '，', ',', '。', '.')
+            .trim('"', '\'', '“', '”', '‘', '’', ' ')
+            .trimEnd('，', ',', '。', '.', ' ')
         if (clean.isBlank() || clean.contains('\u0000')) return null
         if (clean.split(File.separatorChar).any { it == ".." }) return null
         val candidate = when {
