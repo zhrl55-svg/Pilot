@@ -10,6 +10,7 @@ import com.pilot.agent.agent.AgentSettings
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONObject
 
 /**
@@ -78,38 +79,76 @@ class MiniMaxTts(private val context: Context) : SpeechOutput {
     var lastError: String? = null
         private set
 
+    /** 一条播报的终止回调：onDone / onError 恰好其一、只触发一次（V-04）。 */
+    private class Pending(
+        private val onDone: () -> Unit,
+        private val onError: (String) -> Unit,
+    ) {
+        private val fired = AtomicBoolean(false)
+
+        fun done() {
+            if (fired.compareAndSet(false, true)) runCatching(onDone)
+        }
+
+        fun error(msg: String) {
+            if (fired.compareAndSet(false, true)) runCatching { onError(msg) }
+        }
+    }
+
+    /**
+     * 当前在途（合成中或播放中）的播报。
+     *
+     * ★ stop() 时必须给它收尾：以前合成被作废、或 MediaPlayer 被 stop 释放后，
+     *   onCompletion 永远不来，Speaker 持有的 AudioGate 令牌就泄漏了——在真正的
+     *   引用计数下这会让麦克风永久处于"放音中"。
+     */
+    @Volatile
+    private var current: Pending? = null
+
+    /** 收掉当前在途播报（按"播完/被打断"处理）。 */
+    private fun finishCurrentAsDone() {
+        val p = current
+        current = null
+        p?.done()
+    }
+
     override fun speak(text: String, onDone: () -> Unit, onError: (String) -> Unit) {
+        val p = Pending(onDone, onError)
         if (text.isBlank()) {
-            onDone()
+            p.done()
             return
         }
         val settings = AgentSettings.load()
         if (settings.apiKey.isBlank()) {
             lastError = "没有 API Key"
-            onError(lastError!!)
-            onDone()
+            p.error(lastError ?: "没有 API Key")
             return
         }
+        // 新播报顶掉旧播报：旧的按"被打断"收尾
+        finishCurrentAsDone()
+        current = p
         val gen = ++playGen
         Thread {
             val t0 = System.currentTimeMillis()
             val bytes = synth(text, settings)
-            if (bytes == null || bytes.isEmpty()) {
-                if (gen != playGen) return@Thread
-                Dbg.w(TAG, "MiniMax TTS 合成失败：$lastError")
-                main.post {
-                    onError(lastError ?: "合成失败")
-                    onDone()
-                }
+            if (gen != playGen) {
+                // 已被 stop() 或下一条播报作废；收尾由 stop()/下一条 speak 负责，这里兜底一次
+                Dbg.i(TAG, "MiniMax TTS 结果作废 gen=$gen")
+                main.post { p.done() }
                 return@Thread
             }
-            if (gen != playGen) {
-                Dbg.i(TAG, "MiniMax TTS 结果作废 gen=$gen")
+            if (bytes == null || bytes.isEmpty()) {
+                Dbg.w(TAG, "MiniMax TTS 合成失败：$lastError")
+                main.post {
+                    if (current === p) current = null
+                    // 只回调 onError（V-04），由 Speaker 决定是否降级系统 TTS
+                    p.error(lastError ?: "合成失败")
+                }
                 return@Thread
             }
             Dbg.i(TAG, "MiniMax TTS ${bytes.size}B ${System.currentTimeMillis() - t0}ms")
             main.post {
-                if (gen == playGen) play(bytes, onDone, onError) else onDone()
+                if (gen == playGen) play(bytes, p) else p.done()
             }
         }.apply { name = "mm-tts"; isDaemon = true }.start()
     }
@@ -117,14 +156,18 @@ class MiniMaxTts(private val context: Context) : SpeechOutput {
     override fun stop() {
         playGen++
         stopInternal()
+        finishCurrentAsDone()
     }
 
     override fun release() {
         playGen++
         stopInternal()
+        finishCurrentAsDone()
     }
 
-    private fun play(bytes: ByteArray, onDone: () -> Unit, onError: (String) -> Unit) {
+    private fun play(bytes: ByteArray, p: Pending) {
+        // 试听等非 speak 路径会顶掉正在播的那条：先给它收尾，避免闸门令牌泄漏
+        if (current !== p) finishCurrentAsDone()
         stopInternal()
         runCatching {
             val f = File(context.cacheDir, "tts_${System.currentTimeMillis()}.mp3")
@@ -144,12 +187,14 @@ class MiniMaxTts(private val context: Context) : SpeechOutput {
             mp.setDataSource(f.absolutePath)
             mp.setOnCompletionListener {
                 stopInternal()
-                onDone()
+                if (current === p) current = null
+                p.done()
             }
             mp.setOnErrorListener { _, what, extra ->
                 Dbg.w(TAG, "MediaPlayer 错误 what=$what extra=$extra")
                 stopInternal()
-                onError("播放失败")
+                if (current === p) current = null
+                p.error("播放失败")
                 true
             }
             mp.prepare()
@@ -158,8 +203,9 @@ class MiniMaxTts(private val context: Context) : SpeechOutput {
             lastError = "${it.javaClass.simpleName}: ${it.message}"
             Dbg.e(TAG, "播放异常 $lastError")
             stopInternal()
-            onError("播放异常")
-            onDone()
+            if (current === p) current = null
+            // 只回调 onError（V-04）
+            p.error("播放异常")
         }
     }
 
@@ -194,7 +240,7 @@ class MiniMaxTts(private val context: Context) : SpeechOutput {
                 return@Thread
             }
             main.post {
-                if (gen == playGen) play(bytes, onDone, { onDone() }) else onDone()
+                if (gen == playGen) play(bytes, Pending(onDone, { onDone() })) else onDone()
             }
         }.apply { name = "mm-tts-preview"; isDaemon = true }.start()
     }

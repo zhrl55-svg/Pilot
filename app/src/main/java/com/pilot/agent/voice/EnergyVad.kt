@@ -23,8 +23,34 @@ class EnergyVad(
     private var voicedFrames = 0
     private var silentFrames = 0
     private val preRoll = ArrayDeque<ShortArray>()
-    private val segment = ArrayList<Short>()
+
+    /**
+     * 当前句子的采样（预分配、按需翻倍增长）。
+     * 以前是 ArrayList<Short>，每帧装箱 ~320 个对象，一句 15 秒就是 24 万个（审核 V-08 ②）。
+     */
+    private var segment = ShortArray(INITIAL_SEGMENT_SAMPLES)
+    private var segmentLen = 0
     private var inSpeech = false
+
+    private fun appendSegment(src: ShortArray, len: Int) {
+        if (len <= 0) return
+        val need = segmentLen + len
+        if (need > segment.size) {
+            var cap = segment.size
+            while (cap < need) cap *= 2
+            segment = segment.copyOf(cap)
+        }
+        System.arraycopy(src, 0, segment, segmentLen, len)
+        segmentLen = need
+    }
+
+    /** 取出当前句子并清空；超大的缓冲顺手缩回初始大小，别长期占内存。 */
+    private fun takeSegment(): ShortArray {
+        val out = segment.copyOf(segmentLen)
+        segmentLen = 0
+        if (segment.size > INITIAL_SEGMENT_SAMPLES * 4) segment = ShortArray(INITIAL_SEGMENT_SAMPLES)
+        return out
+    }
 
     /** 当前是否正处在一句话中间（监听超时兜底用）。 */
     @get:Synchronized
@@ -35,7 +61,7 @@ class EnergyVad(
         voicedFrames = 0
         silentFrames = 0
         inSpeech = false
-        segment.clear()
+        segmentLen = 0
         preRoll.clear()
     }
 
@@ -68,9 +94,9 @@ class EnergyVad(
                 if (voicedFrames >= 3) {
                     inSpeech = true
                     silentFrames = 0
-                    segment.clear()
+                    segmentLen = 0
                     // 带上开口前的 300ms，别把首字吃掉
-                    preRoll.forEach { segment.addAll(it.toList()) }
+                    preRoll.forEach { appendSegment(it, it.size) }
                     preRoll.clear()
                     onSpeechStart()
                 }
@@ -80,7 +106,7 @@ class EnergyVad(
             return
         }
 
-        segment.addAll(frame.take(len))
+        appendSegment(frame, len.coerceAtMost(frame.size))
 
         if (rms > threshold) {
             silentFrames = 0
@@ -89,14 +115,13 @@ class EnergyVad(
         }
 
         val silentMs = silentFrames * AudioCapture.FRAME_MS
-        val totalMs = segment.size * 1000 / AudioCapture.SAMPLE_RATE
+        val totalMs = segmentLen * 1000 / AudioCapture.SAMPLE_RATE
         if (silentMs < minSilenceMs() && totalMs < MAX_SEGMENT_MS) return
 
         inSpeech = false
         voicedFrames = 0
         silentFrames = 0
-        val pcm = segment.toShortArray()
-        segment.clear()
+        val pcm = takeSegment()
 
         // 太短的是噪音（关门声、衣物摩擦），直接丢
         if (pcm.size * 1000 / AudioCapture.SAMPLE_RATE >= MIN_SPEECH_MS) {
@@ -112,8 +137,7 @@ class EnergyVad(
     fun flush() {
         if (!inSpeech) return
         inSpeech = false
-        val pcm = segment.toShortArray()
-        segment.clear()
+        val pcm = takeSegment()
         if (pcm.isNotEmpty()) onSegment(pcm)
     }
 
@@ -134,5 +158,8 @@ class EnergyVad(
         private const val MIN_SPEECH_MS = 300
         private const val MAX_SEGMENT_MS = 15_000
         private const val PRE_ROLL_FRAMES = 15 // 300ms
+
+        /** 初始 2 秒；15 秒上限时最多翻倍到 ~4 秒×2 … 自动增长 */
+        private const val INITIAL_SEGMENT_SAMPLES = AudioCapture.SAMPLE_RATE * 2
     }
 }

@@ -1,6 +1,7 @@
 package com.pilot.agent.voice
 
 import com.pilot.agent.Dbg
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * 麦克风占用闸门：谁在放声音，谁说了算。
@@ -24,14 +25,23 @@ import com.pilot.agent.Dbg
  *   - 录音管线本身可以继续跑（重启 AudioRecord 要 ~100ms，
  *     频繁开关反而更容易丢唤醒词），只在识别入口拦
  *
- * 令牌用引用计数：多个来源同时放音时，一个停了不能把另一个的也关掉。
+ * ## 真正的引用计数（审核 V-02）
+ * 以前 holders 是按**名字**存的 Set：两条播报都持有 "tts"，先结束的那条把 "tts"
+ * 从集合里删掉，第二条还在播麦克风就被判"可信"，回声被识别成新指令（自问自答）。
+ * 现在每次 [hold] 发一个唯一 id 令牌，只有**所有**令牌都 close 后才解除静音；
+ * 名字只用于调试和 [activeHolders] 判断"音乐是否在放"。
  */
 object AudioGate {
 
     private const val TAG = "PilotAudioGate"
     private val lock = Any()
-    private val holders = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-    private val echoGuardHolders = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val nextId = AtomicLong(1L)
+
+    /** 令牌 id → 来源名。只在 [lock] 内修改。 */
+    private val holders = LinkedHashMap<Long, String>()
+
+    /** 开启了回声保护的令牌 id。只在 [lock] 内修改。 */
+    private val echoGuardHolders = HashSet<Long>()
     private val whenUnmuted = ArrayList<() -> Unit>()
 
     /** 当前是否静音（麦克风内容不可信）。 */
@@ -50,36 +60,69 @@ object AudioGate {
     var lastReleaseAt: Long = 0L
         private set
 
-    /** 占用来源名（调试用）。 */
-    fun activeHolders(): Set<String> = holders.toSet()
+    /** 占用来源名（去重后；调试 / 判断音乐是否在放用）。 */
+    fun activeHolders(): Set<String> = synchronized(lock) { holders.values.toSet() }
+
+    /** 当前持有的令牌总数（调试用）。 */
+    fun holderCount(): Int = synchronized(lock) { holders.size }
 
     /**
-     * 拿一个占用令牌。返回的 close() 幂等，重复调无害。
+     * 拿一个占用令牌。返回的 close() 幂等，重复调无害；只释放**本令牌**。
      *
      * [guardEcho] 只对 TTS 这类结束时会留下尾音的放音源开启。音乐暂停时
      * 用户通常马上说指令，不能把随后 900ms 的人声当成回声丢掉。
      */
     fun hold(name: String, guardEcho: Boolean = true): AutoCloseable {
-        synchronized(lock) {
-            holders.add(name)
-            if (guardEcho) echoGuardHolders.add(name)
+        val id = nextId.getAndIncrement()
+        val count = synchronized(lock) {
+            if (name in SINGLETON_SOURCES) {
+                // 单实例放音源：新令牌顶替同名旧令牌（旧令牌之后 close 为空操作）
+                val stale = holders.entries.filter { it.value == name }.map { it.key }
+                stale.forEach {
+                    holders.remove(it)
+                    echoGuardHolders.remove(it)
+                }
+            }
+            holders[id] = name
+            if (guardEcho) echoGuardHolders.add(id)
             syncLocked()
+            holders.size
         }
-        Dbg.i(TAG, "音频占用 +$name（持有者=${holders.size}）")
-        var closed = false
-        return AutoCloseable {
+        Dbg.i(TAG, "音频占用 +$name#$id（持有者=$count）")
+        return Token(id, name)
+    }
+
+    /**
+     * 单实例放音源：同一时刻最多一个令牌，再次 hold 视为"刷新"。
+     *
+     * MusicPlayer 在每次 STATE_READY（缓冲恢复 / seek）都会重新 hold("music") 且不关旧令牌
+     * （审核 M-03，music 模块本次不改）。按名字去重时这被掩盖了；改成真正引用计数后，
+     * 旧令牌会永久泄漏、麦克风永远"放音中"。所以对单实例源保留"同名顶替"语义。
+     * TTS 这类可能并发多条的来源**不在此列**，严格引用计数。
+     */
+    private val SINGLETON_SOURCES = setOf("music")
+
+    private class Token(private val id: Long, private val name: String) : AutoCloseable {
+        @Volatile
+        private var closed = false
+
+        override fun close() {
             val callbacks = ArrayList<() -> Unit>()
-            synchronized(lock) {
-                if (closed) return@AutoCloseable
+            val count = synchronized(lock) {
+                if (closed) return@synchronized -1
                 closed = true
-                val removed = holders.remove(name)
-                val guarded = echoGuardHolders.remove(name)
+                val removed = holders.remove(id) != null
+                val guarded = echoGuardHolders.remove(id)
+                // 回声保护窗口从"最后一个带回声的放音源结束"开始算；
+                // 只要还有任何放音在继续，麦克风本来就不可信，不用记。
                 if (removed && guarded && holders.isEmpty()) {
                     lastReleaseAt = android.os.SystemClock.uptimeMillis()
                 }
                 syncLocked(callbacks)
+                holders.size
             }
-            Dbg.i(TAG, "音频占用 -$name（持有者=${holders.size}）")
+            if (count < 0) return
+            Dbg.i(TAG, "音频占用 -$name#$id（持有者=$count）")
             callbacks.forEach { runCatching(it) }
         }
     }

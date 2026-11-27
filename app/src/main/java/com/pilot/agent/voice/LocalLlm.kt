@@ -30,10 +30,21 @@ import kotlin.concurrent.withLock
  */
 class LocalLlm private constructor(private val context: Context) {
 
+    /**
+     * 一把锁同时保护「初始化 / 推理 / 释放」。
+     *
+     * 审核 C5：以前 generate() 拿到 session 引用后无锁推理，release()（切换/删除模型时
+     * 由 OnDeviceModelManager 调用）会在 native 推理途中释放 MNN session → SIGSEGV，
+     * 进程级崩溃。两个线程同时 generate 也会并发进 native。现在三者互斥。
+     */
     private val lock = ReentrantLock()
     private var session: LlmSession? = null
     private var initTried = false
     private var initFailed = false
+
+    /** release() 请求中断当前生成：onProgress 返回 true 让 native 尽快停下、释放锁。 */
+    @Volatile
+    private var cancelRequested = false
 
     @Volatile
     var ready: Boolean = false
@@ -165,10 +176,27 @@ class LocalLlm private constructor(private val context: Context) {
 
     /**
      * 生成。@return null = 不可用
+     *
+     * 整个推理过程持有 [lock]：与 [release] 和其它 generate 互斥（见 C5）。
      */
     fun generate(prompt: String, onDelta: ((String) -> Unit)? = null): String? {
+        // 先在锁外完成加载等待（ModelStore.awaitReady 可能较久），再进锁复核 session
         if (!ensureReady()) return null
-        val s = session ?: return null
+        return lock.withLock {
+            // 拿锁前可能刚被 release()：可重入锁，就地再加载一次
+            if (session == null && !ensureReady()) return null
+            val s = session ?: return null
+            cancelRequested = false
+            generateLocked(s, prompt, onDelta)
+        }
+    }
+
+    /** 调用方必须持有 [lock]。 */
+    private fun generateLocked(
+        s: LlmSession,
+        prompt: String,
+        onDelta: ((String) -> Unit)?,
+    ): String? {
         val t0 = System.currentTimeMillis()
         var firstTokenMs = -1L
         // ★ 文本是从 onProgress 流式回调里攒出来的，不是从返回的 map 取。
@@ -183,12 +211,13 @@ class LocalLlm private constructor(private val context: Context) {
                         if (!progress.isNullOrEmpty()) {
                             if (firstTokenMs < 0) firstTokenMs = System.currentTimeMillis() - t0
                             acc.append(progress)
-                            onDelta?.invoke(progress)
+                            runCatching { onDelta?.invoke(progress) }
                         }
                         // ★ 返回值语义是「要不要【停止】」，不是「要不要继续」。
                         //   按直觉写 true 的后果：每轮只生成 1 个 token，日志还一切正常，
                         //   极难联想到是这个。
-                        return false
+                        //   只有 release() 请求中断时才返回 true。
+                        return cancelRequested
                     }
                 },
             )
@@ -196,7 +225,8 @@ class LocalLlm private constructor(private val context: Context) {
             val fromStream = acc.toString().trim()
             val fromMap = (result["text"] as? String)?.trim().orEmpty()
             val text = fromStream.ifBlank { fromMap }
-            Dbg.i(TAG, "本地LLM 生成 ${lastGenerateMs}ms（首字 ${firstTokenMs}ms）→ 「${text.take(80)}」")
+            // 不记录生成正文（可能含用户个人数据，见 code.md 日志脱敏条目），只记长度
+            Dbg.i(TAG, "本地LLM 生成 ${lastGenerateMs}ms（首字 ${firstTokenMs}ms）→ ${text.length} 字")
             text
         } catch (t: Throwable) {
             lastError = "${t.javaClass.simpleName}: ${t.message}"
@@ -205,8 +235,23 @@ class LocalLlm private constructor(private val context: Context) {
         }
     }
 
+    /**
+     * 请求中断正在进行的生成（例如用户点了"停止"）。不等待；
+     * 正在跑的 generate 会在下一个 token 回调时停下并返回已生成的部分。
+     * 没有生成在跑时无副作用（下一次 generate 开始时会清掉标志）。
+     */
+    fun cancelGeneration() {
+        cancelRequested = true
+    }
+
+    /**
+     * 释放模型。若正在生成，先请求中断并等待本次生成结束（拿到同一把锁）后再释放，
+     * 避免 native use-after-free。
+     */
     fun release() {
+        cancelRequested = true
         lock.withLock {
+            cancelRequested = false
             runCatching { session?.release() }
             session = null
             ready = false

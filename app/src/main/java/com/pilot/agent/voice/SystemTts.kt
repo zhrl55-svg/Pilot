@@ -11,6 +11,8 @@ import com.pilot.agent.agent.AgentSettings
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * 系统 TTS。
@@ -68,7 +70,40 @@ class SystemTts(context: Context) : SpeechOutput {
     var lastError: String? = null
         private set
 
-    private var seq = 0
+    private val seq = AtomicInteger(0)
+
+    /**
+     * 一条播报的终止回调，保证 onDone / onError 恰好触发其一、且只触发一次（V-04）。
+     */
+    private class Pending(
+        private val onDone: () -> Unit,
+        private val onError: (String) -> Unit,
+    ) {
+        private val fired = AtomicBoolean(false)
+
+        fun done() {
+            if (fired.compareAndSet(false, true)) runCatching(onDone)
+        }
+
+        fun error(msg: String) {
+            if (fired.compareAndSet(false, true)) runCatching { onError(msg) }
+        }
+    }
+
+    /**
+     * 在途播报（utteranceId → 回调）。
+     *
+     * 以前是**静态** Map，QUEUE_FLUSH 冲掉的旧条目一直留在里面，直到下次 stop() 才被
+     * 统一触发，误调 onSpeechDone 自动开麦（V-02）。现在实例级，并在冲掉/打断时立即收尾。
+     */
+    private val pending = java.util.concurrent.ConcurrentHashMap<String, Pending>()
+
+    /**
+     * stop() 代数。speak 要先等初始化、再 post 到主线程，期间若被 stop()，
+     * 这条不能再出声（以前会"打断了它还接着播"），直接按被打断收尾。
+     */
+    @Volatile
+    private var stopGen = 0
 
     init {
         try {
@@ -97,16 +132,22 @@ class SystemTts(context: Context) : SpeechOutput {
                     tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                         override fun onStart(utteranceId: String?) = Unit
                         override fun onDone(utteranceId: String?) {
-                            doneCallbacks.remove(utteranceId)?.invoke()
+                            utteranceId?.let { pending.remove(it)?.done() }
                         }
 
+                        /** 被 stop() 或后一条 QUEUE_FLUSH 冲掉：按"播完"收尾，立刻释放闸门。 */
+                        override fun onStop(utteranceId: String?, interrupted: Boolean) {
+                            utteranceId?.let { pending.remove(it)?.done() }
+                        }
+
+                        @Deprecated("Deprecated in Java")
                         override fun onError(utteranceId: String?) {
-                            doneCallbacks.remove(utteranceId)?.invoke()
+                            utteranceId?.let { pending.remove(it)?.error("系统 TTS 播报出错") }
                         }
 
                         override fun onError(utteranceId: String?, errorCode: Int) {
                             Dbg.w(TAG, "系统 TTS 播报出错 code=$errorCode")
-                            doneCallbacks.remove(utteranceId)?.invoke()
+                            utteranceId?.let { pending.remove(it)?.error("系统 TTS 播报出错（code=$errorCode）") }
                         }
                     })
                     Dbg.i(TAG, "系统 TTS 就绪 引擎=${engineName()} lang=${if (langOk) "zh" else "缺中文包"}")
@@ -215,52 +256,67 @@ class SystemTts(context: Context) : SpeechOutput {
     }.getOrDefault("未知")
 
     override fun speak(text: String, onDone: () -> Unit, onError: (String) -> Unit) {
+        val p = Pending(onDone, onError)
         if (text.isBlank()) {
-            onDone()
+            p.done()
             return
         }
+        val gen = stopGen
         Thread {
             if (!initLatch.await(4, TimeUnit.SECONDS)) {
                 Dbg.w(TAG, "系统 TTS 初始化超时")
             }
             if (!ready || !langOk) {
-                main.post {
-                    onError(lastError ?: "系统 TTS 不可用")
-                    onDone()
-                }
+                // 只回调 onError，不再追加 onDone（V-04）
+                main.post { p.error(lastError ?: "系统 TTS 不可用") }
                 return@Thread
             }
-            val id = "pilot_${++seq}"
-            doneCallbacks[id] = onDone
+            val id = "pilot_${seq.incrementAndGet()}"
             main.post {
+                if (gen != stopGen) {
+                    // 排队期间被 stop() 打断：不再出声
+                    p.done()
+                    return@post
+                }
+                // QUEUE_FLUSH 会冲掉之前的在途播报：先把它们按"播完"收尾，
+                // 不留残留回调（引擎通常也会回 onStop，Pending 自带一次性保护）。
+                drainPending()
+                pending[id] = p
                 // 设置页可能刚改过语速：每次播报前同步一次（只读一个 Float）。
                 tts?.setSpeechRate(AgentSettings.ttsRate())
                 val params = Bundle()
                 val r = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, id)
                 if (r != TextToSpeech.SUCCESS) {
                     Dbg.w(TAG, "系统 TTS speak 返回 $r")
-                    doneCallbacks.remove(id)?.invoke()
-                    onError("播报失败")
+                    pending.remove(id)?.error("系统 TTS 播报失败")
                 }
             }
         }.apply { name = "sys-tts"; isDaemon = true }.start()
     }
 
+    /** 把所有在途播报按"播完"收尾（被打断 / 被冲掉 / 释放时）。 */
+    private fun drainPending() {
+        if (pending.isEmpty()) return
+        val ids = pending.keys.toList()
+        ids.forEach { pending.remove(it)?.done() }
+    }
+
     override fun stop() {
+        stopGen++
         runCatching { tts?.stop() }
-        doneCallbacks.values.forEach { runCatching { it() } }
-        doneCallbacks.clear()
+        drainPending()
     }
 
     override fun release() {
+        stopGen++
         runCatching { tts?.stop() }
         runCatching { tts?.shutdown() }
         tts = null
         ready = false
+        drainPending()
     }
 
     private companion object {
         const val TAG = "PilotTts"
-        val doneCallbacks = java.util.concurrent.ConcurrentHashMap<String, () -> Unit>()
     }
 }

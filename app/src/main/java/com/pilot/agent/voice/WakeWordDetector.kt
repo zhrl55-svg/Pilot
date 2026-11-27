@@ -1,6 +1,7 @@
 package com.pilot.agent.voice
 
 import android.content.Context
+import android.os.SystemClock
 import com.k2fsa.sherpa.onnx.FeatureConfig
 import com.k2fsa.sherpa.onnx.KeywordSpotter
 import com.k2fsa.sherpa.onnx.KeywordSpotterConfig
@@ -22,6 +23,13 @@ import com.pilot.agent.Dbg
  * 只要有一行含未知 token，`createStream` 会直接抛
  * `Failed to create native OnlineStream`，整条链路哑掉。
  * 所以逐行校验，把坏的挑出来丢掉并打日志，别让一行坏词拖垮全部。
+ *
+ * ## 线程（审核 V-06）
+ * - [feed] / [reset] 在采集线程，持有对象锁（this）；
+ * - [load] 可能在主线程（改唤醒词 / 打断词）或 worker 线程（自动恢复）调用：
+ *   用 [loadLock] 串行化多次 load，**先在锁外建好新 spotter/stream，再在对象锁内原子替换**，
+ *   最后释放旧实例——音频线程不会在 native 释放途中 acceptWaveform（以前可能 SIGSEGV）；
+ * - 失败不再"永久 failed"：按指数退避允许重试（[reloadIfNeeded]），不用重启 App。
  */
 class WakeWordDetector(private val context: Context) {
 
@@ -35,7 +43,23 @@ class WakeWordDetector(private val context: Context) {
 
     private var spotter: KeywordSpotter? = null
     private var stream: OnlineStream? = null
+
+    /** 最近一次加载 / 识别失败；为 true 时在 [nextRetryAt] 之前不重试。 */
+    @Volatile
     private var failed = false
+
+    @Volatile
+    private var failCount = 0
+
+    @Volatile
+    private var nextRetryAt = 0L
+
+    /** 调用过 [release]：彻底停用，不再自动恢复。 */
+    @Volatile
+    private var released = false
+
+    /** 串行化 [load]（与 feed 用的对象锁分开，避免加载模型时阻塞音频线程）。 */
+    private val loadLock = Any()
 
     private val samples = FloatArray(AudioCapture.FRAME_SAMPLES)
 
@@ -43,6 +67,7 @@ class WakeWordDetector(private val context: Context) {
     var labels: List<String> = emptyList()
         private set
 
+    @Volatile
     private var loadedWith: List<String> = emptyList()
     private var fedFrames = 0L
 
@@ -57,14 +82,23 @@ class WakeWordDetector(private val context: Context) {
         }.getOrDefault(emptySet())
     }
 
-    fun load(words: List<String>): Boolean {
+    fun load(words: List<String>): Boolean = synchronized(loadLock) { loadLocked(words) }
+
+    private fun loadLocked(words: List<String>): Boolean {
         val wanted = words.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
         if (wanted.isEmpty()) {
             lastError = "唤醒词为空"
             return false
         }
         if (ready && wanted == loadedWith) return true
-        if (failed) return false
+        if (failed) {
+            val wait = nextRetryAt - SystemClock.uptimeMillis()
+            if (wait > 0) {
+                Dbg.w(TAG, "KWS 上次失败（${lastError}），${wait}ms 后才允许重试")
+                return false
+            }
+        }
+        released = false
 
         val generated = KwsKeywords.lines(wanted)
         val keywordLines = generated.filter { line ->
@@ -80,7 +114,7 @@ class WakeWordDetector(private val context: Context) {
             return false
         }
 
-        if (ready) closeInternal()
+        var next: KeywordSpotter? = null
         return try {
             val t0 = System.currentTimeMillis()
             val config = KeywordSpotterConfig(
@@ -115,26 +149,72 @@ class WakeWordDetector(private val context: Context) {
             )
             // 模型在 assets 里，所以这里传 context.assets（不是 null）。
             // 注意：离线 ASR 那边模型在 filesDir，必须传 null——两者相反，别抄错。
-            val next = KeywordSpotter(context.assets, config)
-            spotter = next
+            val built = KeywordSpotter(context.assets, config)
+            next = built
             // createStream 直接吃多行词表，覆盖 keywordsFile 的内容
-            stream = next.createStream(keywordLines.joinToString("\n"))
-            labels = wanted
-            loadedWith = wanted
-            ready = true
-            failed = false
-            lastError = null
-            fedFrames = 0
+            val nextStream = built.createStream(keywordLines.joinToString("\n"))
+
+            // ★ 原子替换：feed() 持有同一把对象锁，替换后再没有线程引用旧实例
+            val (oldStream, oldSpotter) = synchronized(this) {
+                val prevStream = stream
+                val prevSpotter = spotter
+                spotter = built
+                stream = nextStream
+                labels = wanted
+                loadedWith = wanted
+                ready = true
+                failed = false
+                failCount = 0
+                nextRetryAt = 0L
+                lastError = null
+                fedFrames = 0
+                Pair(prevStream, prevSpotter)
+            }
+            runCatching { oldStream?.release() }
+            runCatching { oldSpotter?.release() }
             Dbg.i(TAG, "KWS 就绪 words=$wanted ${System.currentTimeMillis() - t0}ms")
             true
         } catch (t: Throwable) {
-            failed = true
-            lastError = "${t.javaClass.simpleName}: ${t.message}"
-            closeInternal()
-            Dbg.e(TAG, "KWS 初始化失败 $lastError")
+            // 新实例建到一半失败：只释放新的，旧实例（若有）继续用旧词表工作，不让链路哑掉
+            runCatching { next?.release() }
+            synchronized(this) {
+                markFailedLocked("${t.javaClass.simpleName}: ${t.message}")
+                // 没有旧实例可用时，记下这次想要的词，自动恢复按它重试；
+                // 有旧实例时保持 loadedWith=旧词表（ready 仍为 true，旧词照常工作）。
+                if (!ready) loadedWith = wanted
+            }
+            Dbg.e(TAG, "KWS 初始化失败 $lastError（第 $failCount 次，${nextRetryAt - SystemClock.uptimeMillis()}ms 后可重试）")
             false
         }
     }
+
+    /** 调用方需持有对象锁。 */
+    private fun markFailedLocked(msg: String) {
+        failed = true
+        failCount++
+        lastError = msg
+        val backoff = (RETRY_BASE_MS shl (failCount - 1).coerceIn(0, 6)).coerceAtMost(RETRY_MAX_MS)
+        nextRetryAt = SystemClock.uptimeMillis() + backoff
+    }
+
+    /**
+     * 识别失败（native 抛错）或加载失败后，到了退避时间就按上次的词表重载。
+     * 会加载模型（几百毫秒），**不要在音频线程调**，交给 worker。
+     * @return true = 当前可用
+     */
+    fun reloadIfNeeded(): Boolean {
+        if (ready) return true
+        if (released) return false
+        val words = loadedWith
+        if (words.isEmpty()) return false
+        if (SystemClock.uptimeMillis() < nextRetryAt) return false
+        Dbg.i(TAG, "KWS 自动恢复：按 $words 重新加载")
+        return load(words)
+    }
+
+    /** 是否处在"失败待恢复"状态（供上层决定要不要调 [reloadIfNeeded]）。 */
+    val needsReload: Boolean
+        get() = !ready && !released && loadedWith.isNotEmpty() && SystemClock.uptimeMillis() >= nextRetryAt
 
     /**
      * 喂一帧 16k PCM16。命中返回命中的词，并立即 reset 准备下一次。
@@ -183,11 +263,10 @@ class WakeWordDetector(private val context: Context) {
             if (hit != null) kws.reset(input)
             hit
         } catch (t: Throwable) {
-            lastError = "${t.javaClass.simpleName}: ${t.message}"
-            ready = false
-            failed = true
+            // 已持有对象锁（@Synchronized）
+            markFailedLocked("${t.javaClass.simpleName}: ${t.message}")
             closeInternal()
-            Dbg.e(TAG, "KWS 识别失败 $lastError")
+            Dbg.e(TAG, "KWS 识别失败 $lastError（将自动重载）")
             null
         }
     }
@@ -201,10 +280,15 @@ class WakeWordDetector(private val context: Context) {
     }
 
     fun release() {
-        failed = true
-        closeInternal()
+        synchronized(loadLock) {
+            synchronized(this) {
+                released = true
+                closeInternal()
+            }
+        }
     }
 
+    /** 调用方需持有对象锁。 */
     private fun closeInternal() {
         runCatching { stream?.release() }
         runCatching { spotter?.release() }
@@ -220,6 +304,12 @@ class WakeWordDetector(private val context: Context) {
         // 0.12 过于敏感：真机实测打字/环境音下「不说了/别说了/第一个」三分钟误命中 20+ 次。
         // 0.22 仍低于官方示例（0.25），保留轻声唤醒的余量，同时明显压掉误报。
         const val KEYWORD_THRESHOLD = 0.22f
+
+        /** 失败后首次重试等待；之后翻倍 */
+        const val RETRY_BASE_MS = 2_000L
+
+        /** 重试等待上限 */
+        const val RETRY_MAX_MS = 60_000L
 
         /** 100 帧 = 2 秒打一次心跳，太密会把日志淹掉 */
         // 心跳只用于判断"模型没认词 vs 代码没被调用"，2 秒一条纯属刷屏；

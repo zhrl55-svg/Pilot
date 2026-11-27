@@ -20,6 +20,10 @@ import kotlin.math.sqrt
  * （车内/环境变化会让模板分数掉到 0.1 以下），所以策略是「宁可放过，不可错杀」：
  * 没注册模板、模型没就绪、音频不足，一律放行。
  *
+ * ★ 但"放行"不等于"确认是主人"：VoiceInput 会把每句的校验结论（[SpeakerAuth]）交给上层，
+ *   读通知/个人数据等敏感能力只认 VERIFIED 或"手机已解锁"（见 [PersonalDataGate]）。
+ * ★ 注册必须由用户在界面里**显式发起**（[enrollMany] / [enroll]），不再有"首句自动注册"（审核 S6/V-07）。
+ *
  * ## 模型
  * `filesDir/models/voiceprint/cnceleb_resnet34_LM.onnx`（25MB，WeSpeaker CN-Celeb）
  * 输出 256 维 embedding，比对用余弦相似度。
@@ -73,6 +77,7 @@ class VoiceprintGate(private val context: Context) {
      */
     val engineAvailable: Boolean = true
 
+    @Synchronized
     fun ensureReady(): Boolean {
         if (ready) return true
         if (initTried && initFailed) return false
@@ -117,7 +122,12 @@ class VoiceprintGate(private val context: Context) {
         }
     }
 
-    /** 从一段 16k 音频提取 embedding */
+    /**
+     * 从一段 16k 音频提取 embedding。
+     * 加锁：worker 线程（逐句校验）和主线程（界面快捷注册）可能同时调用，
+     * 且不能与 [release] 并发（native use-after-free）。
+     */
+    @Synchronized
     fun embed(pcm: ShortArray, sampleRate: Int = AudioCapture.SAMPLE_RATE): FloatArray? {
         if (!ensureReady()) return null
         if (sampleRate != AudioCapture.SAMPLE_RATE) return null
@@ -151,41 +161,87 @@ class VoiceprintGate(private val context: Context) {
         }
     }
 
-    /**
-     * 首句自动注册：还没有模板时，第一句够长的有效语音直接成为主人声纹。
-     *
-     * 为什么要有这条：注册弹窗那套（念 3 遍口令）太重，用户懒得念；
-     * 而且**口令必须和唤醒词一致**才判得准，用户很难记住。
-     * 改成"第一次说话就注册"，门槛降到零。
-     *
-     * @param minSeconds 这句至少要多少秒，太短（咳嗽、清嗓子）不认
-     * @return true = 已用这句注册成功
-     */
-    fun enrollIfAbsent(pcm: ShortArray, minSeconds: Float = 1.5f): Boolean {
-        if (hasTemplate()) return false
-        val seconds = pcm.size.toDouble() / AudioCapture.SAMPLE_RATE
-        if (seconds < minSeconds) {
-            Dbg.i(TAG, "首句注册：音频 ${"%.1f".format(seconds)}s 太短，不注册")
-            return false
-        }
-        val ok = enroll(pcm)
-        Dbg.i(TAG, "首句注册：${"%.1f".format(seconds)}s → saved=$ok")
-        return ok
-    }
+    // ★ 原 enrollIfAbsent（首句自动注册）已删除：第一个开口的人（家人、电视、播报回声）
+    //   会成为"主人"，之后真正的主人被静默拒绝（审核 S6 / V-07）。注册只能由界面显式发起。
 
     /** 用这段音频覆盖模板（注册 / 重新注册） */
     fun enroll(pcm: ShortArray): Boolean {
         val emb = embed(pcm) ?: return false
-        return runCatching {
-            val buf = ByteBuffer.allocate(emb.size * 4)
-            emb.forEach { buf.putFloat(it) }
-            templateFile().writeBytes(buf.array())
-            Dbg.i(TAG, "声纹模板已保存 dim=${emb.size}")
-            true
-        }.getOrElse {
-            Dbg.e(TAG, "声纹模板保存失败 ${it.message}")
-            false
+        return saveTemplate(emb, "单句")
+    }
+
+    /**
+     * 多句注册：每句单独提 embedding，再求平均并重新归一化。
+     *
+     * 为什么不是把几段音频拼起来再提：拼接会跨过静音、换气和句间停顿，
+     * 模型学到的是不连续的特征；而分句提 embedding 再平均，能把各句里随机的
+     * 噪声方向抵消一部分，噪声环境（车内）下模板更稳。
+     *
+     * ★ 一致性校验（V-07）：各句 embedding 两两余弦相似度必须都 ≥ [ENROLL_CONSISTENCY]，
+     *   否则判定"不是同一个人在念 / 混进了播报或电视声"，不落盘，[lastError] 给出原因。
+     */
+    fun enrollMany(pcms: List<ShortArray>): Boolean {
+        val embeddings = pcms.mapNotNull { embed(it) }
+        if (embeddings.isEmpty()) {
+            if (lastError == null) lastError = "注册样本太短或模型不可用"
+            return false
         }
+        val dim = embeddings.first().size
+        val usable = embeddings.filter { it.size == dim }
+        if (usable.isEmpty()) return false
+        if (pcms.size >= 2 && usable.size < 2) {
+            lastError = "有效样本不足（${usable.size}/${pcms.size}），请每句说完整一点再注册"
+            Dbg.w(TAG, "声纹注册：$lastError")
+            return false
+        }
+        var minSim = 1f
+        for (i in usable.indices) for (j in i + 1 until usable.size) {
+            val sim = cosine(usable[i], usable[j])
+            if (sim < minSim) minSim = sim
+        }
+        if (usable.size >= 2) {
+            Dbg.i(TAG, "声纹注册：样本两两最低相似度 ${"%.3f".format(minSim)}")
+            if (minSim < ENROLL_CONSISTENCY) {
+                lastError = "几句录音的声音差别太大（可能混入了别人或播放的声音），请在安静处由本人重新注册"
+                Dbg.w(TAG, "声纹注册被拒：$lastError")
+                return false
+            }
+        }
+        val avg = FloatArray(dim)
+        for (e in usable) for (i in 0 until dim) avg[i] += e[i]
+        for (i in 0 until dim) avg[i] /= usable.size
+        val norm = sqrt(avg.sumOf { (it * it).toDouble() }).toFloat()
+        if (norm <= 0f) return false
+        for (i in 0 until dim) avg[i] /= norm
+        Dbg.i(TAG, "声纹：${usable.size} 句样本平均完成")
+        val saved = saveTemplate(avg, "${usable.size} 句平均")
+        if (saved) lastError = null
+        return saved
+    }
+
+    private fun cosine(a: FloatArray, b: FloatArray): Float {
+        if (a.size != b.size) return 0f
+        var dot = 0.0
+        var na = 0.0
+        var nb = 0.0
+        for (i in a.indices) {
+            dot += a[i] * b[i]
+            na += a[i] * a[i]
+            nb += b[i] * b[i]
+        }
+        if (na == 0.0 || nb == 0.0) return 0f
+        return (dot / (sqrt(na) * sqrt(nb))).toFloat()
+    }
+
+    private fun saveTemplate(emb: FloatArray, label: String): Boolean = runCatching {
+        val buf = ByteBuffer.allocate(emb.size * 4)
+        emb.forEach { buf.putFloat(it) }
+        templateFile().writeBytes(buf.array())
+        Dbg.i(TAG, "声纹模板已保存（$label）dim=${emb.size}")
+        true
+    }.getOrElse {
+        Dbg.e(TAG, "声纹模板保存失败 ${it.message}")
+        false
     }
 
     private fun loadTemplate(): FloatArray? = runCatching {
@@ -228,6 +284,7 @@ class VoiceprintGate(private val context: Context) {
         Dbg.i(TAG, "声纹模板已清除")
     }
 
+    @Synchronized
     fun release() {
         runCatching { extractor?.release() }
         extractor = null
@@ -257,5 +314,14 @@ class VoiceprintGate(private val context: Context) {
          * 识别阶段还有机会拦），也不能让主人喊不醒。
          */
         const val WAKE_THRESHOLD = 0.30f
+
+        /**
+         * 注册样本两两最低相似度。
+         *
+         * 同一人不同句子之间通常明显高于"人声 vs TTS 回声"（实测回声对主人模板 0.02~0.11）；
+         * 取 0.25 只拦"明显不是同一个声音"的情况，避免把车内噪声下的主人也拒掉。
+         * 需要真机校准。
+         */
+        const val ENROLL_CONSISTENCY = 0.25f
     }
 }
