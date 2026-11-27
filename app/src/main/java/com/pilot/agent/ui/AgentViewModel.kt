@@ -521,6 +521,12 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     private var lastUserText: String? = null
     private var lastUserTextAt = 0L
     private var lastAccessibilityPromptAt = 0L
+
+    /** 上一条「这个动作要读屏幕，要我带你去开权限吗」正在等用户回答（不默认跳页面）。 */
+    private var pendingA11yGuide = false
+
+    /** loop 不存在时，C 类命令的「带路」目标由 ViewModel 自己记着。 */
+    private var pendingViewGuide: com.pilot.agent.action.CommandTarget? = null
     @Volatile
     private var pendingToolConfirm: PendingToolConfirm? = null
     private var dispatchJob: kotlinx.coroutines.Job? = null
@@ -1444,35 +1450,160 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
      * 由模型决定回答还是执行。不再让遗留匹配器插在中间。
      */
     private fun dispatchRequest(g: String) {
-        // C 类「要我带你到开关页吗」的肯定回答：不交给模型，直接开页面（m-20261127-104）。
-        AgentRuntime.loop?.takePendingGuide()?.let { guide ->
+        // 1) 无障碍「带路」的肯定回答（先问，不默认跳设置页；m-20261127-105）。
+        if (pendingA11yGuide) {
+            pendingA11yGuide = false
             if (com.pilot.agent.action.CommandSemantics.isAffirmative(g)) {
-                running = true
-                justSent = true
-                activeTaskLabel = "打开${guide.label}设置页"
-                publishNotificationStatus()
-                viewModelScope.launch {
-                    val outcome = com.pilot.agent.action.VerifiedLauncher.launch(
-                        getApplication(),
-                        com.pilot.agent.action.CommandSemantics.guideIntent(guide),
-                        expectPackage = null,
-                        timeoutMs = 4_000L,
-                    )
-                    add(
-                        LogEntry.Kind.OBSERVE,
-                        com.pilot.agent.action.CommandSemantics.guideOpenedText(guide, outcome),
-                    )
-                    running = false
-                    justSent = false
-                    activeTaskLabel = ""
-                    publishNotificationStatus()
-                }
+                add(LogEntry.Kind.OBSERVE, "已打开系统设置的无障碍页，请找到 Pilot 并开启。")
+                openAccessibilitySettings()
                 return
             }
         }
+        // 2) 设置页带路：loop 不存在时由 ViewModel 自己记着（m-20261127-104）。
+        pendingViewGuide?.let { guide ->
+            pendingViewGuide = null
+            if (com.pilot.agent.action.CommandSemantics.isAffirmative(g)) {
+                launchGuide(guide)
+                return
+            }
+        }
+        // 3) 无障碍缺失或服务未连上时，不需要屏幕的命令直接在本机完成。
         if (tryRunFastPath(g, allowConfirmation = true)) return
+        if (!screenReady() && com.pilot.agent.action.ScreenRequirements.requirement(g) ==
+            com.pilot.agent.action.ScreenRequirement.NONE
+        ) {
+            if (runScreenless(g)) return
+        }
         if (tryRunLocalTool(g)) return
         dispatchToAgent(g)
+    }
+
+    /** 读屏能力是否就绪（权限 + 服务已绑定）。 */
+    private fun screenReady(): Boolean = accessibilityOn && AgentRuntime.loop != null
+
+    private fun launchGuide(guide: com.pilot.agent.action.CommandTarget) {
+        running = true
+        justSent = true
+        activeTaskLabel = "打开${guide.label}设置页"
+        publishNotificationStatus()
+        viewModelScope.launch {
+            val outcome = com.pilot.agent.action.VerifiedLauncher.launch(
+                getApplication(),
+                com.pilot.agent.action.CommandSemantics.guideIntent(guide),
+                expectPackage = null,
+                timeoutMs = 4_000L,
+            )
+            add(LogEntry.Kind.OBSERVE, com.pilot.agent.action.CommandSemantics.guideOpenedText(guide, outcome))
+            running = false
+            justSent = false
+            activeTaskLabel = ""
+            publishNotificationStatus()
+        }
+    }
+
+    /**
+     * 不需要屏幕的本地能力（m-20261127-105）：日程 / 提醒 / 待办 / B 类系统命令 / 查询 / 音乐。
+     * @return true = 已经接管（无论成功失败都会给回执）
+     */
+    private fun runScreenless(goal: String): Boolean {
+        val app = getApplication<Application>()
+        val g = goal.trim()
+        val requirements = com.pilot.agent.action.ScreenRequirements
+        when {
+            com.pilot.agent.action.CalendarTool.handlesCancel(g) ->
+                answerScreenless { com.pilot.agent.action.CalendarTool.cancelLastCreated(app) }
+            com.pilot.agent.action.CalendarTool.handles(g) ->
+                answerScreenless { com.pilot.agent.action.CalendarTool.create(app, g) }
+            com.pilot.agent.action.ReminderManager.handles(g) ->
+                answerScreenless { com.pilot.agent.action.ReminderManager.handle(app, g) }
+            com.pilot.agent.action.PersonalTodoStore.handles(g) ->
+                answerScreenless { com.pilot.agent.action.PersonalTodoStore.handle(g) }
+            com.pilot.agent.query.QueryEngine.canHandle(g) ->
+                answerScreenless {
+                    com.pilot.agent.query.QueryEngine.handle(g)
+                        ?: "没能查到「$g」的结果，可能是网络不可用或暂时没有相关内容。"
+                }
+            requirements.isMusicCommand(g) ->
+                answerScreenless { playMusicScreenless(g) }
+            else -> {
+                val cmd = com.pilot.agent.action.CommandSemantics.classify(g)
+                if (cmd == null || cmd.kind != com.pilot.agent.action.CommandKind.RESULT) return false
+                answerScreenless {
+                    when (val r = com.pilot.agent.action.SystemCommandRunner.run(
+                        com.pilot.agent.action.SystemOps(app), cmd, g,
+                    )) {
+                        null -> null
+                        is com.pilot.agent.action.SystemRunOutcome.Done -> r.message
+                        is com.pilot.agent.action.SystemRunOutcome.NeedsGuide -> {
+                            pendingViewGuide = r.target
+                            r.message
+                        }
+                    }
+                }
+            }
+        }
+        return true
+    }
+
+    /** 统一的「无界面本机执行」收尾：走同一条 DONE + 播报路径。 */
+    private fun answerScreenless(block: suspend () -> String?) {
+        running = true
+        justSent = true
+        activeTaskLabel = "本机执行"
+        publishNotificationStatus()
+        viewModelScope.launch {
+            val message = try {
+                block()
+            } catch (c: kotlinx.coroutines.CancellationException) {
+                throw c
+            } catch (t: Throwable) {
+                Dbg.w(TAG, "本机执行失败：${t.message}")
+                "执行失败：${t.javaClass.simpleName}"
+            }
+            running = false
+            justSent = false
+            activeTaskLabel = ""
+            publishNotificationStatus()
+            dispatchJob = null
+            val clean = message?.trim().orEmpty().ifEmpty { "没有完成。" }
+            add(LogEntry.Kind.DONE, clean)
+            AgentRuntime.speaker.speak(clean)
+            refreshStatus()
+        }
+    }
+
+    /** 无障碍未连上时的最小音乐播放：搜索/热歌 → 直接拉起播放器。 */
+    private suspend fun playMusicScreenless(goal: String): String {
+        val s = AgentSettings.load()
+        val query = goal
+            .replace(Regex("^(帮我|给我|请)?(播放|放首|放一下|来首|来一首|放歌|听歌)"), "")
+            .replace(Regex("(这首歌|的歌|歌曲|音乐|吧|呗)$"), "")
+            .trim()
+        val songs = withContext(Dispatchers.IO) {
+            if (query.isBlank()) {
+                com.pilot.agent.music.NeteaseApi.chartSongs(s.musicBaseUrl, 3778678L, s.neteaseCookie, 20)
+            } else {
+                com.pilot.agent.music.NeteaseApi.search(s.musicBaseUrl, query, 5, s.neteaseCookie)
+            }
+        }
+        if (songs.isEmpty()) return "没搜到「${query.ifBlank { "热门" }}」，检查音乐服务或网络后再说一次。"
+        val tracks = songs.map { song ->
+            com.pilot.agent.music.MusicPlayer.Track(
+                title = song.name,
+                artist = song.artist,
+                resolver = {
+                    com.pilot.agent.music.NeteaseApi.playUrl(s.musicBaseUrl, song.id, s.neteaseCookie)
+                        ?.let { com.pilot.agent.music.MusicPlayer.Source.Remote(it) }
+                },
+                lyricProvider = {
+                    com.pilot.agent.music.NeteaseApi.lyrics(s.musicBaseUrl, song.id, s.neteaseCookie)
+                },
+            )
+        }
+        val started = withContext(Dispatchers.Main.immediate) {
+            com.pilot.agent.music.MusicPlayer.get(getApplication()).playQueue(tracks)
+        }
+        return if (started) "正在播放：${songs.first().display}" else "音乐播放失败，检查音乐服务后再说一次。"
     }
 
     /**
@@ -1647,18 +1778,26 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         if (running) return
         reloadSettings()
         refreshStatus()
-        if (!accessibilityOn) {
-            // Android 不允许普通 App 静默勾选无障碍开关，但可以把用户直接带到
-            // Pilot 的服务详情页，并同时用聊天文字和语音说明下一步。
-            Dbg.w(TAG, "操作权限未开启，已提示并打开设置：goalChars=${g.length}")
-            val prompt = "需要先开启 Pilot 的操作权限。我已打开设置页，请找到 Pilot 并开启，然后再说一次。"
+        if (!accessibilityOn &&
+            com.pilot.agent.action.ScreenRequirements.needsScreen(g)
+        ) {
+            // 只有真要读屏的动作才拦（m-20261127-105）。先问要不要带路，**不默认跳设置页**。
+            Dbg.w(TAG, "该动作需要读屏，无障碍未开启：goalChars=${g.length}")
+            val prompt = "这个动作要读屏幕，需要先开启 Pilot 系统操作权限。要我现在带你到设置页吗？回复「好」就行。"
             add(LogEntry.Kind.DONE, prompt)
+            pendingA11yGuide = true
             val now = System.currentTimeMillis()
             if (now - lastAccessibilityPromptAt > 5_000L) {
                 lastAccessibilityPromptAt = now
                 AgentRuntime.speaker.speak(prompt)
             }
-            openAccessibilitySettings()
+            refreshStatus()
+            return
+        }
+        if (!accessibilityOn) {
+            // 不需要屏幕但本机没法直接处理（不该走到这里）：如实说明，不弹设置页。
+            Dbg.w(TAG, "无障碍未开启，且本机无法直接执行：goalChars=${g.length}")
+            add(LogEntry.Kind.ERROR, "这个请求需要读屏幕才能继续，先开启 Pilot 系统操作权限再说一次。")
             refreshStatus()
             return
         }

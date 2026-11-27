@@ -903,68 +903,16 @@ class AgentLoop(
                 semantics.needsUserText(cmd)
             }
 
-            com.pilot.agent.action.CommandKind.RESULT -> when (cmd.target) {
-                com.pilot.agent.action.CommandTarget.BRIGHTNESS -> runBrightness(goal)
-                com.pilot.agent.action.CommandTarget.VOLUME -> runVolume(goal)
-                com.pilot.agent.action.CommandTarget.DND -> runDnd(cmd.on == true)
-                else -> null
+            com.pilot.agent.action.CommandKind.RESULT -> {
+                when (val r = com.pilot.agent.action.SystemCommandRunner.run(actions.systemOps, cmd, goal)) {
+                    null -> null
+                    is com.pilot.agent.action.SystemRunOutcome.Done -> r.message
+                    is com.pilot.agent.action.SystemRunOutcome.NeedsGuide -> {
+                        pendingGuide = r.target
+                        r.message
+                    }
+                }
             }
-        }
-    }
-
-    private fun runBrightness(goal: String): String? {
-        val change = com.pilot.agent.action.SystemOps.parseLevelChange(goal) ?: return null
-        val r = when (change) {
-            is com.pilot.agent.action.LevelChange.Delta -> actions.systemOps.adjustBrightness(change.percent)
-            is com.pilot.agent.action.LevelChange.Absolute -> actions.systemOps.setBrightness(change.percent)
-        }
-        return when (r) {
-            null -> "调亮度失败了，系统没有接受这次修改。"
-            com.pilot.agent.action.SystemOps.NEED_WRITE_SETTINGS -> {
-                pendingGuide = com.pilot.agent.action.CommandTarget.BRIGHTNESS
-                com.pilot.agent.action.CommandSemantics.needsUserText(
-                    com.pilot.agent.action.SystemCommand(
-                        com.pilot.agent.action.CommandKind.IMPOSSIBLE,
-                        com.pilot.agent.action.CommandTarget.BRIGHTNESS,
-                        null,
-                        "需要「修改系统设置」权限才能改亮度",
-                    ),
-                )
-            }
-
-            else -> r
-        }
-    }
-
-    private fun runVolume(goal: String): String? {
-        val silent = goal.contains("静音")
-        val change = com.pilot.agent.action.SystemOps.parseLevelChange(goal)
-        val r = when {
-            change is com.pilot.agent.action.LevelChange.Delta -> actions.systemOps.adjustVolume(change.percent)
-            change is com.pilot.agent.action.LevelChange.Absolute -> actions.systemOps.setVolume(change.percent)
-            silent -> actions.systemOps.setVolume(0)
-            else -> return null
-        }
-        return r ?: "调音量失败了，系统没有接受这次修改。"
-    }
-
-    private fun runDnd(on: Boolean): String? {
-        val r = actions.systemOps.setDnd(on)
-        return when (r) {
-            null -> "没改成：系统没有接受勿扰切换。"
-            com.pilot.agent.action.SystemOps.NEED_DND_ACCESS -> {
-                pendingGuide = com.pilot.agent.action.CommandTarget.DND
-                com.pilot.agent.action.CommandSemantics.needsUserText(
-                    com.pilot.agent.action.SystemCommand(
-                        com.pilot.agent.action.CommandKind.IMPOSSIBLE,
-                        com.pilot.agent.action.CommandTarget.DND,
-                        on,
-                        "需要通知策略访问权限才能改勿扰",
-                    ),
-                )
-            }
-
-            else -> r
         }
     }
 
