@@ -48,6 +48,7 @@ internal object DebugCommands {
         "fastpath_owner", "fastpath_compare", "reminder_cancel", "memory_delete_id",
         "memory_forget", "fastpath_fill_test", "set_netease_cookie", "tts_test", "tts_engine",
         "asr_test", "llm_test", "sandbox_test", "sandbox_timeout_ms", "voice_test", "simulate_nav",
+        "debug_launch",
     )
     private val BOOL_KEYS = listOf("kws_test", "import_models", "log_verbose")
 
@@ -382,6 +383,28 @@ internal object DebugCommands {
                 }
                 Dbg.i(TAG, "模拟导航服务已返回 jobId=$jobId")
             }.apply { name = "simulate-navigation-test"; isDaemon = true }.start()
+            return true
+        }
+
+        // 调试：以后台身份尝试启动任意 action/组件，验证某种后台启动方式是否可行。
+        //   --es debug_launch "action:android.settings.SETTINGS"
+        //   --es debug_launch "comp:com.android.settings/.HWSettings"
+        val debugLaunch = intent.getStringExtra("debug_launch")?.trim().orEmpty()
+        if (debugLaunch.isNotEmpty()) {
+            Thread {
+                val i = (if (debugLaunch.startsWith("comp:")) {
+                    val c = debugLaunch.removePrefix("comp:")
+                    Intent().setComponent(
+                        android.content.ComponentName(c.substringBefore('/'), c.substringAfter('/')),
+                    )
+                } else {
+                    Intent(debugLaunch.removePrefix("action:"))
+                }).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                val outcome = runBlocking {
+                    com.pilot.agent.action.VerifiedLauncher.launch(app, i, null, 5_000L)
+                }
+                Dbg.i(TAG, "debug_launch $debugLaunch -> $outcome")
+            }.apply { name = "debug-launch"; isDaemon = true }.start()
             return true
         }
 
