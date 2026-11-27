@@ -25,6 +25,10 @@
     <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
     <!-- 端侧语音识别需要自己持有麦克风（AudioRecord），系统 SpeechRecognizer 会被抢占 -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- 日程直写系统日历（m-20261127-103）：读用于选可写日历/查重，写用于插入事件；
+         没授予时退回 ACTION_INSERT（打开日历新建页）并如实说明。 -->
+    <uses-permission android:name="android.permission.READ_CALENDAR" />
+    <uses-permission android:name="android.permission.WRITE_CALENDAR" />
 
     <!-- 沙箱挂载目录：SAF 选目录需要存储读权限；
          MANAGE_EXTERNAL_STORAGE 让 proot 能 bind 共享存储下的目录。 -->

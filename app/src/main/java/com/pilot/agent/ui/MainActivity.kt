@@ -145,14 +145,33 @@ class MainActivity : ComponentActivity() {
             if (granted) vm.startVoiceHold()
         }
 
+    /**
+     * 日程直写系统日历需要的运行时权限（m-20261127-103）。
+     * Tool 层拿不到 Activity，经 [com.pilot.agent.action.CalendarPermissions] 借这个 launcher 弹授权框。
+     */
+    private val calendarPermission =
+        registerForActivityResult(
+            androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions(),
+        ) { grants ->
+            com.pilot.agent.action.CalendarPermissions.onResult(grants)
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        com.pilot.agent.action.CalendarPermissions.attach { permissions ->
+            calendarPermission.launch(permissions)
+        }
         setContent {
             PilotTheme {
                 AgentScreen(vm, onRequestMic = { micPermission.launch(android.Manifest.permission.RECORD_AUDIO) })
             }
         }
         handleGoalIntent(intent)
+    }
+
+    override fun onDestroy() {
+        com.pilot.agent.action.CalendarPermissions.detach()
+        super.onDestroy()
     }
 
     private fun requestMic() {

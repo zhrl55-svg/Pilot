@@ -267,6 +267,14 @@ class AgentLoop(
         actions.targetDisplayId = virtualDisplay
         reader.displayIdFilter = virtualDisplay
 
+        // 「取消刚才那个日程」：只删 Pilot 刚建的那一条（m-20261127-103）。
+        if (com.pilot.agent.action.CalendarTool.handlesCancel(goal)) {
+            emit(AgentEvent.Finished(
+                com.pilot.agent.action.CalendarTool.cancelLastCreated(com.pilot.agent.PilotApp.instance),
+            ))
+            return
+        }
+
         if (com.pilot.agent.action.CalendarTool.handles(goal)) {
             emit(AgentEvent.Finished(com.pilot.agent.action.CalendarTool.create(
                 com.pilot.agent.PilotApp.instance, goal,
