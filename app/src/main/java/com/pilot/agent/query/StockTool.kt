@@ -2,6 +2,7 @@ package com.pilot.agent.query
 
 import com.pilot.agent.Dbg
 import com.pilot.agent.assistant.llm.LlmGateway
+import com.pilot.agent.runtime.await
 import java.nio.charset.Charset
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -85,7 +86,7 @@ class StockTool : QueryTool {
                 .header("User-Agent", "Mozilla/5.0 (Linux; Android 12)")
                 .get()
                 .build()
-            client.newCall(req).execute().use { resp ->
+            client.newCall(req).await().use { resp ->
                 if (!resp.isSuccessful) {
                     Dbg.w(TAG, "HTTP ${resp.code}")
                     return@withContext null

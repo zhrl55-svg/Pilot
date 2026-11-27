@@ -9,12 +9,17 @@ import com.pilot.agent.Dbg
 import com.pilot.agent.PilotApp
 import com.pilot.navigation.GeoCoder
 import com.pilot.navigation.NavKeys
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 /**
  * 天气查询：走高德 Web 服务 `v3/weather/weatherInfo`，不碰屏幕、不进 AgentLoop。
@@ -142,7 +147,7 @@ class WeatherTool : QueryTool {
     }
 
     /** geo 接口这个 key 无权限，用 POI 搜索兜底拿 adcode。 */
-    private fun resolveAdcodeByPoi(key: String, city: String): String? {
+    private suspend fun resolveAdcodeByPoi(key: String, city: String): String? {
         val url = "https://restapi.amap.com/v3/place/text?key=$key&keywords=" +
             URLEncoder.encode(city, "UTF-8") + "&offset=1&output=json"
         val json = getJson(url) ?: return null
@@ -152,7 +157,7 @@ class WeatherTool : QueryTool {
         return adcode?.takeIf { it.length == 6 && it.all(Char::isDigit) }
     }
 
-    private fun fetch(key: String, adcode: String, extensions: String): JSONObject? {
+    private suspend fun fetch(key: String, adcode: String, extensions: String): JSONObject? {
         val url = "https://restapi.amap.com/v3/weather/weatherInfo?key=$key&city=$adcode" +
             "&extensions=$extensions&output=json"
         val json = getJson(url) ?: return null
@@ -163,14 +168,42 @@ class WeatherTool : QueryTool {
         return json
     }
 
-    private fun getJson(url: String): JSONObject? = runCatching {
-        val conn = URL(url).openConnection() as HttpURLConnection
-        conn.connectTimeout = 6000
-        conn.readTimeout = 8000
-        conn.requestMethod = "GET"
-        JSONObject(conn.inputStream.use { it.readBytes().decodeToString() })
-    }.getOrElse {
-        Dbg.w(TAG, "天气请求异常 ${it.javaClass.simpleName}")
+    /**
+     * 可取消的 GET：HttpURLConnection 本身对协程取消无感，所以放到独立线程执行，
+     * 协程取消时立刻 `disconnect()` 让阻塞的 `inputStream.read()` 抛 IOException 返回
+     * （审核 P0-4：点停止后天气查询也必须 1 秒内结束，不能等 readTimeout 8 秒）。
+     */
+    private suspend fun getJson(url: String): JSONObject? = try {
+        suspendCancellableCoroutine { cont ->
+            val worker = Thread({
+                var conn: HttpURLConnection? = null
+                try {
+                    conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                        connectTimeout = 6000
+                        readTimeout = 8000
+                        requestMethod = "GET"
+                    }
+                    val live = conn!!
+                    // 取消先于建连完成时，这个回调会被立即执行（协程已取消）。
+                    cont.invokeOnCancellation { runCatching { live.disconnect() } }
+                    val json = JSONObject(live.inputStream.use { it.readBytes().decodeToString() })
+                    if (cont.isActive) cont.resume(json)
+                } catch (t: Throwable) {
+                    if (cont.isActive) {
+                        cont.resumeWithException(t)
+                    } else if (t !is IOException) {
+                        Dbg.w(TAG, "天气请求取消后结束 ${t.javaClass.simpleName}")
+                    }
+                } finally {
+                    runCatching { conn?.disconnect() }
+                }
+            }, "pilot-weather")
+            worker.isDaemon = true
+            worker.start()
+        }
+    } catch (t: Throwable) {
+        if (t is CancellationException) throw t
+        Dbg.w(TAG, "天气请求异常 ${t.javaClass.simpleName}")
         null
     }
 

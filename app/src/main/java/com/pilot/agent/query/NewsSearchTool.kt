@@ -3,6 +3,7 @@ package com.pilot.agent.query
 import android.text.Html
 import android.util.Xml
 import com.pilot.agent.Dbg
+import com.pilot.agent.runtime.await
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
@@ -87,7 +88,7 @@ class NewsSearchTool : QueryTool {
         formatWithArticles(query, items, rangeLabel)
     }
 
-    private fun fetchFeed(query: String, range: String): List<Item> {
+    private suspend fun fetchFeed(query: String, range: String): List<Item> {
         val encoded = URLEncoder.encode("$query when:$range", StandardCharsets.UTF_8.name())
         val url = "https://news.google.com/rss/search?q=$encoded&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
         return try {
@@ -97,7 +98,7 @@ class NewsSearchTool : QueryTool {
                 .header("Accept", "application/rss+xml, application/xml, text/xml")
                 .get()
                 .build()
-            client.newCall(request).execute().use { response ->
+            client.newCall(request).await().use { response ->
                 if (!response.isSuccessful) {
                     Dbg.w(TAG, "RSS HTTP ${response.code} range=$range")
                     emptyList()
@@ -107,12 +108,13 @@ class NewsSearchTool : QueryTool {
                 }
             }
         } catch (t: Throwable) {
+            if (t is kotlinx.coroutines.CancellationException) throw t
             Dbg.w(TAG, "RSS fetch failed range=$range ${t.javaClass.simpleName}")
             emptyList()
         }
     }
 
-    private fun fetchBingNews(query: String): List<Item> {
+    private suspend fun fetchBingNews(query: String): List<Item> {
         val encoded = URLEncoder.encode(query, StandardCharsets.UTF_8.name())
         val url = "https://www.bing.com/news/search?q=$encoded&format=rss&qft=sortbydate%3d%221%22"
         return try {
@@ -122,7 +124,7 @@ class NewsSearchTool : QueryTool {
                 .header("Accept", "application/rss+xml, application/xml, text/xml")
                 .get()
                 .build()
-            client.newCall(request).execute().use { response ->
+            client.newCall(request).await().use { response ->
                 if (!response.isSuccessful) {
                     Dbg.w(TAG, "Bing News RSS HTTP ${response.code}")
                     emptyList()
@@ -132,6 +134,7 @@ class NewsSearchTool : QueryTool {
                 }
             }
         } catch (t: Throwable) {
+            if (t is kotlinx.coroutines.CancellationException) throw t
             Dbg.w(TAG, "Bing News RSS failed ${t.javaClass.simpleName}")
             emptyList()
         }

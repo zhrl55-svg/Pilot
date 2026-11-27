@@ -2,6 +2,7 @@ package com.pilot.agent.voice
 
 import android.content.Context
 import com.pilot.agent.Dbg
+import com.pilot.agent.runtime.await
 import com.pilot.agent.runtime.AgentRuntime
 import java.io.File
 import java.io.FileOutputStream
@@ -456,7 +457,7 @@ internal fun parseContentRangeStart(header: String?): Long? {
  * - 服务器忽略 Range 返回 200 时清空重写；
  * - 服务器回 416 且长度已等于 [expectedBytes] 时视为已完成（返回现有长度）。
  */
-internal fun downloadOne(
+internal suspend fun downloadOne(
     client: OkHttpClient,
     url: String,
     expectedBytes: Long,
@@ -483,7 +484,7 @@ internal fun downloadOne(
     val call = client.newCall(request)
     onCall(call)
     try {
-        call.execute().use { response ->
+        call.await().use { response ->
             if (response.code == 416 && existing == expectedBytes) return existing
             if (!response.isSuccessful) throw IOException("HTTP ${response.code}")
 

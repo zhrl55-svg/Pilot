@@ -4,6 +4,7 @@ import android.net.Uri
 import android.text.Html
 import com.pilot.agent.Dbg
 import com.pilot.agent.assistant.llm.LlmGateway
+import com.pilot.agent.runtime.await
 import com.pilot.agent.tool.LaunchResults
 import com.pilot.agent.tool.ToolStatus
 import java.net.InetAddress
@@ -66,7 +67,7 @@ class WebSearchTool : QueryTool {
                 .header("Accept", "application/json")
                 .header("User-Agent", "PilotAndroid/1.0")
                 .get().build()
-            client.newCall(req).execute().use { response ->
+            client.newCall(req).await().use { response ->
                 if (!response.isSuccessful) {
                     Dbg.w(TAG, "search HTTP ${response.code}")
                     return@withContext when (response.code) {
@@ -120,7 +121,7 @@ class WebSearchTool : QueryTool {
      * 只取标题和摘要：国内网络下很多外链正文抓不到，抓取会把整体拖到超时。
      * @return null = 没拿到有效结果（调用方回退 Brave）
      */
-    private fun bingSearch(query: String): String? {
+    private suspend fun bingSearch(query: String): String? {
         val url = "https://www.bing.com/search?q=" +
             URLEncoder.encode(query, Charsets.UTF_8.name()) +
             "&count=5&setlang=zh-hans&cc=cn"
@@ -133,8 +134,8 @@ class WebSearchTool : QueryTool {
             .header("Accept", "text/html,application/xhtml+xml")
             .get()
             .build()
-        return runCatching {
-            client.newCall(request).execute().use { response ->
+        return try {
+            client.newCall(request).await().use { response ->
                 if (!response.isSuccessful) {
                     Dbg.w(TAG, "bing HTTP ${response.code}")
                     return@use null
@@ -165,8 +166,11 @@ class WebSearchTool : QueryTool {
                     append("\n\n结果由 Bing 搜索提供。")
                 }
             }
-        }.getOrElse {
-            Dbg.w(TAG, "bing search failed: ${it.javaClass.simpleName}")
+        } catch (t: Throwable) {
+            // 取消要穿透：把 CancellationException 当成「搜索失败」吞掉，会让上层误以为
+            // 还能继续回退 Brave —— 用户点了停止，后台却又发一个请求。
+            if (t is kotlinx.coroutines.CancellationException) throw t
+            Dbg.w(TAG, "bing search failed: ${t.javaClass.simpleName}")
             null
         }
     }
@@ -276,7 +280,7 @@ class WebPageTool : QueryTool {
                     .header("User-Agent", "PilotAndroid/1.0")
                     .header("Accept", "text/html,application/xhtml+xml")
                     .get().build()
-                client.newCall(request).execute().use { response ->
+                client.newCall(request).await().use { response ->
                     if (response.code in 300..399) {
                         val location = response.header("Location") ?: return@withContext "正文抓取失败：重定向地址缺失。"
                         if (hop == 3) return@withContext "正文抓取失败：重定向次数过多。"

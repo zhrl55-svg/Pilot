@@ -94,12 +94,18 @@ object QueryEngine {
      * @return 播报文本；null = 没有工具接 / 没查到 / 查询不可用
      */
     suspend fun handle(goal: String): String? {
-        return when (val r = handleResult(goal)) {
-            is QueryResult.Answer -> r.text
-            is QueryResult.NeedMoreInfo -> r.prompt
-            is QueryResult.NoResult -> null
-            is QueryResult.Unavailable -> null
-            null -> null
+        return try {
+            when (val r = handleResult(goal)) {
+                is QueryResult.Answer -> r.text
+                is QueryResult.NeedMoreInfo -> r.prompt
+                is QueryResult.NoResult -> null
+                is QueryResult.Unavailable -> null
+                null -> null
+            }
+        } catch (t: kotlinx.coroutines.CancellationException) {
+            // 诊断：点停止后阻塞的网络调用由 await() 立即中断；这行日志的时间戳就是「取消→返回」的证据。
+            Dbg.i(TAG, "查询被取消：goalChars=${goal.length}")
+            throw t
         }
     }
 

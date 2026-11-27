@@ -402,7 +402,7 @@ class CapabilityExecutor(
     }
 
     /** 榜单名 → 网易云官方歌单 id。 */
-    private fun chartSongs(
+    private suspend fun chartSongs(
         base: String,
         chart: String,
         cookie: String,

@@ -6,9 +6,12 @@ import android.net.NetworkCapabilities
 import com.pilot.agent.Dbg
 import com.pilot.agent.PilotApp
 import com.pilot.agent.agent.AgentSettings
+import com.pilot.agent.runtime.await
 import java.net.URLEncoder
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
@@ -62,7 +65,7 @@ object NeteaseApi {
      *   cookie 有两千多字符，URL 编码后请求行过长，中间任何一层（网关/代理/OkHttp 自己）
      *   截断都会变成"未登录"，而报错信息看起来像风控，极难排查。
      */
-    private fun get(
+    private suspend fun get(
         base: String,
         path: String,
         params: Map<String, String> = emptyMap(),
@@ -99,19 +102,21 @@ object NeteaseApi {
         return null
     }
 
-    private fun request(url: String, cookie: String?): JSONObject = try {
+    private suspend fun request(url: String, cookie: String?): JSONObject = try {
         val host = java.net.URI(url).host.orEmpty()
         if (TailscaleGateway.isTailnetHost(host)) {
             TailscaleGateway.get(PilotApp.instance, url, cookie, 15_000)
         } else {
             val builder = Request.Builder().url(url).get()
             if (!cookie.isNullOrBlank()) builder.header("Cookie", cookie)
-            client.newCall(builder.build()).execute().use { resp ->
+            client.newCall(builder.build()).await().use { resp ->
                 JSONObject().put("ok", true).put("code", resp.code)
                     .put("body", com.pilot.agent.agent.HttpBodies.readCapped(resp.body))
             }
         }
     } catch (t: Throwable) {
+        // 取消不是网络错误：不能吞掉后换下一个镜像地址再试（那样点停止后还会继续发请求）。
+        if (t is kotlinx.coroutines.CancellationException) throw t
         JSONObject().put("ok", false).put("error", t.message ?: "network error")
     }
 
@@ -131,7 +136,7 @@ object NeteaseApi {
 
     // ------------------------------------------------------------ 搜索
 
-    fun search(base: String, keyword: String, limit: Int = 5, cookie: String? = null): List<Song> {
+    suspend fun search(base: String, keyword: String, limit: Int = 5, cookie: String? = null): List<Song> {
         val params = mapOf("keywords" to keyword, "limit" to limit.toString())
         val json = get(base, "/search", params, cookie) ?: return emptyList()
         val songs = json.optJSONObject("result")?.optJSONArray("songs") ?: return emptyList()
@@ -156,7 +161,7 @@ object NeteaseApi {
     }
 
     /** 网易云“最近播放”。该接口需要登录账号的 uid；结果为空时由调用方回退到本地播放历史。 */
-    fun recentSongs(base: String, cookie: String, limit: Int = 20): List<Song> {
+    suspend fun recentSongs(base: String, cookie: String, limit: Int = 20): List<Song> {
         if (cookie.isBlank()) return emptyList()
         val profile = loginProfile(base, cookie) ?: return emptyList()
         val json = get(
@@ -171,7 +176,7 @@ object NeteaseApi {
     }
 
     /** 网易云官方榜榜单。3778678=热歌榜，3779629=新歌榜，19723756=飙升榜。 */
-    fun chartSongs(
+    suspend fun chartSongs(
         base: String,
         chartId: Long,
         cookie: String? = null,
@@ -183,7 +188,7 @@ object NeteaseApi {
             .also { Dbg.i(TAG, "榜单 $chartId：${it.size} 首") }
     }
 
-    fun everydayRecommendations(base: String, cookie: String, limit: Int = 20): List<Song> {
+    suspend fun everydayRecommendations(base: String, cookie: String, limit: Int = 20): List<Song> {
         if (cookie.isBlank()) return emptyList()
         val json = get(base, "/recommend/songs", emptyMap(), cookie) ?: return emptyList()
         val songs = json.optJSONObject("data")?.optJSONArray("dailySongs") ?: return emptyList()
@@ -191,7 +196,7 @@ object NeteaseApi {
             .also { Dbg.i(TAG, "每日推荐：${it.size} 首") }
     }
 
-    fun likedSongs(base: String, cookie: String, limit: Int = 20): List<Song> {
+    suspend fun likedSongs(base: String, cookie: String, limit: Int = 20): List<Song> {
         if (cookie.isBlank()) return emptyList()
         val profile = loginProfile(base, cookie) ?: return emptyList()
         val list = get(
@@ -256,7 +261,10 @@ object NeteaseApi {
      *   实测同一台服务器、同一个 cookie，v1 恒定返回 `-460 网络环境存在风险`，
      *   旧接口正常。这不是 IP 被风控——换接口就好，v1 大概是加了新的风控校验。
      */
-    fun playUrl(base: String, songId: Long, cookie: String? = null): String? {
+    fun playUrl(base: String, songId: Long, cookie: String? = null): String? =
+        runBlocking(Dispatchers.IO) { playUrlAwait(base, songId, cookie) }
+
+    private suspend fun playUrlAwait(base: String, songId: Long, cookie: String?): String? {
         val params = mapOf("id" to songId.toString())
         val json = get(base, "/song/url", params, cookie) ?: return null
         val data = json.optJSONArray("data") ?: return null
@@ -275,7 +283,10 @@ object NeteaseApi {
      * 取逐行同步歌词。优先使用逐字歌词接口，内容为空时回退到普通 LRC。
      * 制片信息（作词、作曲等）会在前奏阶段停留很久，因此从时间轴中移除。
      */
-    fun lyrics(base: String, songId: Long, cookie: String? = null): List<LyricLine> {
+    fun lyrics(base: String, songId: Long, cookie: String? = null): List<LyricLine> =
+        runBlocking(Dispatchers.IO) { lyricsAwait(base, songId, cookie) }
+
+    private suspend fun lyricsAwait(base: String, songId: Long, cookie: String?): List<LyricLine> {
         val json = get(
             base,
             "/lyric",
@@ -324,12 +335,12 @@ object NeteaseApi {
 
     // ------------------------------------------------------------ 扫码登录
 
-    fun qrKey(base: String, fallbackBase: String? = null): String? {
+    suspend fun qrKey(base: String, fallbackBase: String? = null): String? {
         return qrSession(base, fallbackBase)?.key
     }
 
     /** The key belongs to the API instance that created it; pin every step to that same base URL. */
-    fun qrSession(base: String, fallbackBase: String? = null): QrSession? {
+    suspend fun qrSession(base: String, fallbackBase: String? = null): QrSession? {
         val primary = base.trim().trimEnd('/')
         val fallback = fallbackBase?.trim()?.trimEnd('/').orEmpty()
         for (candidate in routeOrder(PilotApp.instance, primary, fallback)) {
@@ -346,7 +357,7 @@ object NeteaseApi {
     }
 
     /** @return base64 的 data:image/png;base64,... */
-    fun qrImage(base: String, key: String): String? {
+    suspend fun qrImage(base: String, key: String): String? {
         val json = get(
             base,
             "/login/qr/create",
@@ -360,7 +371,7 @@ object NeteaseApi {
      * 轮询扫码结果。
      * @return Pair(状态, cookie)。成功时 cookie 非空，需要持久化到本地。
      */
-    fun qrCheck(base: String, key: String): Pair<QrState, String?> {
+    suspend fun qrCheck(base: String, key: String): Pair<QrState, String?> {
         val json = get(
             base,
             "/login/qr/check",
@@ -393,11 +404,11 @@ object NeteaseApi {
         .joinToString("; ")
 
     /** 登录态检查，顺便能拿到昵称 */
-    fun loginStatus(base: String, cookie: String): String? {
+    suspend fun loginStatus(base: String, cookie: String): String? {
         return loginProfile(base, cookie)?.nickname?.takeIf { it.isNotBlank() }
     }
 
-    fun loginProfile(base: String, cookie: String): Profile? {
+    suspend fun loginProfile(base: String, cookie: String): Profile? {
         if (cookie.isBlank()) return null
         val json = get(base, "/login/status", emptyMap(), cookie) ?: return null
         val data = json.optJSONObject("data") ?: return null

@@ -1,6 +1,8 @@
 package com.pilot.agent.query
 
 import com.pilot.agent.Dbg
+import com.pilot.agent.runtime.await
+import com.pilot.agent.runtime.catchingNonCancel
 import java.net.URLEncoder
 import java.time.DayOfWeek
 import java.time.LocalDate
@@ -173,6 +175,8 @@ class TrainQueryTool : QueryTool {
             Dbg.w(TAG, "12306 查询失败：${failure.reason}")
             "12306 暂时没查成：${failure.message}。查询条件已保留，可以回复“重试”。"
         } catch (failure: Throwable) {
+            // 取消不是「12306 不可用」：原样抛出，交给停止动作收尾，不生成可重试的失败文案。
+            if (failure is kotlinx.coroutines.CancellationException) throw failure
             Dbg.e(TAG, "12306 查询异常：${failure.javaClass.simpleName}: ${failure.message}")
             "12306 暂时不可用，请稍后回复“重试”。"
         }
@@ -406,7 +410,8 @@ class TrainQueryTool : QueryTool {
         val responses = coroutineScope {
             pairs.map { (from, to) ->
                 async(Dispatchers.IO) {
-                    runCatching { queryPair(endpoint, request.date, from, to) to (from to to) }
+                    // catchingNonCancel：点停止时不把取消包成“查询失败”，避免上层换通道重试。
+                    catchingNonCancel { queryPair(endpoint, request.date, from, to) to (from to to) }
                 }
             }.awaitAll()
         }
@@ -443,7 +448,7 @@ class TrainQueryTool : QueryTool {
         return endpoint
     }
 
-    private fun queryPair(
+    private suspend fun queryPair(
         endpoint: String,
         date: String,
         from: Station,
@@ -659,9 +664,9 @@ class TrainQueryTool : QueryTool {
         return catalog
     }
 
-    private fun executeText(request: Request, failureMessage: String): String {
+    private suspend fun executeText(request: Request, failureMessage: String): String {
         try {
-            client.newCall(request).execute().use { response ->
+            client.newCall(request).await().use { response ->
                 if (!response.isSuccessful) {
                     throw TrainQueryFailure("$failureMessage（HTTP ${response.code}）")
                 }
@@ -670,6 +675,8 @@ class TrainQueryTool : QueryTool {
         } catch (failure: TrainQueryFailure) {
             throw failure
         } catch (failure: Throwable) {
+            // 用户点停止时不要把取消包装成“网络异常”，否则上层会把它当失败并可重试。
+            if (failure is kotlinx.coroutines.CancellationException) throw failure
             throw TrainQueryFailure("$failureMessage（网络异常）")
         }
     }

@@ -1,5 +1,6 @@
 package com.pilot.agent.agent
 
+import com.pilot.agent.runtime.await
 import com.pilot.agent.runtime.rethrowIfCancellation
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
@@ -141,7 +142,7 @@ class AgentIntentRouter(private val settingsProvider: () -> AgentSettings) {
             .post(body.toString().toRequestBody(JSON_MEDIA))
             .build()
 
-        return client.newCall(request).execute().use { response ->
+        return client.newCall(request).await().use { response ->
             val raw = response.body?.string().orEmpty()
             if (!response.isSuccessful) error("HTTP ${response.code}: ${raw.take(240)}")
             val root = json.parseToJsonElement(raw).jsonObject
