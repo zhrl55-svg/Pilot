@@ -1,6 +1,7 @@
 package com.pilot.agent.perception
 
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.Transient
 
 /**
  * 屏幕上一个可操作/可读的节点。
@@ -53,13 +54,31 @@ data class UiNode(
     }
 }
 
+/**
+ * 一帧屏幕快照。
+ *
+ * ★ 节点 id 只在**本帧**内有效：[frameId] 标识这一帧，执行层按 (frameId, id) 取节点，
+ *   帧已过期或节点位置/内容已变化时拒绝执行（见 [ScreenReader.lookup]），
+ *   避免「拿第 N 帧的 [7] 去点第 N+1 帧的 [7]」。
+ */
 @Serializable
 data class ScreenSnapshot(
     val pkg: String = "",
     val nodes: List<UiNode> = emptyList(),
     val ts: Long = 0L,
     val truncated: Boolean = false,
+    /** 帧号，由 [ScreenReader.capture] 单调递增分配；0 表示未知/旧数据。 */
+    val frameId: Long = 0L,
+    /**
+     * 页面上下文文字（包括不可点击的说明文字，例如弹窗正文「确认支付 ¥299？」）。
+     * 只给风险判定（Guard）判断「确定/继续」这类通用按钮所在语境用：
+     * 不序列化、不进入规划提示词、不写日志。
+     */
+    @Transient
+    val contextText: String = "",
 ) {
+    fun node(id: Int): UiNode? = nodes.firstOrNull { it.id == id }
+
     fun toPrompt(): String = buildString {
         append("前台应用: ").append(pkg.ifEmpty { "unknown" }).append('\n')
         append("可见节点 ").append(nodes.size).append(" 个")

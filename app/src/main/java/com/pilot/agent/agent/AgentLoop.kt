@@ -2,20 +2,28 @@ package com.pilot.agent.agent
 
 import com.pilot.agent.Dbg
 import com.pilot.agent.action.DeviceActions
+import com.pilot.agent.action.LaunchOutcome
 import com.pilot.agent.browser.BrowserSessionManager
 import com.pilot.agent.extension.UserScript
 import com.pilot.agent.extension.UserScriptStep
 import com.pilot.agent.perception.ScreenReader
 import com.pilot.agent.perception.ScreenSnapshot
+import com.pilot.agent.runtime.catchingNonCancel
+import com.pilot.agent.runtime.rethrowIfCancellation
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -52,12 +60,61 @@ class AgentLoop(
     private val pendingConfirms = ConcurrentHashMap<Long, CompletableDeferred<Boolean>>()
     private val confirmSeq = AtomicLong(0)
     private val runSeq = AtomicLong(0)
+
+    /** start / cancel 的互斥锁：RunReceiver 线程、主线程、语音线程都会调它们（审核 F-11 / C1）。 */
+    private val lock = Any()
+
+    @Volatile
     private var job: Job? = null
+
+    /**
+     * 每次运行独有的上下文，挂在协程上下文里随调用链传递（withContext(IO) 也会继承）。
+     *
+     * ★ 之前 hasUi 是实例字段：被抢占的旧任务还在阻塞 IO 时，新任务的 start() 改写了它，
+     *   旧任务的 askUser 读到的是新值。现在 askUser 读的是**自己那次运行**的 hasUi。
+     */
+    private class RunCtx(val token: Long, val hasUi: Boolean) : AbstractCoroutineContextElement(Key) {
+        companion object Key : CoroutineContext.Key<RunCtx>
+
+        /** 本次运行是否已经把外部不可信内容（网页/MCP/工具输出）喂给过规划器。 */
+        @Volatile
+        var tainted: Boolean = false
+    }
+
+    /** 结构化的步骤记录：完成判定不再从 history 字符串里猜 "ok"（审核 F-02）。 */
+    private data class StepRecord(
+        val action: AgentAction,
+        val ok: Boolean,
+        /** 界面指纹是否变化 */
+        val progressed: Boolean,
+        /** 直达类动作（open/shortcut/component）的回查结果；其他动作为 null */
+        val launch: LaunchOutcome?,
+        val pkgAfter: String?,
+    )
+
+    /** 确认的几种结局：文案要区分，不能把超时、没界面都说成「按你的意思取消」（审核 F-07）。 */
+    private enum class ConfirmOutcome { APPROVED, DENIED, TIMEOUT, NO_UI }
+
+    /** 技能回放的结局。 */
+    private sealed class ReplayResult {
+        data class Done(val summary: String) : ReplayResult()
+
+        /** 用户拒绝了回放中的风险步骤：整个任务立即中止，不再交给模型。 */
+        data class Aborted(val reason: String) : ReplayResult()
+
+        /** 没命中 / 回放失败 / 校验不一致：交回模型规划。 */
+        object Fallback : ReplayResult()
+    }
 
     /** 本次任务最后一个「把用户带到别的 App」的动作落在了哪个包，用于决定收尾要不要归位。 */
     @Volatile
     private var landedPkg: String? = null
 
+    /** 本次任务开始时用户在看的包（技能沉淀时作为 originPkg，回放前据此补 open）。 */
+    @Volatile
+    private var runOriginPkg: String? = null
+
+    /** 无 RunCtx 时的兜底（理论上不会用到）。 */
     @Volatile
     private var hasUi = true
 
@@ -87,25 +144,29 @@ class AgentLoop(
         chatHistory: List<Pair<String, String>> = emptyList(),
     ) {
         if (goal.isBlank()) return
-        // 新任务顶掉旧任务：旧任务可能正卡在等用户确认，不顶掉的话后面所有请求都会被 isRunning 挡回去
-        if (isRunning) {
-            Dbg.i(TAG, "supersede running task")
-            cancel(notify = false)
-        }
-        hasUi = ui
-        val myToken = runSeq.incrementAndGet()
-        // LAZY 启动：否则 Main.immediate 下 launch 的 lambda 会在 job 赋值之前就跑起来，
-        // 循环里的 job?.isActive 读到的是上一轮的旧 Job，直接判定"已取消"静默退出。
-        val newJob = scope.launch(start = CoroutineStart.LAZY) {
-            try {
-                run(goal.trim(), executionMode, myToken, chatHistory)
-            } catch (t: Throwable) {
-                if (t is kotlinx.coroutines.CancellationException) throw t
-                Dbg.e(TAG, "run failed: ${t.message}", t)
-                emit(AgentEvent.Failed(t.message ?: "执行异常"))
+        val newJob: Job
+        synchronized(lock) {
+            // 新任务顶掉旧任务：旧任务可能正卡在等用户确认，不顶掉的话后面所有请求都会被 isRunning 挡回去
+            if (job?.isActive == true) {
+                Dbg.i(TAG, "supersede running task")
+                cancelLocked()
             }
+            hasUi = ui
+            val myToken = runSeq.incrementAndGet()
+            // LAZY 启动：否则 Main.immediate 下 launch 的 lambda 会在 job 赋值之前就跑起来，
+            // 循环里的 job?.isActive 读到的是上一轮的旧 Job，直接判定"已取消"静默退出。
+            newJob = scope.launch(RunCtx(myToken, ui), start = CoroutineStart.LAZY) {
+                try {
+                    run(goal.trim(), executionMode, myToken, chatHistory)
+                } catch (t: Throwable) {
+                    rethrowIfCancellation(t)
+                    Dbg.e(TAG, "run failed: ${t.message}", t)
+                    emit(AgentEvent.Failed(t.message ?: "执行异常"))
+                }
+            }
+            job = newJob
         }
-        job = newJob
+        // 在锁外启动：Main.immediate 下 start() 会就地执行到第一个挂起点，不能拿着锁跑
         newJob.start()
     }
 
@@ -118,12 +179,21 @@ class AgentLoop(
      *   避免旧任务残留一条「已取消」错误。
      */
     fun cancel(notify: Boolean = true) {
-        val wasRunning = job?.isActive == true
-        job?.cancel()
+        val wasRunning = synchronized(lock) { cancelLocked() }
+        if (notify && wasRunning) sink.tryEmit(AgentEvent.Failed("任务已取消"))
+    }
+
+    /** 调用方必须持有 [lock]。返回取消前是否在运行。 */
+    private fun cancelLocked(): Boolean {
+        val j = job
+        val wasRunning = j?.isActive == true
         job = null
+        // 让旧 run token 失效：旧任务即使还卡在阻塞调用里，回来后也不会再执行设备动作或归位
+        runSeq.incrementAndGet()
+        j?.cancel()
         pendingConfirms.values.forEach { it.complete(false) }
         pendingConfirms.clear()
-        if (notify && wasRunning) sink.tryEmit(AgentEvent.Failed("任务已取消"))
+        return wasRunning
     }
 
     fun confirm(requestId: Long, approved: Boolean) {
@@ -152,6 +222,7 @@ class AgentLoop(
         val originPkg = (reader.capture()?.pkg ?: reader.last()?.pkg)
             ?.takeIf { it.isNotEmpty() && it != self }
         landedPkg = null
+        runOriginPkg = originPkg
         try {
             runInner(goal, settings, chatHistory)
         } finally {
@@ -264,12 +335,22 @@ class AgentLoop(
         // 输入步骤目前没有安全的参数槽位/密钥托管机制，任何含输入的任务都不沉淀为可回放技能。
         var skillEligible = true
         val history = mutableListOf<String>()
+        // 结构化步骤记录：完成判定靠「启动回查 + 界面指纹变化」，不从 history 字符串里猜 "ok"（审核 F-02）。
+        val stepRecords = mutableListOf<StepRecord>()
 
-        // 1. 先看技能库，能回放就不惊动模型
+        // 1. 先看技能库，能回放就不惊动模型。
+        //    ★ 回放不再直接信任轨迹：每一步过 Guard + 确认，结束后比对完成界面指纹（审核 S-01/S-06）。
         if (settings.allowSkillReplay) {
-            replaySkill(goal)?.let {
-                emit(AgentEvent.Finished(it))
-                return
+            when (val replay = replaySkill(goal)) {
+                is ReplayResult.Done -> {
+                    emit(AgentEvent.Finished(replay.summary))
+                    return
+                }
+                is ReplayResult.Aborted -> {
+                    emit(AgentEvent.Failed(replay.reason))
+                    return
+                }
+                ReplayResult.Fallback -> Unit
             }
         }
 
@@ -343,18 +424,27 @@ class AgentLoop(
 
             when (action.action) {
                 "done" -> {
-                    if (skillEligible && trace.isNotEmpty()) skills.recordSuccess(goal, snap.pkg, trace)
+                    if (skillEligible && trace.isNotEmpty()) {
+                        persistSkill(goal, snap.pkg, trace, snap)
+                    }
                     Dbg.i(TAG, "done: ${action.summary} steps=$step skills=${trace.size}")
                     emit(AgentEvent.Finished(action.summary ?: "已完成"))
                     return
                 }
 
                 // 直达动作（Intent / 组件）成功过一次就算完成。
-                // 不判的话会重复发明同一个 Intent：实测「打开电池」连发 3 次直到死循环检测中止。
+                // ★ 完成判定不再看 history 里有没有 "ok" 字样（后台静默拦截也会写 ok），
+                //   而是看**启动回查结果**（VerifiedLauncher）+ 界面指纹是否真的变了（审核 F-02/P0-5）。
                 "shortcut", "component" -> {
-                    if (history.any { it.startsWith("直达") && it.contains("ok") }) {
-                        Dbg.i(TAG, "直达已执行过，判定完成：${action.summary}")
-                        if (skillEligible && trace.isNotEmpty()) skills.recordSuccess(goal, snap.pkg, trace)
+                    val prev = stepRecords.lastOrNull { it.launch != null }
+                    val launch = prev?.launch
+                    val confirmed = launch != null &&
+                        (launch.isOk || (launch is LaunchOutcome.Unknown && prev?.progressed == true))
+                    if (confirmed) {
+                        Dbg.i(TAG, "直达已确认到位（$launch），判定完成：${action.summary}")
+                        if (skillEligible && trace.isNotEmpty()) {
+                            persistSkill(goal, snap.pkg, trace, snap)
+                        }
                         emit(AgentEvent.Finished("已打开 ${action.summary ?: ""}"))
                         return
                     }
@@ -417,8 +507,19 @@ class AgentLoop(
                 }
             }
 
+            // 执行设备动作前再确认一次没被取消：runCatching/catch(Throwable) 吞掉取消信号时，
+            // 这里能挡住「用户点了停止还在点屏幕」（审核 F-11/C1）。
+            currentCoroutineContext().ensureActive()
             emit(AgentEvent.Acting(action.describe()))
             val ok = execute(action)
+            // 直达类动作的回查结果（open/shortcut/component 由 DeviceActions 写入），其他动作为 null。
+            val launchNow = if (action.action == "open" || action.action == "shortcut" ||
+                action.action == "component"
+            ) {
+                actions.lastLaunchOutcome
+            } else {
+                null
+            }
             Dbg.i(TAG, "step=$step result=${if (ok) "ok" else "fail"} nodes=${snap.nodes.size} pkg=${snap.pkg}")
 
             // 系统直调是一步到位的原子操作：成功即完成，失败即终止。
@@ -451,6 +552,13 @@ class AgentLoop(
             if (after != null) nextSnap = after
             val changed = after != null && screenKey(after) != screenKey(snap)
             val countsAsProgress = !uiAffecting(action) || changed
+            stepRecords += StepRecord(
+                action = action,
+                ok = ok,
+                progressed = changed,
+                launch = launchNow,
+                pkgAfter = after?.pkg,
+            )
 
             if (countsAsProgress) {
                 if (invalidStreak > 0) Dbg.i(TAG, "step=$step 界面有变化，无效动作计数清零")
@@ -963,6 +1071,20 @@ class AgentLoop(
                 val r = withContext(Dispatchers.IO) {
                     com.pilot.agent.sandbox.SandboxTerminal.run(ctx, arg)
                 }
+                // ★ 先看 status：非 DONE 就不是"正常执行完"，不要说成可用，也不要重跑（远端可能已有副作用）。
+                when (r.status) {
+                    com.pilot.agent.sandbox.SandboxTerminal.Status.UNAVAILABLE -> {
+                        emit(AgentEvent.Observe("终端不可用：${r.brief(200)}\n(exit=${r.exitCode})"))
+                        Dbg.w(TAG, "终端不可用 exit=${r.exitCode}: $arg")
+                        return false
+                    }
+                    com.pilot.agent.sandbox.SandboxTerminal.Status.UNKNOWN -> {
+                        emit(AgentEvent.Observe("终端命令已发出但结果未知（超时/断连），不会重试，请自行确认。\n${r.brief(200)}"))
+                        Dbg.w(TAG, "终端结果未知 exit=${r.exitCode}: $arg")
+                        return false
+                    }
+                    com.pilot.agent.sandbox.SandboxTerminal.Status.DONE -> Unit
+                }
                 // 非零退出但 stdout 有内容也算可用（实测 `df -h` 在华为上
                 // 个别挂载点 Permission denied → exit=1，但数据是好的）。
                 val usable = r.ok || r.output.isNotBlank()
@@ -1052,7 +1174,10 @@ class AgentLoop(
     }
 
     private suspend fun askUser(question: String, risk: Risk = Risk.NONE): Boolean {
-        if (!hasUi) {
+        // 读**自己这次运行**的 hasUi（RunCtx 挂在协程上下文里随调用链传递）：
+        // 被新任务抢占后，旧任务不会因为实例字段被改成 true 就冒出去弹确认（审核 F-11/C1）。
+        val uiAvailable = currentCoroutineContext()[RunCtx]?.hasUi ?: hasUi
+        if (!uiAvailable) {
             Dbg.w(TAG, "no ui attached, auto-deny: $question")
             emit(AgentEvent.Observe("无人可确认，已放弃：$question"))
             return false
@@ -1066,29 +1191,109 @@ class AgentLoop(
         return result
     }
 
-    private suspend fun replaySkill(goal: String): String? {
+    private suspend fun replaySkill(goal: String): ReplayResult {
         val pkg = reader.last()?.pkg.orEmpty()
         val skill = skills.match(goal, pkg)
         if (skill == null) {
             Dbg.i(TAG, "no skill matched pkg=$pkg")
-            return null
+            return ReplayResult.Fallback
         }
         Dbg.i(TAG, "skill hit goal=${skill.goal} steps=${skill.steps.size} successes=${skill.successes}")
         emit(AgentEvent.Observe("命中技能「${skill.goal}」（成功 ${skill.successes} 次），开始回放 ${skill.steps.size} 步"))
+
+        // 回放前若当前不在起点 App，且首步不是 open，先补一步 open，避免在错误界面点空（审核 S-04）。
+        if (skill.originPkg.isNotEmpty() && skill.originPkg != pkg &&
+            skill.steps.firstOrNull()?.action != "open"
+        ) {
+            emit(AgentEvent.Observe("先切回起点 App ${skill.originPkg}"))
+            if (!actions.openApp(skill.originPkg)) {
+                Dbg.i(TAG, "replay origin open failed pkg=${skill.originPkg}")
+                return ReplayResult.Fallback
+            }
+            delay(500)
+        }
+
         for (step in skill.steps) {
-            val snap = reader.capture() ?: return null
+            currentCoroutineContext().ensureActive()
+            val snap = reader.capture() ?: return ReplayResult.Fallback
+            // ★ 回放每一步都过 Guard + 确认，绝不因为「以前成功过」就跳过护栏（审核 S-01/P0-2）。
+            val guardAction = skillStepToGuardAction(step)
+            if (guardAction == null) {
+                Dbg.w(TAG, "技能回放遇到不可映射步骤 ${step.action}，转交模型")
+                return ReplayResult.Fallback
+            }
+            val risk = guard.riskOf(guardAction, snap)
+            if (risk != Risk.NONE) {
+                val go = askUser(
+                    "回放「${skill.goal}」中的「${guardAction.describe()}」—— 可能涉及${guard.riskLabel(risk)}，确认继续？",
+                    risk,
+                )
+                guard.audit(goal, guardAction, risk, go)
+                if (!go) {
+                    Dbg.i(TAG, "用户在回放中取消风险步骤")
+                    return ReplayResult.Aborted("已在回放中取消该操作")
+                }
+            }
             val ok = replayStep(step, snap)
             Dbg.i(TAG, "replay step=${step.action} label=${step.label} ok=$ok")
             if (!ok) {
+                skills.recordFailure(skill.id)
                 emit(AgentEvent.Observe("回放中断，转交模型重新规划"))
-                return null
+                return ReplayResult.Fallback
             }
             delay(400)
         }
+
+        // 回放结束比对完成界面指纹：不一致说明到的不是当初那个界面，交回模型（审核 S-06）。
+        if (skill.finalSignature.isNotEmpty()) {
+            val finalSnap = reader.capture()
+            val matched = finalSnap != null && skill.finalSignature.any { key ->
+                finalSnap.nodes.any { it.text.contains(key, ignoreCase = true) }
+            }
+            if (!matched) {
+                Dbg.i(TAG, "回放完成但界面指纹不一致，转交模型")
+                skills.recordFailure(skill.id)
+                emit(AgentEvent.Observe("回放结果与记录不一致，转交模型核对"))
+                return ReplayResult.Fallback
+            }
+        }
         skills.recordHit(skill.id)
         Dbg.i(TAG, "replay done goal=${skill.goal} steps=${skill.steps.size}")
-        return "${skill.goal.trim().trimEnd('。', '！', '!', '；', ';')}已完成"
+        return ReplayResult.Done("${skill.goal.trim().trimEnd('。', '！', '!', '；', ';')}已完成")
     }
+
+    /** 技能步骤 → Guard 可判定的 [AgentAction]（只为过护栏，不直接执行）。无法映射时返回 null。 */
+    private fun skillStepToGuardAction(step: SkillStep): AgentAction? = when (step.action) {
+        "tap_text" -> AgentAction(action = "tap_node", target = step.label, summary = step.label)
+        "input" -> AgentAction(action = "input", text = step.value)
+        "key" -> AgentAction(action = "key", target = step.label)
+        "open" -> AgentAction(action = "open", target = step.label, summary = step.label)
+        "shortcut" -> AgentAction(action = "shortcut", target = step.label, summary = step.label)
+        "component" -> AgentAction(action = "component", target = step.label, summary = step.label)
+        "scroll" -> AgentAction(action = "scroll", target = step.label)
+        "wait" -> AgentAction(action = "wait", ms = step.value.toLongOrNull()?.toInt() ?: 500)
+        else -> null
+    }
+
+    /**
+     * 沉淀一条成功轨迹。originPkg 取本次任务开始时用户所在的 App；finalSignature 取完成界面关键文字，
+     * 回放结束后用它比对，不一致即交回模型（审核 S-06）。
+     */
+    private fun persistSkill(goal: String, landingPkg: String, steps: List<SkillStep>, snap: ScreenSnapshot) {
+        if (steps.isEmpty()) return
+        val sig = signatureOf(snap)
+        val origin = runOriginPkg.orEmpty()
+        catchingNonCancel { skills.recordSuccess(goal, origin, landingPkg, steps, sig) }
+    }
+
+    /** 完成界面的关键文字：非空、非时钟、长度适中的前 5 条（去重）。 */
+    private fun signatureOf(s: ScreenSnapshot): List<String> =
+        s.nodes.asSequence()
+            .map { it.text.trim() }
+            .filter { it.isNotEmpty() && it.length <= 24 && !clockLike.matches(it) }
+            .distinct()
+            .take(5)
+            .toList()
 
     private suspend fun replayStep(step: SkillStep, snap: ScreenSnapshot): Boolean = when (step.action) {
         "tap_text" -> {

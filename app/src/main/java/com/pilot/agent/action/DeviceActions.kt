@@ -2,14 +2,19 @@ package com.pilot.agent.action
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.graphics.Path
 import android.os.Bundle
 import android.view.accessibility.AccessibilityNodeInfo
 import com.pilot.agent.Dbg
 import com.pilot.agent.perception.ScreenReader
+import com.pilot.agent.perception.UiNode
+import com.pilot.agent.runtime.catchingNonCancel
 import kotlin.coroutines.resume
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -36,6 +41,25 @@ class DeviceActions(
     @Volatile
     private var needPageTurn = false
 
+    /**
+     * 最近一次 open / shortcut / component 启动的**回查结果**（[VerifiedLauncher]）。
+     *
+     * Boolean 返回值为兼容旧调用方保留：true 只表示「前台已切换或无法否定」，
+     * 要播报「已打开」必须看这里是 [LaunchOutcome.Ok]；[LaunchOutcome.Unknown] 要如实说结果未知。
+     * 每次启动开始时重置为 null。
+     */
+    @Volatile
+    var lastLaunchOutcome: LaunchOutcome? = null
+        private set
+
+    /**
+     * 最近一次节点动作因「帧过期 / 节点已变化」被拒绝的原因；成功或非过期失败时为 null。
+     * AgentLoop 据此提示规划器「界面已变化，重新读屏」。
+     */
+    @Volatile
+    var lastStaleReason: String? = null
+        private set
+
     /** 系统能力直调（音量、亮度、电话），不发 Intent 也不点屏幕 */
     val systemOps: SystemOps by lazy { SystemOps(service) }
 
@@ -54,25 +78,43 @@ class DeviceActions(
             durationMs,
         )
 
-    /** 点节点：先 performAction，失败退坐标点击。 */
-    suspend fun tapNode(id: Int): Boolean {
-        val node = reader.node(id) ?: return false
+    /**
+     * 按 (帧号, 节点 id) 取**仍然有效**的节点。
+     * 帧已过期、节点消失、位置或文字变了都返回 null，并把原因写进 [lastStaleReason]。
+     * frameId 为 null 时按最新一帧解析（旧调用方语义），同样做新鲜度校验。
+     */
+    private fun liveNode(frameId: Long?, id: Int): Pair<AccessibilityNodeInfo, UiNode>? {
+        lastStaleReason = null
+        return when (val r = reader.lookup(frameId, id)) {
+            is ScreenReader.NodeLookup.Live -> r.node to r.ui
+            is ScreenReader.NodeLookup.Stale -> {
+                lastStaleReason = r.reason
+                Dbg.w(TAG, "拒绝执行过期节点：${r.reason}")
+                null
+            }
+        }
+    }
+
+    /** 点节点：先 performAction，失败退坐标点击（坐标取自同一帧且已校验未移动）。 */
+    suspend fun tapNode(id: Int, frameId: Long? = null): Boolean {
+        currentCoroutineContext().ensureActive()
+        val (node, ui) = liveNode(frameId, id) ?: return false
         val target = node.findClickableAncestor() ?: node
         if (target.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
         if (node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
-        val snap = reader.last()?.nodes?.firstOrNull { it.id == id } ?: return false
-        return tap(snap.cx, snap.cy)
+        return tap(ui.cx, ui.cy)
     }
 
-    suspend fun longPressNode(id: Int): Boolean {
-        val node = reader.node(id) ?: return false
+    suspend fun longPressNode(id: Int, frameId: Long? = null): Boolean {
+        currentCoroutineContext().ensureActive()
+        val (node, ui) = liveNode(frameId, id) ?: return false
         if (node.performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK)) return true
-        val snap = reader.last()?.nodes?.firstOrNull { it.id == id } ?: return false
-        return longPress(snap.cx, snap.cy)
+        return longPress(ui.cx, ui.cy)
     }
 
-    fun input(id: Int, text: String): Boolean {
-        val node = reader.node(id) ?: return false
+    /** 非 suspend：调用方（AgentLoop）执行前已做 ensureActive。 */
+    fun input(id: Int, text: String, frameId: Long? = null): Boolean {
+        val (node, _) = liveNode(frameId, id) ?: return false
         node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
         val args = Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
@@ -82,8 +124,8 @@ class DeviceActions(
         return false
     }
 
-    fun scroll(id: Int, forward: Boolean = true): Boolean {
-        val node = reader.node(id) ?: return false
+    fun scroll(id: Int, forward: Boolean = true, frameId: Long? = null): Boolean {
+        val (node, _) = liveNode(frameId, id) ?: return false
         val action = if (forward) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
         else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
         return node.performAction(action)
@@ -100,6 +142,7 @@ class DeviceActions(
     }
 
     suspend fun openApp(pkgOrName: String): Boolean {
+        lastLaunchOutcome = null
         val requested = pkgOrName.trim()
         if (requested == "终端" || requested.equals("Pilot 终端", ignoreCase = true) ||
             requested.equals("Pilot Terminal", ignoreCase = true)
@@ -108,14 +151,18 @@ class DeviceActions(
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             return startSafely(intent, service.packageName)
         }
-        val pkg = resolvePackage(pkgOrName) ?: return false
-        val intent = service.packageManager.getLaunchIntentForPackage(pkg) ?: return false
+        val pkg = resolvePackage(pkgOrName) ?: run {
+            lastLaunchOutcome = LaunchOutcome.Failed(ActivityNotFoundException("没有找到应用「$pkgOrName」"))
+            return false
+        }
+        val intent = service.packageManager.getLaunchIntentForPackage(pkg) ?: run {
+            lastLaunchOutcome = LaunchOutcome.Failed(ActivityNotFoundException("「$pkgOrName」没有启动入口"))
+            return false
+        }
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        if (startSafely(intent, pkg)) return true
-        // ★ 后台启动被拦（HarmonyOS HwASInterceptor）→ 用**无障碍手势**把 App 拉到前台。
-        //   语音场景下 agent 几乎总在后台，没有这条兜底就什么都做不了。
-        //   手法：从屏幕底部往上滑 → 系统 App 抽屉/最近任务 → 点目标 App 图标。
-        return launchViaLauncherGesture(pkg, pkgOrName)
+        // ★ 后台启动被拦时的降级（悬浮窗豁免 → 回桌面重试 → 系统搜索 → 桌面图标手势）
+        //   全部在 startSafely 内部按顺序做一次（审核 D-06：以前这里还会再翻一遍桌面）。
+        return startSafely(intent, pkg)
     }
 
     /**
@@ -287,30 +334,30 @@ class DeviceActions(
      * 别发一个没人接的 Intent 然后误判成功（这个坑实测过：规则重复决策到死循环）。
      */
     suspend fun openShortcut(actionOrUri: String): Boolean {
+        lastLaunchOutcome = null
         val intent = if (actionOrUri.contains("://")) {
             Intent(Intent.ACTION_VIEW, android.net.Uri.parse(actionOrUri))
         } else {
             Intent(actionOrUri)
         }.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        if (startSafely(intent)) return true
-        // 后台被拦：Intent 里带包名的话走抽屉手势；查不到就放弃
-        val pkg = intent.`package` ?: intent.component?.packageName
-        val label = pkg?.let { p ->
-            runCatching {
-                val info = service.packageManager.getPackageInfo(p, 0)
-                service.packageManager.getApplicationLabel(info.applicationInfo ?: return@runCatching "").toString()
-            }.getOrNull()
-        }
-        return if (pkg != null && label != null) launchViaLauncherGesture(pkg, label) else false
+        // 后台被拦时的降级（含桌面图标手势）已在 startSafely 内部做过一次，这里不再重复（审核 D-06）。
+        return startSafely(intent)
     }
 
     /** 启动指定组件（App 内入口，来自 [AppLaunchIndex]） */
     suspend fun launchComponent(pkg: String, cls: String): Boolean {
+        lastLaunchOutcome = null
         val intent = Intent().setComponent(android.content.ComponentName(pkg, cls))
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         if (startSafely(intent, pkg)) return true
         // 直达起不来（实测：华为系统组件要 ACCESS_INTERFACE 之类的应用签名权限，
         // 抛 SecurityException）→ 降级为打开该 App 主入口，让后续点击/规划接着干。
+        // ★ 只有「系统明确拒绝 / 没有 Activity」才降级；后台拦截（Blocked）在 startSafely 里
+        //   已经把整条降级链走过一遍，再来一遍只会把桌面再翻一次（审核 D-06）。
+        val first = lastLaunchOutcome
+        val denied = first is LaunchOutcome.Failed ||
+            (first is LaunchOutcome.Blocked && first.reason.startsWith(VerifiedLauncher.REASON_DENIED))
+        if (!denied) return false
         val launch = service.packageManager.getLaunchIntentForPackage(pkg)
             ?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) ?: return false
         Dbg.i(TAG, "组件直达失败，降级打开 $pkg 主入口")
@@ -318,34 +365,28 @@ class DeviceActions(
     }
 
     /**
-     * startActivity + **焦点窗口回查**。
+     * startActivity + **回查**（统一走 [VerifiedLauncher]），结果写入 [lastLaunchOutcome]。
      *
      * ★ HarmonyOS / EMUI 的后台 Activity 拦截是**静默失败**：startActivity 不抛异常，
      * logcat 里只有 `activity start fail: Background activity start`（HANDOFF 坑 #18）。
-     * 无头路径里 `runCatching{}.isSuccess` 全是假成功。所以起完回查前台包名：
+     * 无头路径里 `runCatching{}.isSuccess` 全是假成功。所以起完回查前台应用窗口：
      * 换过去了才算成功。expectPkg 为 null 时用 resolveActivity 的命中包推。
+     *
+     * 返回值语义（兼容旧调用方）：
+     * - true：回查确认到达（Ok），或前台切到了别的界面 / 目标本来就在前台（Unknown，交给下一轮重感知）；
+     * - false：没有 Activity、系统拒绝，或整条降级链都没能把目标拉到前台。
      */
     private suspend fun startSafely(intent: Intent, expectPkg: String? = null): Boolean {
+        currentCoroutineContext().ensureActive()
+        lastLaunchOutcome = null
         val pm = service.packageManager
         val hit = pm.resolveActivity(intent, 0)
         if (hit == null) {
             Dbg.w(TAG, "没有 Activity 能接这个 Intent: ${intent.action ?: intent.component}")
+            lastLaunchOutcome = LaunchOutcome.Failed(ActivityNotFoundException("没有应用能处理这个请求"))
             return false
         }
         val target = expectPkg ?: hit.activityInfo.packageName
-        val before = foregroundPackage()
-        val started = runCatching { service.startActivity(intent) }
-            .onFailure {
-                Dbg.w(TAG, "启动失败 ${it.javaClass.simpleName}: ${it.message}")
-                // 设置页被系统拒绝（未导出）就记下来，下次别再撞墙
-                if (it is SecurityException && intent.action != null) {
-                    SettingsShortcuts.markDead(intent.action!!)
-                }
-            }
-            .isSuccess
-        if (!started) return false
-        // 目标本来就在前台（同包内换页），回查不出差别，放行
-        if (before == target) return true
 
         // ★ 判「启动成没成」的判据：前台到底动没动，而不是「多久之内到前台」。
         //   2026-11-11 实测（P40 / HarmonyOS 4.0）：force-stop 目标 App 后调 startActivity，
@@ -353,33 +394,66 @@ class DeviceActions(
         //   而早先的判据是 rootInActiveWindow + 1.2 秒超时，窗口切换期 root 返回 null，
         //   null 被当成「前台没动」→ 把「冷启动慢」误判成「被系统拦截」→
         //   白走一遍桌面翻屏（10 秒，还可能翻不到）。别再按老结论下判断。
-        when (awaitTransition(target, 6000L)) {
-            Transition.REACHED -> return true
-            // 前台换了但还没落在目标包（冷启动过渡页、系统权限弹窗挡在前面）——
-            // 这是"起来了"，交给下一轮重感知去处理真实界面。
-            Transition.MOVED -> {
-                if (awaitForeground(target, 1500L)) return true
-                Dbg.i(TAG, "前台已切换（未落在 $target），按启动成功处理")
+        when (val first = VerifiedLauncher.launch(service, intent, target, 6000L)) {
+            LaunchOutcome.Ok -> {
+                lastLaunchOutcome = first
                 return true
             }
-            Transition.STUCK -> Unit
+            LaunchOutcome.Unknown -> {
+                // 前台切到了别的界面（冷启动过渡页、权限 / 关联启动弹窗挡在前面），或目标本来就在前台。
+                // 这是「起来了但没确认」：交给下一轮重感知处理真实界面，不再重复启动（避免重复副作用）。
+                // 目标此刻就在前台 → 事实上已经打开，记为 Ok。
+                if (awaitForeground(target, 1500L)) {
+                    lastLaunchOutcome = LaunchOutcome.Ok
+                } else {
+                    Dbg.i(TAG, "前台已变化但未落在 $target，结果未确认")
+                    lastLaunchOutcome = first
+                }
+                return true
+            }
+            is LaunchOutcome.Failed -> {
+                lastLaunchOutcome = first
+                return false
+            }
+            is LaunchOutcome.Blocked -> {
+                if (first.reason.startsWith(VerifiedLauncher.REASON_DENIED)) {
+                    // 设置页被系统拒绝（未导出）就记下来，下次别再撞墙
+                    intent.action?.let { SettingsShortcuts.markDead(it) }
+                    lastLaunchOutcome = first
+                    return false
+                }
+                // 6 秒内前台确实没换过：往下走降级链
+            }
         }
 
         // 走到这里说明 6 秒内前台确实没换过，才轮到兜底。
         // （历史上这里写的是「后台启动被拦 → 桌面翻屏」，那个结论是误判，见上面注释。）
         //
+        // ★ 第 0 步：悬浮窗「可见窗口豁免」（BackgroundLauncher），不打断用户当前界面。
+        if (OverlayGate.canDraw(service)) {
+            val viaOverlay = BackgroundLauncher.launch(service, intent, target, 4000L)
+            if (viaOverlay !is LaunchOutcome.Blocked) {
+                lastLaunchOutcome = viaOverlay
+                return viaOverlay.isOk || viaOverlay === LaunchOutcome.Unknown
+            }
+        }
+
         // ★ 先做一次"回桌面再来一遍"：目标 App 的任务栈可能停在某个奇怪状态，
         //   系统没把它带到前台（实测设置页就卡过：startActivity 成功但窗口不动）。
         //   回桌面等于换一个干净的起点，比去搜索页乱点靠谱。
         Dbg.w(TAG, "启动未生效，回桌面后重试一次：$target")
         service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
         delay(600)
-        if (runCatching { service.startActivity(intent) }.isSuccess) {
-            when (awaitTransition(target, 4000L)) {
-                Transition.REACHED -> return true
-                Transition.MOVED -> return true
-                Transition.STUCK -> Unit
+        when (val retry = VerifiedLauncher.launch(service, intent, target, 4000L)) {
+            LaunchOutcome.Ok, LaunchOutcome.Unknown -> {
+                lastLaunchOutcome = retry
+                return true
             }
+            is LaunchOutcome.Failed -> {
+                lastLaunchOutcome = retry
+                return false
+            }
+            is LaunchOutcome.Blocked -> Unit
         }
         Dbg.w(TAG, "目标 $target 未在预算内到达前台，尝试系统搜索拉起")
         // 桌面图标上显示的是**应用 label**（设置 / 蓝牙 / 手机管家），不是包名。
@@ -389,10 +463,18 @@ class DeviceActions(
         }.getOrDefault(target)
         // 首选「系统搜索」：桌面下滑 → 输入应用名 → 回车，一次直达，不受图标在第几屏、
         // 是否被塞进文件夹影响（华为把一堆系统应用收进了大文件夹）。
-        if (globalSearch(displayLabel, target, listOf("已安装的应用", "应用"))) return true
+        // globalSearch / launchViaLauncherGesture 内部都以「前台到达目标包」为成功判据。
+        if (globalSearch(displayLabel, target, listOf("已安装的应用", "应用"))) {
+            lastLaunchOutcome = LaunchOutcome.Ok
+            return true
+        }
         // 最后手段才是翻屏点图标。
-        if (launchViaLauncherGesture(target, displayLabel)) return awaitForeground(target, 2500L)
+        if (launchViaLauncherGesture(target, displayLabel)) {
+            lastLaunchOutcome = LaunchOutcome.Ok
+            return true
+        }
         Dbg.w(TAG, "搜索和桌面图标都没能把 $target 拉到前台")
+        lastLaunchOutcome = LaunchOutcome.Blocked("多种方式都没能把「$displayLabel」拉到前台，可能被系统后台启动限制拦截")
         return false
     }
 
@@ -514,7 +596,7 @@ class DeviceActions(
         for ((idx, cand) in list.take(3).withIndex()) {
             delay(RESULT_SETTLE_MS)
             val pageBefore = foregroundPackage()
-            val clicked = runCatching { clickNodeOrParent(cand) }.getOrDefault(false)
+            val clicked = catchingNonCancel { clickNodeOrParent(cand) }.getOrDefault(false)
             Dbg.i(TAG, "全局搜索：点候选#${idx + 1}「${cand.text ?: cand.contentDescription}」-> $clicked")
             if (!clicked) continue
             if (expectPkg != null) {

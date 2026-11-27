@@ -110,6 +110,13 @@ object AgentRuntime {
                 Dbg.i("PilotVoice", "打断：停止播报（触发词=$word）")
                 runCatching { speaker.stop() }
             }
+            // ★ AI 回完一句 → 自动切回聆听态（免唤醒连续对话）。
+            //   挂在 Runtime 而不是 ViewModel 的轮询上：界面退到后台、ViewModel 已经
+            //   onCleared 时，语音这条链路照样要能接着听。
+            //   VoiceInput 内部会核对待命/免打扰/回声保护，不该听的时候自己跳过。
+            speaker.onSpeechDone = {
+                v.enterConversationListening("播报结束")
+            }
             voiceInput = v
         }
     }

@@ -3,6 +3,7 @@ package com.pilot.agent.action
 import android.content.Context
 import android.graphics.PixelFormat
 import android.os.Build
+import android.os.Looper
 import android.provider.Settings
 import android.view.Gravity
 import android.view.View
@@ -17,15 +18,17 @@ import com.pilot.agent.Dbg
  * 起 Activity 会被放行（这是给输入法、悬浮球这类工具的口子）。
  * Pilot 已有 SYSTEM_ALERT_WINDOW 权限，可以借这个口子当「后台启动通行证」。
  *
- * ## 为什么不用它当主路径
- * 悬浮窗要用户手动去设置里开「显示在其他应用上层」，一步摩擦。
- * 所以主路径是 AlarmManager（系统代发，零摩擦），这个是兜底。
- *
- * 用完立即 removeView——只是瞬时提权，不是常驻悬浮窗。
+ * ## 使用约束
+ * - 只是降级手段：由 [BackgroundLauncher] 在「前台确实没切过去」时调用，启动结果仍由
+ *   [VerifiedLauncher] 回查，不再以「悬浮窗挂上了 / startActivity 没抛异常」当成功。
+ * - [show] / [hide] 必须在**主线程**调用（WindowManager.addView 需要 Looper）；
+ *   在其他线程调用直接返回 false，不会崩。
+ * - 用完立即 removeView——只是瞬时提权，不是常驻悬浮窗。
  */
 object OverlayGate {
 
     private const val TAG = "PilotOverlay"
+    private val lock = Any()
     private var windowManager: WindowManager? = null
     private var view: View? = null
 
@@ -37,46 +40,59 @@ object OverlayGate {
     }
 
     fun show(context: Context): Boolean {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            Dbg.w(TAG, "show 必须在主线程调用，已忽略")
+            return false
+        }
         if (!canDraw(context)) return false
-        if (view != null) return true
-        return try {
-            val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
-            val v = View(context)
-            val params = WindowManager.LayoutParams(
-                1, 1,
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-                } else {
-                    @Suppress("DEPRECATION")
-                    WindowManager.LayoutParams.TYPE_PHONE
-                },
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                PixelFormat.TRANSLUCENT,
-            ).apply { gravity = Gravity.TOP or Gravity.START }
+        synchronized(lock) {
+            if (view != null) return true
+            return try {
+                val app = context.applicationContext ?: context
+                val wm = app.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                val v = View(app)
+                val params = WindowManager.LayoutParams(
+                    1, 1,
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                    } else {
+                        @Suppress("DEPRECATION")
+                        WindowManager.LayoutParams.TYPE_PHONE
+                    },
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                    PixelFormat.TRANSLUCENT,
+                ).apply { gravity = Gravity.TOP or Gravity.START }
 
-            wm.addView(v, params)
-            windowManager = wm
-            view = v
-            Dbg.i(TAG, "可见窗口闸门已开")
-            true
-        } catch (t: Throwable) {
-            Dbg.w(TAG, "闸门开启失败 ${t.message}")
-            false
+                wm.addView(v, params)
+                windowManager = wm
+                view = v
+                Dbg.i(TAG, "可见窗口闸门已开")
+                true
+            } catch (t: Throwable) {
+                Dbg.w(TAG, "闸门开启失败 ${t.message}")
+                false
+            }
         }
     }
 
-    fun hide(context: Context) {
-        val v = view ?: return
-        val wm = windowManager ?: return
-        view = null
-        windowManager = null
-        try {
-            wm.removeView(v)
-            Dbg.i(TAG, "可见窗口闸门已关")
-        } catch (t: Throwable) {
-            Dbg.w(TAG, "闸门关闭失败 ${t.message}")
+    fun hide(@Suppress("UNUSED_PARAMETER") context: Context) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            Dbg.w(TAG, "hide 必须在主线程调用，已忽略")
+            return
+        }
+        synchronized(lock) {
+            val v = view ?: return
+            val wm = windowManager ?: return
+            view = null
+            windowManager = null
+            try {
+                wm.removeView(v)
+                Dbg.i(TAG, "可见窗口闸门已关")
+            } catch (t: Throwable) {
+                Dbg.w(TAG, "闸门关闭失败 ${t.message}")
+            }
         }
     }
 }

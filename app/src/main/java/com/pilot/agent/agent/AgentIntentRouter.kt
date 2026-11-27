@@ -1,7 +1,10 @@
 package com.pilot.agent.agent
 
+import com.pilot.agent.runtime.rethrowIfCancellation
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.add
@@ -52,26 +55,34 @@ class AgentIntentRouter(private val settingsProvider: () -> AgentSettings) {
         val s = settingsProvider()
         if (!s.cloudReady) throw Planner.Unavailable("未配置云端模型 API Key")
 
-        var lastError: Throwable? = null
-        repeat(2) {
-            try {
-                val content = call(
+        // 只在输出无法解析时重试；取消信号原样抛出，网络错误不重试（审核 F-01 / C4）
+        var parseError: Throwable? = null
+        for (attempt in 0 until 2) {
+            currentCoroutineContext().ensureActive()
+            val content = try {
+                call(
                     s = s,
                     text = text,
                     history = history,
                     memoryContext = memoryContext,
                     now = now,
-                    retryHint = lastError?.message,
+                    retryHint = parseError?.message,
                 )
+            } catch (t: Throwable) {
+                rethrowIfCancellation(t)
+                throw Planner.Unavailable(t.message ?: "Agent 首轮决策失败")
+            }
+            try {
                 return@withContext parse(content)
             } catch (t: Throwable) {
-                lastError = t
+                rethrowIfCancellation(t)
+                parseError = t
             }
         }
-        throw Planner.Unavailable(lastError?.message ?: "Agent 首轮决策失败")
+        throw Planner.Unavailable(parseError?.message ?: "Agent 首轮决策失败")
     }
 
-    private fun call(
+    private suspend fun call(
         s: AgentSettings,
         text: String,
         history: List<Pair<String, String>>,
