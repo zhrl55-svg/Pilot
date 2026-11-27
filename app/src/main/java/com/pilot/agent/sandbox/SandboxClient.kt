@@ -72,7 +72,15 @@ object SandboxClient {
             val out = data?.getString("out").orEmpty()
             val exit = data?.getInt("exit") ?: -1
             val ms = data?.getLong("ms") ?: 0L
-            deliver(jobId, SandboxTerminal.Result(out, exit, ms))
+            // AIDL 只回传 exitCode：把哨兵退出码还原成明确的 status。
+            // ★ 超时被远端中止时 exit=124(EXIT_UNKNOWN)，旧代码重建 Result 时默认 status=DONE，
+            //   上层就会当成「正常执行完但是非零退出」，把结果未知误报成可用。未启动(-4)同理。
+            val status = when (exit) {
+                SandboxTerminal.EXIT_UNKNOWN -> SandboxTerminal.Status.UNKNOWN
+                SandboxTerminal.EXIT_UNAVAILABLE -> SandboxTerminal.Status.UNAVAILABLE
+                else -> SandboxTerminal.Status.DONE
+            }
+            deliver(jobId, SandboxTerminal.Result(out, exit, ms, status))
         }
     }
 

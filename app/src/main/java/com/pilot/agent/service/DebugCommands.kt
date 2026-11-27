@@ -47,7 +47,7 @@ internal object DebugCommands {
     private val STRING_KEYS = listOf(
         "fastpath_owner", "fastpath_compare", "reminder_cancel", "memory_delete_id",
         "memory_forget", "fastpath_fill_test", "set_netease_cookie", "tts_test", "tts_engine",
-        "asr_test", "llm_test", "sandbox_test", "voice_test", "simulate_nav",
+        "asr_test", "llm_test", "sandbox_test", "sandbox_timeout_ms", "voice_test", "simulate_nav",
     )
     private val BOOL_KEYS = listOf("kws_test", "import_models", "log_verbose")
 
@@ -312,14 +312,16 @@ internal object DebugCommands {
         //   --es sandbox_test "uname -a; echo PILOT_SANDBOX_OK"
         val sandboxTest = intent.getStringExtra("sandbox_test")?.trim()
         if (!sandboxTest.isNullOrEmpty()) {
+            // 可选：--es sandbox_timeout_ms 60000 —— 验证「超时返回结果未知」用；默认 420s。
+            val timeoutMs = intent.getStringExtra("sandbox_timeout_ms")?.toLongOrNull() ?: 420_000L
             Thread {
                 val term = com.pilot.agent.sandbox.SandboxTerminal
                 term.init(app)
                 runBlocking {
-                    val r = term.run(app, sandboxTest, timeoutMs = 420_000)
+                    val r = term.run(app, sandboxTest, timeoutMs = timeoutMs)
                     Dbg.i(
                         TAG,
-                        "沙箱自检 exit=${r.exitCode} ${r.durationMs}ms " +
+                        "沙箱自检 status=${r.status} exit=${r.exitCode} ${r.durationMs}ms " +
                             "mode=${com.pilot.agent.sandbox.SandboxClient.mode()} " +
                             LogRedactor.text("out", r.output.take(400)),
                     )
