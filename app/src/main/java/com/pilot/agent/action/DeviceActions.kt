@@ -215,7 +215,8 @@ class DeviceActions(
                     }
                 }.getOrDefault(false)
                 Dbg.i(TAG, "桌面第 ${page?.first ?: screen} 屏点击「$label」-> $ok (页数上限 $limit)")
-                if (ok && awaitForeground(pkg, 2500L)) return true
+                // 冷启动设置主页实测要约 3.8s 才到前台，2.5s 会把成功判成失败。
+                if (ok && awaitForeground(pkg, 4000L)) return true
             }
 
             // 往下一屏滑。★ 必须验证「真的翻页了」：
@@ -461,19 +462,23 @@ class DeviceActions(
             val info = service.packageManager.getPackageInfo(target, 0)
             service.packageManager.getApplicationLabel(info.applicationInfo ?: return@runCatching "").toString()
         }.getOrDefault(target)
-        // 首选「系统搜索」：桌面下滑 → 输入应用名 → 回车，一次直达，不受图标在第几屏、
-        // 是否被塞进文件夹影响（华为把一堆系统应用收进了大文件夹）。
-        // globalSearch / launchViaLauncherGesture 内部都以「前台到达目标包」为成功判据。
-        if (globalSearch(displayLabel, target, listOf("已安装的应用", "应用"))) {
-            lastLaunchOutcome = LaunchOutcome.Ok
-            return true
-        }
-        // 最后手段才是翻屏点图标。
+        // 先试「桌面图标手势」：由**桌面（系统应用）**去启动目标，后台也能放行；
+        // 比系统搜索更确定（搜索页会先被拉起、联想列表还可能点到网页卡片）。
         if (launchViaLauncherGesture(target, displayLabel)) {
             lastLaunchOutcome = LaunchOutcome.Ok
             return true
         }
-        Dbg.w(TAG, "搜索和桌面图标都没能把 $target 拉到前台")
+        // 再退到「系统搜索」：桌面下滑 → 输入应用名 → 点联想/提交。
+        if (globalSearch(displayLabel, target, listOf("已安装的应用", "应用"))) {
+            lastLaunchOutcome = LaunchOutcome.Ok
+            return true
+        }
+        // 搜索没成功时可能把用户留在搜索页：按一次返回回到桌面，别把搜索页丢给用户。
+        if (foregroundPackage() != target) {
+            runCatching { service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK) }
+            delay(300)
+        }
+        Dbg.w(TAG, "桌面图标和系统搜索都没能把 $target 拉到前台")
         lastLaunchOutcome = LaunchOutcome.Blocked("多种方式都没能把「$displayLabel」拉到前台，可能被系统后台启动限制拦截")
         return false
     }

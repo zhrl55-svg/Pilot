@@ -50,6 +50,9 @@ object VerifiedLauncher {
     private const val TAG = "PilotLaunch"
     private const val POLL_MS = 100L
 
+    /** 目标出现在前台后，需再稳定停留这么久才算真正打开（防 HarmonyOS “闪一下就撤”）。 */
+    private const val STABLE_MS = 600L
+
     /**
      * [LaunchOutcome.Blocked.reason] 的前缀：系统以 SecurityException 明确拒绝（未导出、缺签名权限）。
      * 这种情况重试/降级都没有意义，调用方可据此直接放弃。
@@ -96,8 +99,18 @@ object VerifiedLauncher {
             val now = probe.foreground()
             if (now != null && target != null && now == target) {
                 if (now != beforePkg) {
-                    Dbg.i(TAG, "前台切到 $target 用时 ${waited}ms")
-                    return LaunchOutcome.Ok
+                    // ★ 稳定确认：HarmonyOS 冷启动「设置主页」这类受保护页面时，会先把目标
+                    //   闪到前台 ~300ms 再撤下（后台启动限制的“假放行”）。只看瞬态就回 Ok
+                    //   会谎报成功，并让上层错过真正的兜底（桌面图标手势）。等一小段再确认仍在目标。
+                    delay(STABLE_MS)
+                    val still = probe.foreground()
+                    if (still == target) {
+                        Dbg.i(TAG, "前台切到 $target 并稳定 用时 ${waited + STABLE_MS}ms")
+                        return LaunchOutcome.Ok
+                    }
+                    Dbg.w(TAG, "前台短暂出现 $target 后又变成 $still，判定未真正打开")
+                    movedElsewhere = still
+                    continue
                 }
                 // 目标本来就在前台（同包内跳页）：看窗口指纹有没有变
                 val win = probe.windowFingerprint()
