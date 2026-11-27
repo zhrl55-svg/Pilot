@@ -140,12 +140,15 @@ class NewsSearchTool : QueryTool {
     private fun normalizeQuery(goal: String): String {
         var q = goal.trim()
         val prefixes = listOf(
-            "帮我搜一下", "帮我搜索", "搜一下", "搜索一下", "搜索", "搜", "查一下", "查查", "查询",
-            "看看", "找一下", "帮我找", "请搜", "请查", "最新的", "最新", "最近的", "最近",
+            "帮我搜一下", "帮我搜索", "你再搜一下", "你再搜", "你再", "再搜一下",
+            "搜一下", "搜索一下", "搜索", "搜", "查一下", "查查", "查询",
+            "看看", "找一下", "帮我找", "请搜", "请查", "一下", "麻烦", "帮我", "请",
+            "最新的", "最新", "最近的", "最近",
         )
         prefixes.forEach { prefix ->
             if (q.startsWith(prefix, ignoreCase = true)) q = q.removePrefix(prefix).trim()
         }
+        q = q.replace(Regex("\\s+"), " ")
         q = q.replace(Regex("最近有什么|最近发生|有什么|最新的?|最近的?|动态|资讯|新闻|消息|热点|头条"), " ")
         q = q.removeSuffix("新闻").let { base -> if (goal.contains("新闻") && base.isNotBlank()) "$base 新闻" else base }
         q = q.trim(' ', '，', ',', '。', '.', '？', '?', '！', '!')

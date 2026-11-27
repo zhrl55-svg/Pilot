@@ -1505,6 +1505,12 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         fallbackKind: IntentGate.Kind,
     ) {
         if (running) return
+        // 强查询（新闻/资讯/网页搜索，且未指定 App、未要求“给我看”）优先走查询通道：
+        // 规则判定优先于模型的执行判定，避免被当成「打开浏览器去搜」。
+        if (IntentGate.isStrongQuery(text)) {
+            runStrongQuery(text)
+            return
+        }
         val current = AgentSettings.load()
         if (!current.cloudReady) {
             Dbg.i(TAG, "agent router fallback: cloud unavailable")
@@ -1557,6 +1563,37 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             }
             Dbg.i(TAG, "agent router -> reply chars=${answer.length} thought=${decision.thought}")
             finishDirectAnswer(text, answer)
+        }
+    }
+
+    /**
+     * 强查询直达：不问模型「要不要执行」，直接走 QueryEngine（新闻→news_search，一般网页→web_search）。
+     * 查不到时如实说明，不转去打开浏览器执行。
+     */
+    private fun runStrongQuery(text: String) {
+        if (running) return
+        running = true
+        justSent = true
+        activeTaskLabel = "查询"
+        publishNotificationStatus()
+        add(LogEntry.Kind.THINK, "正在查询…")
+        dispatchJob = viewModelScope.launch {
+            val answer = try {
+                com.pilot.agent.query.QueryEngine.handle(text)
+            } catch (c: kotlinx.coroutines.CancellationException) {
+                throw c
+            } catch (t: Throwable) {
+                Dbg.w(TAG, "强查询失败：${t.message}")
+                null
+            }
+            running = false
+            justSent = false
+            activeTaskLabel = ""
+            publishNotificationStatus()
+            dispatchJob = null
+            val clean = answer?.trim()?.takeIf { it.isNotBlank() }
+                ?: "没能查到「$text」的最新结果，可能是网络不可用或暂时没有相关内容。"
+            finishDirectAnswer(text, clean)
         }
     }
 

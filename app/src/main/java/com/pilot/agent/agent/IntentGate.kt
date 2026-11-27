@@ -163,6 +163,42 @@ object IntentGate {
         "拨号", "打电话", "分享", "截图", "截屏", "安装", "卸载", "删除", "设置",
     )
 
+    /** 用户明确要“亲眼看网页”：这属于执行（打开给我看），不走查询通道。 */
+    private val VISIBLE_WEB_HINTS = listOf(
+        "给我看", "让我看", "我要看", "我想看", "打开给我看", "打开网页给我看", "显示网页",
+    )
+
+    /**
+     * 「在淘宝搜耳机」「用微博搜新闻」这类**指定了 App 的搜索**是执行，不是查询。
+     * 保留模型对这类请求的执行判断。
+     */
+    private val APP_SCOPED_SEARCH = Regex(
+        "(在|用|到)[^，。！？\\s]{1,14}(里|上|中)?\\s*(搜|搜索|查|查找)",
+    )
+
+    fun isAppScopedSearch(text: String): Boolean {
+        val t = text.trim()
+        if (t.isEmpty()) return false
+        if (APP_SCOPED_SEARCH.containsMatchIn(t)) return true
+        // 「打开微博搜新闻」：有打开/进入/启动 + 搜/查
+        return (t.contains("打开") || t.contains("进入") || t.contains("启动")) &&
+            (t.contains("搜") || t.contains("查"))
+    }
+
+    /**
+     * 强查询：新闻/资讯/热点/最新动态，或明确的网页搜索，且**没有**指定 App、**没有**“给我看”。
+     * 这类请求必须走查询通道（news_search / web_search），规则判定优先于模型的执行判定。
+     */
+    fun isStrongQuery(text: String): Boolean {
+        val t = text.trim()
+        if (t.isEmpty()) return false
+        if (isAppScopedSearch(t)) return false
+        if (VISIBLE_WEB_HINTS.any { t.contains(it) }) return false
+        return LIVE_INFO_HINTS.any(t::contains) ||
+            WEB_SEARCH_HINTS.any(t::contains) ||
+            looksLikeTrainQuery(t)
+    }
+
     /** 纯交流的开头，命中就不当成任务 */
     private val CHAT_PREFIX = listOf(
         "你是谁", "你叫", "你能做什么", "你会", "你好", "在吗", "在不在",
@@ -197,6 +233,8 @@ object IntentGate {
         // 泛化查询词把它误判成数据查询。
         if (selfAsk) return Kind.CHAT
         if (looksLikeTrainQuery(t)) return Kind.QUERY
+        // 指定了 App 的搜索（在淘宝搜耳机 / 打开微博搜新闻）是执行，不是查询。
+        if (isAppScopedSearch(t)) return Kind.TASK
         if (LIVE_INFO_HINTS.any(t::contains) && DEVICE_ACTION_HINTS.none(t::contains)) return Kind.QUERY
         if (t.contains("https://", ignoreCase = true) && listOf("网页", "链接", "文章", "总结", "阅读", "读一下", "浏览").any(t::contains)) return Kind.QUERY
         if (WEB_SEARCH_HINTS.any(t::contains) && DEVICE_ACTION_HINTS.none(t::contains)) return Kind.QUERY

@@ -240,6 +240,19 @@ internal fun dispatchBackgroundGoal(
     //   判定要联网，必须在后台线程跑，不能阻塞广播回调（10 秒 ANR）。
     Thread {
         val kind = com.pilot.agent.agent.IntentGate.classify(goal)
+        // ★ 强查询（新闻/资讯/网页搜索，且未指定 App、未要求“给我看”）优先走查询通道，
+        //   不让模型的「回答/执行」判定把它变成打开浏览器去搜。规则优先。
+        if (com.pilot.agent.agent.IntentGate.isStrongQuery(goal)) {
+            Dbg.i(TAG, "强查询优先走查询通道，跳过模型判定：${LogRedactor.text("goal", goal)}")
+            val answer = runCatching {
+                runBlocking { com.pilot.agent.query.QueryEngine.handle(goal) }
+            }.getOrNull()
+                ?: "没能查到「$goal」的最新结果，可能是网络不可用或暂时没有相关内容。"
+            val summary = com.pilot.agent.query.QueryEngine.speechSummary(answer)
+            if (summary != null) AgentRuntime.speaker.speakExpanded(summary)
+            else AgentRuntime.speaker.speak(answer)
+            return@Thread
+        }
         val settings = com.pilot.agent.agent.AgentSettings.load()
         val decision = if (settings.cloudReady) {
             val now = java.text.SimpleDateFormat("yyyy年M月d日 EEEE HH:mm", java.util.Locale.CHINA)

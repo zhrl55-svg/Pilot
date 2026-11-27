@@ -118,16 +118,25 @@ object QueryEngine {
                 QueryResult.Unavailable("12306 查询失败，请稍后再试。")
             })
         }
-        val tool = tools.firstOrNull { it.matches(goal) } ?: return null
-        if (tool !== trainTool) trainTool.discardPending()
-        Dbg.i(TAG, "用 ${tool.name} 处理查询（${goal.length} 字符）")
-        return record(try {
-            tool.executeResult(goal)
-        } catch (t: Throwable) {
-            if (t is kotlinx.coroutines.CancellationException) throw t
-            Dbg.e(TAG, "${tool.name} 执行失败：${t.message}")
-            QueryResult.Unavailable("查询失败：${t.javaClass.simpleName}")
-        })
+        val matches = tools.filter { it.matches(goal) }
+        if (matches.isEmpty()) return null
+        if (matches.first() !== trainTool) trainTool.discardPending()
+        // 按顺序尝试所有匹配的查询工具：news_search 没结果时继续试 web_search，
+        // 而不是直接返回 null 让上层转去打开浏览器执行。
+        var last: QueryResult? = null
+        for (tool in matches) {
+            Dbg.i(TAG, "用 ${tool.name} 处理查询（${goal.length} 字符）")
+            val result = try {
+                tool.executeResult(goal)
+            } catch (t: Throwable) {
+                if (t is kotlinx.coroutines.CancellationException) throw t
+                Dbg.e(TAG, "${tool.name} 执行失败：${t.message}")
+                QueryResult.Unavailable("查询失败：${t.javaClass.simpleName}")
+            }
+            if (result.isAnswered) return record(result)
+            last = result
+        }
+        return record(last ?: QueryResult.NoResult("没有找到相关结果"))
     }
 
     private fun record(result: QueryResult): QueryResult {

@@ -130,6 +130,10 @@ class AgentLoop(
     @Volatile
     private var lastActionResult: String? = null
 
+    /** 当前任务目标（供浏览器判断「用户是否要亲眼看网页」）。 */
+    @Volatile
+    private var activeGoal: String = ""
+
     val isRunning: Boolean get() = job?.isActive == true
 
     /**
@@ -257,6 +261,11 @@ class AgentLoop(
         settings: AgentSettings,
         chatHistory: List<Pair<String, String>> = emptyList(),
     ) {
+        activeGoal = goal
+        // 虚拟屏执行模式：可用时把启动与感知都指向该 displayId；不可用时为 null，行为与现在一致。
+        val virtualDisplay = com.pilot.agent.display.VirtualDisplayHost.activeDisplayId
+        actions.targetDisplayId = virtualDisplay
+        reader.displayIdFilter = virtualDisplay
 
         if (com.pilot.agent.action.CalendarTool.handles(goal)) {
             emit(AgentEvent.Finished(com.pilot.agent.action.CalendarTool.create(
@@ -304,12 +313,14 @@ class AgentLoop(
                         emit(AgentEvent.Finished(answer))
                         return
                     }
-                }
-                if (settings.mode != AssistantMode.AGENT) {
-                    emit(AgentEvent.Finished("没查到「$goal」的结果"))
+                    // ★ 强查询（新闻/网页搜索等）没有结果时，如实说没查到，**不要**转去打开浏览器执行——
+                    //   这正是「搜索新闻」被当成操作手机去打开网页的根因。
+                    Dbg.i(TAG, "查询无结果，如实结束，不转浏览器：goalChars=${goal.length}")
+                    emit(AgentEvent.Finished("没查到「$goal」的最新结果，可能是网络不可用或暂时没有相关内容。"))
                     return
                 }
-                emit(AgentEvent.Observe("内置查询没有结果，Agent 将使用浏览器或 MCP 继续查找"))
+                // 明确要读网页/用 MCP 的查询，才继续用浏览器或 MCP。
+                emit(AgentEvent.Observe("内置查询不适用，使用浏览器或 MCP 继续查找"))
             }
 
             IntentGate.Kind.CHAT -> {
@@ -749,6 +760,7 @@ class AgentLoop(
                         target = a.url ?: a.target,
                         text = a.text,
                         maxChars = a.maxChars,
+                        showToUser = wantsVisibleBrowser(activeGoal),
                     )
                     lastActionResult = buildString {
                         append(result.message)
@@ -1326,6 +1338,15 @@ class AgentLoop(
         }
 
         else -> false
+    }
+
+    /** 用户是否明确要「亲眼看到网页」→ 全屏；否则默认小窗/后台（不占主屏）。 */
+    private fun wantsVisibleBrowser(goal: String): Boolean {
+        val g = goal.lowercase()
+        return listOf(
+            "给我看", "让我看", "我要看", "我想看", "看一眼", "看一下网页",
+            "展示", "显示出来", "登录", "登陆", "扫码", "扫描二维码",
+        ).any { g.contains(it) }
     }
 
     /** 这一步动作是否「本来就应该让界面变化」。不改变界面的动作（wait 等）不参与无效动作判定。 */
