@@ -215,6 +215,11 @@ class CloudPlanner(private val settingsProvider: () -> AgentSettings) : Planner 
 - swipe {x,y,x2,y2,ms}
 - scroll {id,target:"forward"|"backward"}
 - open {target}                     包名或应用名
+- query {target,text}               端侧搜索源直查，不碰屏幕、不开浏览器，资讯/行情/天气/余票/网页类查询优先用它：
+    target 取值：news_search（实时新闻）、web_search（通用网页搜索）、stock（股票指数）、
+    weather（天气，text 带城市名）、train_12306（火车余票）、nearby_search（附近地点）、
+    web_page（读指定网址正文）、notifications（本机通知）；text 是查询词。
+    结果会在下一步观察里给出，读到后用 done 汇总回答；没结果再换数据源或 browser_open。
 - systemop {target,text,id}          系统能力直调，一步完成，优于此后再点屏幕：
     target 取值：volume/volume_set（text=百分比）、brightness/brightness_set（text=百分比）、
     call（text=联系人/号码）、music（text=歌名）、navigate（text=目的地）、
@@ -249,7 +254,8 @@ class CloudPlanner(private val settingsProvider: () -> AgentSettings) : Planner 
 6. 需要登录或动态网页时使用 browser_*；browser_read 读不到正文时先 browser_click 关闭遮挡层、处理同意按钮或等待。
 7. mcp_call、script_run 和会修改文件/联网的终端命令一律由执行层确认；只在参数不明确时用 ask 澄清。
 8. 只输出 JSON。
-9. 不声称已完成未执行的动作；需要实时信息时必须使用浏览器、MCP 或已有工具读取。
+9. 不声称已完成未执行的动作；需要实时信息时优先用 query 端侧搜索源（新闻/网页/行情/天气/余票等），
+   query 拿不到再用浏览器、MCP 或已有工具读取，不要一上来就 browser_open 硬搜。
 10. 用户要求的能力不在上面的动作清单里（例如扫描局域网设备、查看路由器终端、远程控制其他设备、
     破解/刷机）时，立刻用 ask 说明“Pilot 没有这个能力”，不要靠滑动桌面、翻最近任务、
     搜应用名去反复碰运气——真机实测这类硬试会白跑十几步仍然失败。

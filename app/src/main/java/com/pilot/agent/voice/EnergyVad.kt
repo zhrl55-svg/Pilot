@@ -56,6 +56,17 @@ class EnergyVad(
     @get:Synchronized
     val isInSpeech: Boolean get() = inSpeech
 
+    /**
+     * 当前正在说的这句话的采样快照（不清空缓冲），供"边说边出字"的增量识别用。
+     * 不在说话或还没攒够音频时返回 null。与 [feed]/[takeSegment] 共用同一把锁，
+     * 拿到的是一致快照，不会读到写了一半的缓冲。
+     */
+    @Synchronized
+    fun currentSegmentSnapshot(): ShortArray? {
+        if (!inSpeech || segmentLen <= 0) return null
+        return segment.copyOf(segmentLen)
+    }
+
     @Synchronized
     fun reset() {
         voicedFrames = 0

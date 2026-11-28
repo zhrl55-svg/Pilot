@@ -40,6 +40,41 @@ object QueryEngine {
     fun canHandle(goal: String): Boolean =
         looksLikePendingReply(goal) || tools.any { it.matches(goal) }
 
+    /**
+     * 端侧搜索源清单（工具名 + 一句话说明），供云端 Agent 了解本机有哪些查询能力。
+     * 与 [handle] 共用同一份工具表，新增数据源自动出现在这里。
+     */
+    val sourceCatalog: List<Pair<String, String>> = listOf(
+        "news_search" to "实时新闻（Google News / Bing RSS，最近24小时优先，含标题与摘要）",
+        "web_search" to "通用网页搜索（Bing / Brave，返回标题与摘要）",
+        "stock" to "股票行情与指数",
+        "weather" to "天气（需带城市名）",
+        "train_12306" to "12306 火车余票 / 车次",
+        "nearby_search" to "附近地点搜索",
+        "web_page" to "读取指定网址的网页正文",
+        "notifications" to "本机通知查询",
+    )
+
+    /**
+     * 按工具名执行查询（云端 Agent 的 query 动作用）。
+     * @return 查询结果文本；null = 没有这个名字的工具
+     */
+    suspend fun handleByName(name: String, query: String): String? {
+        val tool = tools.firstOrNull { it.name == name } ?: return null
+        return try {
+            when (val r = tool.executeResult(query)) {
+                is QueryResult.Answer -> r.text
+                is QueryResult.NeedMoreInfo -> r.prompt
+                else -> null
+            }
+        } catch (t: kotlinx.coroutines.CancellationException) {
+            throw t
+        } catch (t: Throwable) {
+            Dbg.w(TAG, "按名查询 $name 失败：${t.message}")
+            null
+        }
+    }
+
     /** 上一轮查询是否在等用户补充条件。 */
     fun hasPendingQuery(): Boolean = trainTool.hasPending()
 
@@ -71,7 +106,41 @@ object QueryEngine {
             if (names.isEmpty()) return null
             return "附近找到 ${names.size} 个：${names.joinToString("，")}。完整结果在屏幕上。"
         }
-        if (!answer.contains("的新闻，范围：") && !answer.startsWith("网页搜索：")) return null
+        if (answer.contains("，范围：")) {
+            // ★ 新闻只简要播报条目 + 摘要（能拿到文章摘要就读完），来源不播报；
+            //   完整结果（含来源、时间）留在屏幕上（m-20261128）。
+            //   新闻结果头统一含「，范围：」（“国际 新闻”，范围：… / “特朗普”的新闻，范围：…）。
+            val entries = Regex("(?m)^\\s*\\d+\\.\\s*(.+)$").findAll(answer).toList()
+            if (entries.isEmpty()) return null
+            val lines = answer.lines()
+            return buildString {
+                append("找到 ").append(entries.size.coerceAtMost(5)).append(" 条新闻。")
+                entries.take(5).forEachIndexed { index, m ->
+                    val title = m.groupValues[1].trim().take(40)
+                    append("第 ").append(index + 1).append(" 条：").append(title).append("。")
+                    // 该条目的摘要行：标题之后到下一条编号之前的「文章摘要 / 正文摘要」。
+                    val startLine = lines.indexOfFirst { it.trimStart().startsWith("${index + 1}. ") }
+                    if (startLine >= 0) {
+                        var endLine = lines.size
+                        for (j in startLine + 1 until lines.size) {
+                            if (Regex("^\\s*\\d+\\.\\s").containsMatchIn(lines[j])) {
+                                endLine = j
+                                break
+                            }
+                        }
+                        val summary = lines.subList(startLine + 1, endLine)
+                            .firstOrNull { it.contains("文章摘要：") || it.contains("正文摘要：") }
+                            ?.substringAfter("文章摘要：")?.substringAfter("正文摘要：")
+                            ?.replace("（原文暂时无法读取）", "")
+                            ?.trim()
+                            // 残缺 HTML 碎片（如 "/font"）或过短内容不算有效摘要，只念标题。
+                            ?.takeIf { it.length >= 8 && !it.matches(Regex("^[\\s/<>\\w]*font[\\s/<>\\w]*$", RegexOption.IGNORE_CASE)) }
+                        if (summary != null) append(summary.take(160)).append("。")
+                    }
+                }
+            }
+        }
+        if (!answer.startsWith("网页搜索：")) return null
         val titles = Regex("(?m)^\\s*\\d+\\.\\s*(.+)$").findAll(answer)
             .map { it.groupValues[1].trim().take(36) }
             .filter { it.isNotBlank() }

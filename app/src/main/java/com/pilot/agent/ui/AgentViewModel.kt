@@ -405,6 +405,10 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     var voiceState by mutableStateOf(VoiceInput.State.IDLE)
         private set
 
+    /** 边说边出字：语音识别的中间文字，实时显示在输入框上；空 = 无预览。 */
+    var voicePartial by mutableStateOf("")
+        private set
+
     /** 用户主动要求免打扰（说了"你休息一会"），不是自动休眠。 */
     var dndRequested by mutableStateOf(false)
         private set
@@ -759,7 +763,10 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 voiceState = it
                 dndRequested = v.dndRequested
             }
+            v.onPartial = { text -> voicePartial = text }
             v.onText = { text ->
+                // 最终结果到达，清掉中间预览（输入框恢复显示用户消息）。
+                voicePartial = ""
                 // ★ 去重：同一条内容短时间内重复到达只显示一次。
                 //   长按录音松手时，VAD 会 flush 出一句；麦克风还在录，
                 //   紧接着又切出一段内容相近的 → 用户看到"显示了两遍"（实测）。
@@ -810,6 +817,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             gate = AgentRuntime.voiceprint,
             onState = { voiceState = it },
             onText = { text ->
+                voicePartial = ""
                 // 所有入口统一经过 run()，由当前模式决定助理或 Agent 链路。
                 run(text)
             },
@@ -826,6 +834,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 )
             },
         ).also { v ->
+            v.onPartial = { text -> voicePartial = text }
             v.onEnrollSegment = { index, total -> enrollProgress = "$index/$total" }
             // 首句自动注册成功（清除声纹后说第一句话）
             v.onEnrolled = {
@@ -869,6 +878,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             // 其余回调都指向已销毁的 ViewModel，全部换成空实现/日志，
             // 防止 Compose 状态在销毁后被无意义地写入。
             input.onState = { }
+            input.onPartial = { }
             input.onError = { msg -> Dbg.w(TAG, "后台语音错误：$msg") }
             input.onWake = { word -> Dbg.i(TAG, "后台唤醒「$word」") }
             input.onVoiceprint = { _, _ -> }
@@ -1633,7 +1643,8 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         val current = AgentSettings.load()
-        AgentRuntime.speaker.speak("我先判断一下怎么处理，请稍等。")
+        // ★ 「请稍等」只在任务确实要交给云端 agent 处理时才说：快路径、本机工具、
+        //   无界面本机执行、本地闲聊这些端侧处理不需要这句提示（m-20261128）。
         if (!current.cloudReady) {
             Dbg.i(TAG, "agent router fallback: cloud unavailable")
             fallbackAgentDispatch(text, fallbackKind)
@@ -1674,6 +1685,8 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                     add(LogEntry.Kind.THINK, "Agent 判断：${decision.thought}")
                 }
                 Dbg.i(TAG, "agent router -> agent thought=${decision.thought}")
+                // 任务确实要交给云端 agent 处理，先说一句提示；端侧路径不说这句。
+                AgentRuntime.speaker.speak("请稍等")
                 startAgent(text, AssistantMode.AGENT)
                 return@launch
             }
@@ -1736,7 +1749,10 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         chatHistory.addLast(question to clean)
         while (chatHistory.size > 40) chatHistory.removeFirst()
         add(LogEntry.Kind.DONE, clean)
-        AgentRuntime.speaker.speak(clean)
+        // 搜索类结果只念摘要（条目 + 摘要，不念来源），长正文留在屏幕上；普通回答完整播报。
+        val spoken = com.pilot.agent.query.QueryEngine.speechSummary(clean)
+        if (spoken != null) AgentRuntime.speaker.speak(spoken)
+        else AgentRuntime.speaker.speak(clean)
         refreshStatus()
     }
 

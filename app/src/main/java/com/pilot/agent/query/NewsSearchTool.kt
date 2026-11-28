@@ -140,7 +140,7 @@ class NewsSearchTool : QueryTool {
         }
     }
 
-    private fun normalizeQuery(goal: String): String {
+    internal fun normalizeQuery(goal: String): String {
         var q = goal.trim()
         val prefixes = listOf(
             "帮我搜一下", "帮我搜索", "你再搜一下", "你再搜", "你再", "再搜一下",
@@ -152,7 +152,14 @@ class NewsSearchTool : QueryTool {
             if (q.startsWith(prefix, ignoreCase = true)) q = q.removePrefix(prefix).trim()
         }
         q = q.replace(Regex("\\s+"), " ")
+        // ★ 口语问句框架不是搜索主题：「今天有没重要的国际新闻」要洗成「国际 新闻」，
+        //   而不是把「今天有没 重要的国际」整句残片回显成“……的新闻”（老板反馈别扭）。
+        q = q.replace(
+            Regex("今天|今日|昨天|明天|这几天|这两天|现在|当前|有没有|有没|有无|有木有|是不是|是否|重要的?|重大|特别|比较|哪些|什么|有|吗|呢|啊|呀"),
+            " ",
+        )
         q = q.replace(Regex("最近有什么|最近发生|有什么|最新的?|最近的?|动态|资讯|新闻|消息|热点|头条"), " ")
+        q = q.replace(Regex("\\s+"), " ").trim()
         q = q.removeSuffix("新闻").let { base -> if (goal.contains("新闻") && base.isNotBlank()) "$base 新闻" else base }
         q = q.trim(' ', '，', ',', '。', '.', '？', '?', '！', '!')
         return q.ifBlank {
@@ -223,7 +230,12 @@ class NewsSearchTool : QueryTool {
                             }
                             val resolvedTitle = if (source.isBlank() && splitTitle > 0) title.substring(0, splitTitle) else title
                             val cleanDescription = Html.fromHtml(description, Html.FROM_HTML_MODE_COMPACT)
-                                .toString().replace(Regex("\\s+"), " ").trim().take(900)
+                                .toString()
+                                // RSS 摘要常带残缺 HTML（如 "</font>" 被截成 "/font"），
+                                // 清掉标签碎片，避免把 "/font" 这类垃圾当成文章摘要播报。
+                                .replace(Regex("<[^>]*>"), " ")
+                                .replace(Regex("/?(font|br|p|div|span|a|b|i|u|em|strong|img|li|ul|ol|h[1-6])\\b", RegexOption.IGNORE_CASE), " ")
+                                .replace(Regex("\\s+"), " ").trim().take(900)
                             items += Item(resolvedTitle, resolvedSource, publishedAt!!, link, cleanDescription)
                         }
                         inItem = false
@@ -263,7 +275,9 @@ class NewsSearchTool : QueryTool {
             }
         }.awaitAll()
         buildString {
-        append("“").append(query).append("”的新闻，范围：").append(rangeLabel).append("（共 ").append(items.size).append(" 条）\n")
+        // 主题本身已含「新闻」时不再追加“的新闻”，避免「国际新闻的新闻」这类重复。
+        val topic = if (query.contains("新闻")) "“$query”" else "“$query”的新闻"
+        append(topic).append("，范围：").append(rangeLabel).append("（共 ").append(items.size).append(" 条）\n")
         items.forEachIndexed { index, item ->
             append('\n').append(index + 1).append(". ").append(item.title)
             append("\n   来源：").append(item.source)
@@ -271,13 +285,18 @@ class NewsSearchTool : QueryTool {
             if (index < articleBodies.size) {
                 val body = articleBodies[index]
                 // Google News 的原文链接是跳转页，抓回来经常只有「Google News」
-                // 这几个字；这种情况用 RSS 自带的摘要，别在结果里刷空内容。
-                val uselessBody = body == "Google News" || body.length < 40
-                if ((body.startsWith("正文抓取失败") || uselessBody) && item.description.isNotBlank()) {
-                    append("\n   文章摘要：").append(item.description)
-                    append("（原文暂时无法读取）")
-                } else {
-                    append("\n   正文摘要：").append(body)
+                // 这几个字（可能带空白）；这种情况用 RSS 自带的摘要，别在结果里刷空内容。
+                val trimmedBody = body.trim()
+                val uselessBody = trimmedBody.equals("Google News", ignoreCase = true) ||
+                    trimmedBody.length < 40
+                val validDescription = item.description.length >= 8
+                when {
+                    (body.startsWith("正文抓取失败") || uselessBody) && validDescription -> {
+                        append("\n   文章摘要：").append(item.description)
+                        append("（原文暂时无法读取）")
+                    }
+                    uselessBody -> Unit // 正文和摘要都无效：只留标题，不刷垃圾内容
+                    else -> append("\n   正文摘要：").append(body)
                 }
             }
         }

@@ -401,6 +401,7 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
                 val st = vm.voiceState
                 !vm.dndRequested && st == com.pilot.agent.voice.VoiceInput.State.LISTENING
             },
+            partialText = vm.voicePartial,
             onSend = {
                 vm.run(input.text)
                 input = TextFieldValue("")
@@ -1835,6 +1836,8 @@ private fun InputBar(
     speaking: Boolean,
     /** 会话已激活、麦克风正在收这一句（唤醒/长按后的连续对话） */
     sessionListening: Boolean,
+    /** 边说边出字：语音识别的中间文字，聆听时实时显示在输入框上 */
+    partialText: String = "",
     onSend: () -> Unit,
     onStop: () -> Unit,
     onStopSpeaking: () -> Unit,
@@ -1945,18 +1948,22 @@ private fun InputBar(
             }
 
             if (live) {
-                // 在听时：一层淡底 + "正在听…"，盖在输入框上但看得见边框
+                // 在听时：一层淡底 + 中间识别文字（边说边出字），盖在输入框上但看得见边框。
+                // 还没有中间文字时显示「正在听…」；有了就实时显示识别到的内容。
                 Box(
                     Modifier
                         .matchParentSize()
                         .background(colors.surface.copy(alpha = 0.88f), RoundedCornerShape(14.dp)),
                     contentAlignment = Alignment.CenterStart,
                 ) {
+                    val hint = if (recording) "正在听…（松手发送）" else "正在听…"
                     Text(
-                        if (recording) "正在听…（松手发送）" else "正在听…",
+                        partialText.ifBlank { hint },
                         fontSize = 13.sp,
-                        color = colors.primary,
-                        modifier = Modifier.padding(horizontal = 16.dp),
+                        color = if (partialText.isBlank()) colors.primary else colors.onSurface,
+                        maxLines = 2,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
                     )
                 }
                 val border = androidx.compose.ui.graphics.lerp(colors.primary, colors.tertiary, phase)

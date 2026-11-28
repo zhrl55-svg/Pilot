@@ -526,6 +526,18 @@ class AgentLoop(
                 }
 
                 "unable" -> {
+                    // ★ 端侧（规则 + 端侧小模型）都完成不了时，交给云端 agent 直接回答。
+                    //   云端规划器是「屏幕操作」导向，对纯查询/知识类目标可能直接 unable；
+                    //   不能拿「端侧没给出动作」当最终结论。仅在本步还没动过屏幕时升级——
+                    //   已执行过动作的中途失败保持原样，避免云端回答与已执行动作脱节。
+                    if (settings.cloudReady && history.isEmpty()) {
+                        Dbg.i(TAG, "端侧无法完成，升级云端 agent 直接回答：goalChars=${goal.length}")
+                        val answer = cloudFallbackAnswer(goal, settings, chatHistory)
+                        if (!answer.isNullOrBlank()) {
+                            emit(AgentEvent.Finished(answer))
+                            return
+                        }
+                    }
                     emit(AgentEvent.Failed("这个请求当前无法处理：${action.summary}"))
                     return
                 }
@@ -664,6 +676,51 @@ class AgentLoop(
         emit(AgentEvent.Failed("超过 ${settings.maxTurns} 步仍未完成，已停在当前界面。"))
     }
 
+    /**
+     * 端侧（规则 + 端侧小模型）都完成不了时的云端兜底：把目标交给云端对话模型直接回答。
+     *
+     * 云端规划器只输出「屏幕操作」动作，对纯查询/知识类目标会直接 unable——
+     * 但云端对话模型能凭知识回答。这里让它直接作答；需要操作手机而本机没完成的，
+     * 明确要求如实说明，不得声称已执行（沿用 [LlmGateway] 的人设约束）。
+     */
+    private suspend fun cloudFallbackAnswer(
+        goal: String,
+        settings: AgentSettings,
+        chatHistory: List<Pair<String, String>>,
+    ): String? {
+        if (!settings.cloudReady) return null
+        val now = java.text.SimpleDateFormat("yyyy年M月d日 EEEE HH:mm", java.util.Locale.CHINA)
+            .format(java.util.Date())
+        val memory = com.pilot.agent.runtime.AgentRuntime.localTools.memory
+            .promptContext(goal, 5)
+        val memoryPrompt = if (memory.isBlank()) "" else "\n相关长期记忆：\n$memory\n"
+        val messages = buildList {
+            add(
+                com.pilot.agent.assistant.llm.LlmGateway.Message(
+                    "system",
+                    "你是手机助手 Pilot 的云端兜底。本机的规则和端侧模型都没有完成这条请求。" +
+                        "现在是 $now。$memoryPrompt" +
+                        "如果这是可以凭知识或常识回答的问题，直接给出准确、简短的回答；" +
+                        "如果这是需要操作手机的请求而本机没有完成，如实说明未能完成，不要声称已经执行。" +
+                        "回答口语化，一到三句，不要用列表。",
+                ),
+            )
+            chatHistory.takeLast(settings.chatContextTurns.coerceIn(0, 20)).forEach { (q, a) ->
+                add(com.pilot.agent.assistant.llm.LlmGateway.Message("user", q))
+                add(com.pilot.agent.assistant.llm.LlmGateway.Message("assistant", a))
+            }
+            add(com.pilot.agent.assistant.llm.LlmGateway.Message("user", goal))
+        }
+        return when (val r = com.pilot.agent.assistant.llm.LlmGateway.chat(settings, messages, timeoutMs = 40_000L)) {
+            is com.pilot.agent.assistant.llm.LlmGateway.ChatResult.Ok ->
+                r.content.trim().takeIf { it.isNotBlank() }
+            is com.pilot.agent.assistant.llm.LlmGateway.ChatResult.Failed -> {
+                Dbg.w(TAG, "云端兜底回答失败：${r.reason}")
+                null
+            }
+        }
+    }
+
     private fun appendHistory(
         history: MutableList<String>,
         action: AgentAction,
@@ -785,6 +842,26 @@ class AgentLoop(
                 }
                 "key" -> target != null && actions.key(target)
                 "systemop" -> runSystemOp(a)
+                "query" -> {
+                    // 端侧搜索源直查：不碰屏幕、不开浏览器。结果写进 lastActionResult
+                    // 供下一轮规划器阅读，模型据此 done 汇总；查不到则换数据源或浏览器。
+                    val source = target.orEmpty()
+                    val q = text.orEmpty()
+                    if (source.isBlank() || q.isBlank()) {
+                        lastActionResult = "query 缺少数据源名(target)或查询词(text)"
+                        emit(AgentEvent.Observe(lastActionResult.orEmpty()))
+                        return false
+                    }
+                    Dbg.i(TAG, "端侧查询 source=$source chars=${q.length}")
+                    val answer = com.pilot.agent.query.QueryEngine.handleByName(source, q)
+                    lastActionResult = if (answer.isNullOrBlank()) {
+                        "端侧查询 $source 没有结果。可换数据源或用 browser_open 继续。"
+                    } else {
+                        "端侧查询 $source 结果：\n${answer.take(16_000)}"
+                    }
+                    emit(AgentEvent.Observe(lastActionResult.orEmpty()))
+                    !answer.isNullOrBlank()
+                }
                 "app_func" -> {
                     val dest = target ?: return false
                     val pkg = dest.substringBefore('/')

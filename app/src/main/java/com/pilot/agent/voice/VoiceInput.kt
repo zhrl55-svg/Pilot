@@ -53,6 +53,15 @@ class VoiceInput(
     var onVoiceprint: (Float, Boolean) -> Unit = onVoiceprint
 
     /**
+     * 边说边出字：说话过程中对已攒音频做增量识别，把中间文字实时回调给界面。
+     *
+     * ★ 只是预览，不是最终结果——最终一句仍由 [onText] 给出（整句离线识别更准）。
+     *   空字符串表示清空预览（切句完成 / 停止聆听 / 声纹拒绝时）。
+     *   与最终识别共用同一把 ASR 锁，增量识别会让最终识别稍等片刻，属可接受代价。
+     */
+    var onPartial: (String) -> Unit = {}
+
+    /**
      * 语音打断时回调（播报中听到「停一下」这类）。
      * AgentRuntime 注入成 `speaker.stop()`——VoiceInput 不直接依赖播报器。
      */
@@ -103,6 +112,17 @@ class VoiceInput(
         Thread(r, "voice-worker").apply { isDaemon = true }
     }
     private val busy = AtomicBoolean(false)
+
+    /** 增量识别（边说边出字）是否正在跑，避免重复提交。 */
+    private val partialBusy = AtomicBoolean(false)
+
+    /** 上次增量识别的时间戳（uptimeMillis），用于节流。 */
+    @Volatile
+    private var lastPartialAt = 0L
+
+    /** 最近一次已公布的中间文字，内容没变就不重复回调。 */
+    @Volatile
+    private var lastPartialText = ""
 
     private var capture: AudioCapture? = null
     private var vad: EnergyVad? = null
@@ -254,6 +274,7 @@ class VoiceInput(
         main.removeCallbacks(sleepTick)
         main.removeCallbacks(conversationTick)
         main.removeCallbacks(convEnterRetry)
+        clearPartial()
         convListen = false
         activeUntil = 0L
         mode = Mode.WAKE          // 只跑唤醒词，和休眠完全一样
@@ -512,6 +533,7 @@ class VoiceInput(
         main.removeCallbacks(listenWatchdog)
         main.removeCallbacks(conversationTick)
         main.removeCallbacks(convEnterRetry)
+        clearPartial()
         convListen = false
         activeUntil = 0L
         // A recognition worker may still be finishing. Do not let its finally block
@@ -807,7 +829,55 @@ class VoiceInput(
             vad?.resetNoiseFloor()
         } else if (mode == Mode.LISTEN || mode == Mode.ACTIVE) {
             vad?.feed(frame, len)
+            // 边说边出字：说话过程中定期把已攒音频送增量识别，实时显示中间文字。
+            maybePartialRecognize()
         }
+    }
+
+    /**
+     * 增量识别调度（采集线程调用）：正在说话、攒够 [PARTIAL_MIN_MS]、距上次超过
+     * [PARTIAL_INTERVAL_MS]、且没有最终识别/上一次增量在跑时，提交一次增量识别。
+     *
+     * ★ 声纹未通过（wakeAuthorized=false）不预览——旁人说话不该点亮输入框。
+     *   放音/回声期上面已 reset VAD，这里自然拿不到快照。
+     */
+    private fun maybePartialRecognize() {
+        if (!wakeAuthorized || enrolling) return
+        val v = vad ?: return
+        if (!v.isInSpeech) return
+        val now = SystemClock.uptimeMillis()
+        if (now - lastPartialAt < PARTIAL_INTERVAL_MS) return
+        if (busy.get() || !partialBusy.compareAndSet(false, true)) return
+        val snapshot = v.currentSegmentSnapshot()
+        if (snapshot == null || snapshot.size * 1000 / AudioCapture.SAMPLE_RATE < PARTIAL_MIN_MS) {
+            partialBusy.set(false)
+            return
+        }
+        lastPartialAt = now
+        val submitted = runCatching {
+            worker.execute {
+                try {
+                    // 提交后到真正执行之间可能已切句进入最终识别：让位，不抢锁。
+                    if (busy.get()) return@execute
+                    val text = asr.transcribe(snapshot)?.trim().orEmpty()
+                    if (text.isNotBlank() && text != lastPartialText && !busy.get()) {
+                        lastPartialText = text
+                        main.post { onPartial(text) }
+                    }
+                } catch (t: Throwable) {
+                    Dbg.w(TAG, "增量识别失败 ${t.javaClass.simpleName}")
+                } finally {
+                    partialBusy.set(false)
+                }
+            }
+        }.isSuccess
+        if (!submitted) partialBusy.set(false)
+    }
+
+    /** 清空中间文字预览（切句完成 / 停止聆听 / 声纹拒绝）。 */
+    private fun clearPartial() {
+        lastPartialText = ""
+        main.post { onPartial("") }
     }
 
     /** KWS 失败后按退避自动重载（加载模型较重，交给 worker；采集线程只做判断）。 */
@@ -974,6 +1044,7 @@ class VoiceInput(
         dndRequested = false
         vad?.reset()
         wakeAuthorized = false
+        clearPartial()
         // 兜底看门狗照常 arm（声纹结果迟迟不回、首句注册推理慢时也不至于卡在 LISTEN）
         armListenWatchdog()
         Dbg.i(TAG, "唤醒候选「$word」，等声纹结果再决定是否进入聆听")
@@ -1073,6 +1144,8 @@ class VoiceInput(
             return
         }
         if (!busy.compareAndSet(false, true)) return
+        // 切句进入最终识别：中间预览到此为止，最终结果由 onText 给出。
+        clearPartial()
         main.removeCallbacks(finishGuard)
         main.removeCallbacks(listenWatchdog)
         // 已经切句进入识别：聆听窗口到此为止（动效随之收起）
@@ -1323,6 +1396,12 @@ class VoiceInput(
 
         /** 放音结束后多久内录到的音频一律当回声丢掉 */
         const val ECHO_GUARD_MS = 900L
+
+        /** 边说边出字：两次增量识别的最小间隔（毫秒）。太密会抢 ASR 锁、拖慢最终识别。 */
+        const val PARTIAL_INTERVAL_MS = 1_200L
+
+        /** 边说边出字：攒够这么长音频才开始第一次增量识别（毫秒），太短识别不出内容。 */
+        const val PARTIAL_MIN_MS = 900
 
         /** 声纹注册要采够的语句段数 */
         const val ENROLL_TARGET = 3

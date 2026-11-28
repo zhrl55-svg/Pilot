@@ -35,6 +35,7 @@ data class AgentAction(
         "input" -> "在 [$id] 输入内容（已隐藏）"
         "open" -> "打开应用 ${target.orEmpty()}"
         "systemop" -> "系统直调 ${summary ?: target.orEmpty()}"
+        "query" -> "端侧查询 ${target.orEmpty()}：${text.orEmpty().take(40)}"
         "shortcut" -> "直达 ${summary ?: target.orEmpty()}"
         "component" -> "直达 ${summary ?: target.orEmpty()}"
         "key" -> "按键 ${target.orEmpty()}"
@@ -69,6 +70,7 @@ data class AgentAction(
           {"name":"swipe","description":"滑动屏幕，用于翻页/滚动","parameters":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"x2":{"type":"integer"},"y2":{"type":"integer"},"ms":{"type":"integer"}},"required":["x","y","x2","y2"]}},
           {"name":"scroll","description":"对可滚动容器做一次滚动，比 swipe 更稳定","parameters":{"type":"object","properties":{"id":{"type":"integer"},"target":{"type":"string","enum":["forward","backward"]}},"required":["id"]}},
           {"name":"open","description":"按包名或应用名打开一个 App","parameters":{"type":"object","properties":{"target":{"type":"string"}},"required":["target"]}},
+          {"name":"query","description":"用本机端侧搜索源查信息，不碰屏幕、不开浏览器，优先于 browser_open 做资讯/行情/天气/余票/网页类查询。target 为数据源名（news_search/web_search/stock/weather/train_12306/nearby_search/web_page/notifications），text 为查询词；拿到结果后用 done 汇总回答。","parameters":{"type":"object","properties":{"target":{"type":"string"},"text":{"type":"string"}},"required":["target","text"]}},
           {"name":"key","description":"系统按键","parameters":{"type":"object","properties":{"target":{"type":"string","enum":["back","home","recents","notifications"]}},"required":["target"]}},
           {"name":"app_func","description":"在 Android 16+ 且系统已授权时调用目标应用公开的 AppFunction；target 格式为 package/functionId，text 为 JSON 参数。调用前必须向用户确认。不可用时改走界面操作。","parameters":{"type":"object","properties":{"target":{"type":"string"},"text":{"type":"string"}},"required":["target"]}},
           {"name":"browser_open","description":"在可见的持久浏览器会话中打开 HTTP/HTTPS 网页，保留登录 Cookie","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}},
@@ -102,7 +104,7 @@ enum class Risk { NONE, MONEY, IRREVERSIBLE, EXTERNAL, SENSITIVE }
  */
 val KNOWN_ACTIONS: Set<String> = setOf(
     "tap", "tap_node", "long_press", "input", "swipe", "scroll",
-    "open", "shortcut", "component", "key", "systemop",
+    "open", "shortcut", "component", "key", "systemop", "query",
     "done", "wait", "ask", "unable", "app_func",
     "browser_open", "browser_read", "browser_click", "browser_type",
     "browser_scroll", "browser_back", "browser_close",
