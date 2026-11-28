@@ -191,6 +191,31 @@ object BrowserEngine {
         }
     }
 
+    /**
+     * 截取当前页面画面（移植 Minis 的虚拟屏效果）。
+     *
+     * 优先走 [HeadlessRenderHost] 的 GPU 离屏渲染：私有虚拟屏 + Presentation 给无头 WebView
+     * 真实合成表面，能截到 WebGL / video 等 GPU-only 层，**普通签名即可、无需任何权限**。
+     * GPU 路径不适用或失败时退回软件 draw（CPU 光栅化，GPU 层可能空白）。
+     *
+     * @return 页面 Bitmap；WebView 未加载时返回 null。
+     */
+    suspend fun screenshot(): Bitmap? {
+        val wv = webView ?: return null
+        val w = holder?.width?.takeIf { it > 0 } ?: 800
+        val h = holder?.height?.takeIf { it > 0 } ?: 1200
+        // GPU 路径只在 WebView 未挂窗（无头）时适用；已挂悬浮窗/全屏时它返回 null。
+        HeadlessRenderHost.capture(wv, w, h)?.let { return it }
+        return withContext(Dispatchers.Main) {
+            runCatching {
+                val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                val canvas = android.graphics.Canvas(bmp)
+                wv.draw(canvas)
+                bmp
+            }.getOrNull()
+        }
+    }
+
     suspend fun click(target: String): BrowserResult {
         val wv = webView ?: return notOpen()
         val q = jsString(target)

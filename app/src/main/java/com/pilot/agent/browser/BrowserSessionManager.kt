@@ -68,6 +68,21 @@ object BrowserSessionManager {
                 ?: return BrowserResult(false, "只允许打开 HTTP 或 HTTPS 网页。")
             return open(app, url, showToUser)
         }
+        if (action == "browser_screenshot") {
+            // 虚拟屏 GPU 离屏截屏（移植 Minis）：普通签名可用，能截到 WebGL/video 等 GPU 层。
+            val bmp = BrowserEngine.screenshot()
+                ?: return BrowserResult(false, "当前没有可截屏的浏览器页面，请先打开网址。")
+            val file = java.io.File(app.cacheDir, "browser_shot.jpg")
+            val ok = runCatching {
+                java.io.FileOutputStream(file).use { bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, it) }
+            }.isSuccess
+            bmp.recycle()
+            return if (ok) {
+                BrowserResult(true, "已截取当前页面画面", text = "截图文件：${file.absolutePath}")
+            } else {
+                BrowserResult(false, "截屏保存失败")
+            }
+        }
         // 非打开类动作：优先作用于当前活动的全屏页，其次引擎（小窗/无头共用同一 WebView）。
         val page = activity
         if (page != null) {

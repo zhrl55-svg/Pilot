@@ -157,7 +157,9 @@ object IntentGate {
         "人工智能", "大模型", "科技", "头条", "热点",
     )
     private val WEB_SEARCH_HINTS = listOf(
-        "网页", "网上搜", "上网搜", "上网查", "网上查", "帮我搜", "搜一下", "搜索一下",
+        // ★ 不放裸词「网页」：「打开网页 / 截取网页画面 / 网页画面保存成图片」是浏览器操作，
+        //   不是搜索。只有明确的搜索/阅读短语才触发 web_search（m-20261128）。
+        "网上搜", "上网搜", "上网查", "网上查", "帮我搜", "搜一下", "搜索一下",
         "搜索", "查资料", "查官网", "网页搜索", "读网页", "阅读网页", "总结网页", "这篇文章",
     )
     private val DEVICE_ACTION_HINTS = listOf(
@@ -188,7 +190,7 @@ object IntentGate {
     }
 
     /**
-     * 强查询：新闻/资讯/热点/最新动态，或明确的网页搜索，且**没有**指定 App、**没有**“给我看”。
+     * 强查询：新闻/资讯/热点/最新动态，或明确的网页搜索，且**没有**指定 App、**没有**”给我看”。
      * 这类请求必须走查询通道（news_search / web_search），规则判定优先于模型的执行判定。
      */
     fun isStrongQuery(text: String): Boolean {
@@ -196,9 +198,27 @@ object IntentGate {
         if (t.isEmpty()) return false
         if (isAppScopedSearch(t)) return false
         if (VISIBLE_WEB_HINTS.any { t.contains(it) }) return false
+        // ★ 明确要「用浏览器打开某网址并做操作」是执行任务，不是资讯查询：
+        //   「打开 https://example.com 然后截取网页画面」含「网页」会被 WEB_SEARCH_HINTS
+        //   误判成 web_search。带 URL + 打开/访问动词、或浏览器 + 操作意图时让位给 Agent。
+        if (looksLikeBrowserTask(t)) return false
         return LIVE_INFO_HINTS.any(t::contains) ||
             WEB_SEARCH_HINTS.any(t::contains) ||
             looksLikeTrainQuery(t)
+    }
+
+    /** 公开判定：浏览器操作任务（路由层在快路径之前据此直接交给 Agent）。 */
+    fun isBrowserTask(text: String): Boolean = looksLikeBrowserTask(text.trim())
+
+    /** 浏览器操作任务：打开/访问网址，或用浏览器做截屏/点击/填写等动作（非纯资讯查询）。 */
+    private fun looksLikeBrowserTask(t: String): Boolean {
+        val hasUrl = Regex("https?://", RegexOption.IGNORE_CASE).containsMatchIn(t) ||
+            Regex("\\b[\\w-]+\\.(com|cn|net|org|io|dev|app|me|co|info|xyz|top|site)\\b", RegexOption.IGNORE_CASE).containsMatchIn(t)
+        val openVerb = listOf("打开", "访问", "进入", "跳转到", "导航到").any(t::contains)
+        if (hasUrl && openVerb) return true
+        val browserWord = listOf("浏览器", "browser").any { t.contains(it, ignoreCase = true) }
+        val browserOp = listOf("截图", "截屏", "画面", "点击", "填写", "输入", "登录", "扫码", "保存成图片").any(t::contains)
+        return browserWord && browserOp
     }
 
     /** 纯交流的开头，命中就不当成任务 */
@@ -237,6 +257,10 @@ object IntentGate {
         if (looksLikeTrainQuery(t)) return Kind.QUERY
         // 指定了 App 的搜索（在淘宝搜耳机 / 打开微博搜新闻）是执行，不是查询。
         if (isAppScopedSearch(t)) return Kind.TASK
+        // ★ 浏览器操作任务（打开网址截屏/点击/填写等）是执行，不是资讯查询：
+        //   「用浏览器打开 example.com，把网页画面保存成图片」含「网页」会被下面的
+        //   WEB_SEARCH_HINTS 误判成 QUERY → web_search。这里先拦下判 TASK。
+        if (looksLikeBrowserTask(t)) return Kind.TASK
         if (LIVE_INFO_HINTS.any(t::contains) && DEVICE_ACTION_HINTS.none(t::contains)) return Kind.QUERY
         if (t.contains("https://", ignoreCase = true) && listOf("网页", "链接", "文章", "总结", "阅读", "读一下", "浏览").any(t::contains)) return Kind.QUERY
         if (WEB_SEARCH_HINTS.any(t::contains) && DEVICE_ACTION_HINTS.none(t::contains)) return Kind.QUERY

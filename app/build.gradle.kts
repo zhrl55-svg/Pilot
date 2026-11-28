@@ -61,6 +61,25 @@ android {
         } else if (platformStore.exists()) {
             logger.warn("keystore/platform.jks 存在，但未配置 PILOT_STORE_PASSWORD / PILOT_KEY_PASSWORD（环境变量或 local.properties），release 将无法打包")
         }
+
+        // 自签名 release（普通分发试用）：仅在显式 -PpilotSelfSignedRelease=true 且无平台密钥时启用。
+        // 用本机私有 keystore/release.jks（不入库），可正常安装使用，但拿不到平台
+        // signature|privileged 权限（虚拟屏、TRIGGER 等受限，自动退回）。
+        // 默认行为不变：缺平台密钥仍拒绝出 release，避免静默降级。
+        val selfSigned = providers.gradleProperty("pilotSelfSignedRelease").orNull == "true"
+        val releaseStore = file("../keystore/release.jks")
+        val relStorePass = signingSecret("PILOT_RELEASE_STORE_PASSWORD")
+        val relKeyPass = signingSecret("PILOT_RELEASE_KEY_PASSWORD")
+        if (selfSigned && !platformStore.exists() &&
+            releaseStore.exists() && relStorePass.isNotBlank() && relKeyPass.isNotBlank()
+        ) {
+            create("releaseSelf") {
+                storeFile = releaseStore
+                storePassword = relStorePass
+                keyAlias = "pilot-release"
+                keyPassword = relKeyPass
+            }
+        }
     }
 
     buildTypes {
@@ -87,7 +106,9 @@ android {
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             // P1：缺失平台密钥时禁止静默回退 debug 签名——
             // 否则 release 包拿不到 signature|privileged 权限且无任何报错。
-            signingConfigs.findByName("platform")?.let { signingConfig = it }
+            // 显式 -PpilotSelfSignedRelease=true 时允许用自签名 releaseSelf（普通分发）。
+            signingConfig = signingConfigs.findByName("platform")
+                ?: signingConfigs.findByName("releaseSelf")
         }
     }
 
@@ -133,10 +154,13 @@ tasks.matching { it.name.startsWith("assembleRelease") || it.name.startsWith("bu
             // 注意：doFirst 的接收者是 Task（Task 本身也是 ExtensionAware），
             // 必须显式取 project 的扩展，否则 getByType 会在 task 扩展里找不到 AppExtension。
             val ext = project.extensions.getByType<com.android.build.gradle.AppExtension>()
+            val selfSigned = project.providers.gradleProperty("pilotSelfSignedRelease").orNull == "true"
             val platform = ext.signingConfigs.findByName("platform")
+                ?: ext.signingConfigs.findByName("releaseSelf")?.takeIf { selfSigned }
                 ?: error(
                     "release 必须使用平台签名，禁止回退 debug：请提供 keystore/platform.jks，" +
-                        "并通过环境变量或 local.properties 配置 PILOT_STORE_PASSWORD / PILOT_KEY_PASSWORD",
+                        "并通过环境变量或 local.properties 配置 PILOT_STORE_PASSWORD / PILOT_KEY_PASSWORD；" +
+                        "普通分发试用可加 -PpilotSelfSignedRelease=true 用自签名 keystore/release.jks",
                 )
             // S1-c：拒绝 AOSP 公开 testkey 的默认密码。确属私有密钥且密码恰好相同时，
             // 显式加 -PpilotAllowWeakSigningPassword=true 才放行（并请尽快更换密码）。

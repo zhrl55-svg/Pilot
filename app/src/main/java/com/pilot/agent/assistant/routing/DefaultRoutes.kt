@@ -22,7 +22,7 @@ object DefaultRoutes {
     // 4：life.reminder 增加起床类关键词/模式（「明早7点叫我起床」）。
     //    必须 bump，否则已装机的 routes.json 仍是旧词表，新词条不生效（真机踩到）。
     // 5：新增 tool.memory-forget —— 「忘掉我的车牌」原来无路由，只能落到 Agent 乱猜。
-    const val SEED_VERSION = 5
+    const val SEED_VERSION = 6
 
     private fun r(
         id: String,
@@ -357,6 +357,9 @@ object DefaultRoutes {
             keywords = listOf("截图", "截屏", "截个屏", "截一张屏", "screenshot", "screen shot"),
             exclude = listOf(
                 "打开截屏设置", "关闭截屏设置", "截屏设置",
+                // ★ 浏览器/网页画面截屏是 Agent 的 browser_screenshot（虚拟屏 GPU 离屏），
+                //   不是设备主屏截屏——「用浏览器打开 example.com 并截图」不能被这里接住。
+                "浏览器", "网页", "页面", "browser",
                 "加个", "添加", "增加", "支持", "功能", "开发", "实现",
                 "讨论", "方案", "接口", "代码", "原理", "设计",
             ),

@@ -226,13 +226,21 @@ class CloudPlanner(private val settingsProvider: () -> AgentSettings) : Planner 
     navigate_stop、navigate_status、terminal（text=命令）、
     settings_switch_on/settings_switch_off/settings_search（text=设置项关键词）
 - key {target:"back"|"home"|"recents"|"notifications"}
-- browser_open {url}                在可见浏览器会话打开网页，保留登录状态
+- browser_open {url}                在**虚拟屏**后台打开网页（不抢用户当前屏幕），保留登录状态
 - browser_read {maxChars}           读取网页标题、网址和正文
+- browser_screenshot                截取网页画面（虚拟屏 GPU 离屏渲染，普通签名可用，含 WebGL/video），返回截图文件路径
 - browser_click {target}            点网页按钮/链接；target 可写可见文字或 css:选择器
 - browser_type {target,text}        填写网页输入框（密码类内容必须由用户明确提供）
 - browser_scroll {target:"forward"|"backward"}
 - browser_back
 - browser_close
+
+虚拟屏说明：Pilot 内置浏览器跑在一块**私有虚拟屏**上（只有本 App 可见、用户看不到、不占主屏、
+不需要平台签名）。因此：
+- 打开网址、读正文、截图、点击、填写都在虚拟屏后台完成，**不会顶掉用户正在用的 App**；
+- 「打开某网址」「截取网页画面」「把网页保存成图片」这类任务，直接用 browser_open + browser_screenshot
+  即可，**不要**去点开屏幕上的浏览器 App，也不要把网址当成搜索关键词；
+- browser_screenshot 截的是虚拟屏里当前页面的真实合成画面（含 WebGL/video）；只取文字用 browser_read 更省。
 - mcp_list
 - mcp_tools {server}
 - mcp_call {server,tool,arguments:"{}"}  arguments 是 JSON 对象字符串
@@ -251,7 +259,9 @@ class CloudPlanner(private val settingsProvider: () -> AgentSettings) : Planner 
 4. 支付、转账、删除、发送消息、提交订单这类不可逆或对外动作，执行层会在动作落地前强制弹出确认；
    你只在信息不足（收款人、金额、内容、对象不明确）时用 ask 澄清，不要为了"确认一下"重复 ask。
 5. 判断任务已完成就用 done，不要多余操作。
-6. 需要登录或动态网页时使用 browser_*；browser_read 读不到正文时先 browser_click 关闭遮挡层、处理同意按钮或等待。
+6. 打开网址、读取或截取网页一律用**内置浏览器**的 browser_*（browser_open/read/screenshot…），
+   它在虚拟屏后台运行、不抢屏幕；**禁止**用 open 去启动外部浏览器 App（Chrome/系统浏览器/夸克等）。
+   需要登录或动态网页时用 browser_*；browser_read 读不到正文时先 browser_click 关闭遮挡层、处理同意按钮或等待。
 7. mcp_call、script_run 和会修改文件/联网的终端命令一律由执行层确认；只在参数不明确时用 ask 澄清。
 8. 只输出 JSON。
 9. 不声称已完成未执行的动作；需要实时信息时优先用 query 端侧搜索源（新闻/网页/行情/天气/余票等），

@@ -1497,7 +1497,17 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 return
             }
         }
-        // 3) 无障碍缺失或服务未连上时，不需要屏幕的命令直接在本机完成。
+        // 3) 浏览器任务（含网址+打开/截屏等操作，或「浏览器」+操作）直接交给 Agent：
+        //    绕过快路径、本地工具、强查询、意图路由的层层误判——实测「用浏览器打开
+        //    https://www.qq.com 并截图」会被本地工具当成「打开网页 App」或被强查询当成
+        //    web_search。Agent 已知道用内置浏览器（虚拟屏）的 browser_* 完成。
+        if (IntentGate.isBrowserTask(g)) {
+            add(LogEntry.Kind.THINK, "浏览器任务：用内置浏览器执行")
+            AgentRuntime.speaker.speak("请稍等")
+            startAgent(g, AssistantMode.AGENT)
+            return
+        }
+        // 4) 无障碍缺失或服务未连上时，不需要屏幕的命令直接在本机完成。
         if (tryRunFastPath(g, allowConfirmation = true)) return
         if (!screenReady() && com.pilot.agent.action.ScreenRequirements.requirement(g) ==
             com.pilot.agent.action.ScreenRequirement.NONE

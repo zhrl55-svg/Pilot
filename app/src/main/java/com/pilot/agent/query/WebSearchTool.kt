@@ -40,7 +40,8 @@ class WebSearchTool : QueryTool {
     override fun matches(goal: String): Boolean {
         val q = goal.lowercase()
         return listOf(
-            "网页", "网上搜", "上网搜", "上网查", "网上查", "帮我搜", "搜一下", "搜索一下",
+            // 不放裸词「网页」：含「网页」的浏览器操作（打开/截屏）不该被当成搜索关键词。
+            "网上搜", "上网搜", "上网查", "网上查", "帮我搜", "搜一下", "搜索一下",
             "搜索网页", "查资料", "查官网", "搜索", "网页搜索",
         ).any(q::contains) ||
             (listOf("怎么用", "教程", "官网", "资料", "介绍").any(q::contains) && q.contains("？"))

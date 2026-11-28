@@ -34,7 +34,7 @@ private const val TAG = "Pilot"
 private val clockLike = Regex("""^(\d{1,2}[:：]\d{2}([:：]\d{2})?|\d{1,3}%|\d{1,2}/\d{1,2})$""")
 
 private val agentOnlyActions = setOf(
-    "browser_open", "browser_read", "browser_click", "browser_type",
+    "browser_open", "browser_read", "browser_screenshot", "browser_click", "browser_type",
     "browser_scroll", "browser_back", "browser_close",
     "mcp_list", "mcp_tools", "mcp_call", "script_list", "script_run",
 )
@@ -831,7 +831,34 @@ class AgentLoop(
                 "swipe" -> x != null && y != null && x2 != null && y2 != null &&
                     actions.swipe(x, y, x2, y2, (a.ms ?: 300).toLong())
                 "scroll" -> id != null && actions.scroll(id, target != "backward")
-                "open" -> target != null && actions.openApp(target)
+                "open" -> {
+                    // ★ 目标里带网址时，open 一律改走**内置浏览器**（虚拟屏后台，不抢屏幕），
+                    //   禁止启动外部浏览器 App（Edge/Chrome/夸克…）。真机实测模型会用
+                    //   open{target:"浏览器"} 或 open{target:"qq.com"} 拉起 Edge，而不是 browser_open。
+                    val url = browserUrlInGoal()
+                    val targetIsUrl = target != null &&
+                        (target.contains("://") || Regex(
+                            "\\b[\\w-]+\\.(com|cn|net|org|io|dev|app|me|co|info|xyz|top|site|gov|edu)\\b",
+                            RegexOption.IGNORE_CASE,
+                        ).containsMatchIn(target))
+                    if (url != null && (targetIsUrl || looksLikeBrowserTarget(target) ||
+                            activeGoal.contains("浏览器") || activeGoal.contains("网页"))
+                    ) {
+                        val r = BrowserSessionManager.execute(
+                            context = com.pilot.agent.PilotApp.instance,
+                            action = "browser_open",
+                            target = url,
+                            text = null,
+                            maxChars = null,
+                            showToUser = false,
+                        )
+                        lastActionResult = "改用内置浏览器打开 $url：${r.message}"
+                        emit(AgentEvent.Observe(lastActionResult.orEmpty()))
+                        r.ok
+                    } else {
+                        target != null && actions.openApp(target)
+                    }
+                }
                 "shortcut" -> target != null && actions.openShortcut(target)
                 "component" -> {
                     if (target != null && target.contains('/')) {
@@ -873,7 +900,7 @@ class AgentLoop(
                     emit(AgentEvent.Observe(result))
                     true
                 }
-                "browser_open", "browser_read", "browser_click", "browser_type",
+                "browser_open", "browser_read", "browser_screenshot", "browser_click", "browser_type",
                 "browser_scroll", "browser_back", "browser_close" -> {
                     val result = BrowserSessionManager.execute(
                         context = com.pilot.agent.PilotApp.instance,
@@ -1552,6 +1579,25 @@ class AgentLoop(
     private fun uiAffecting(a: AgentAction): Boolean = when (a.action) {
         "tap", "tap_node", "long_press", "input", "swipe", "scroll", "key", "open", "shortcut", "component" -> true
         else -> false
+    }
+
+    /** 目标里出现的网址（http(s) 或裸域名），用于把「打开浏览器 App」纠正为内置浏览器。 */
+    private fun browserUrlInGoal(): String? {
+        val g = activeGoal
+        Regex("https?://[^\\s，,。；;）)】」\"']+", RegexOption.IGNORE_CASE).find(g)
+            ?.let { return it.value.trimEnd('.', '，', ',', '。', '；', ';') }
+        Regex("\\b[\\w-]+\\.(com|cn|net|org|io|dev|app|me|co|info|xyz|top|site|gov|edu)\\b(?:/[^\\s，,。；;）)】」\"']*)?", RegexOption.IGNORE_CASE)
+            .find(g)?.let { return "https://${it.value.trimEnd('.', '，', ',', '。', '；', ';')}" }
+        return null
+    }
+
+    /** 目标名是否是浏览器 App（Edge/Chrome/夸克…）。 */
+    private fun looksLikeBrowserTarget(target: String?): Boolean {
+        val t = target?.lowercase().orEmpty()
+        if (t.isBlank()) return false
+        return listOf(
+            "edge", "chrome", "browser", "浏览器", "夸克", "quark", "firefox", "uc", "safari", "opera", "vivaldi",
+        ).any { t.contains(it) }
     }
 
     /**

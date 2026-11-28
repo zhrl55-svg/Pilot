@@ -44,6 +44,7 @@ data class AgentAction(
         "app_func" -> "调用应用工具 ${target.orEmpty()}（参数已隐藏）"
         "browser_open" -> "打开网页 ${url ?: target.orEmpty()}"
         "browser_read" -> "读取浏览器正文"
+        "browser_screenshot" -> "截取浏览器页面画面"
         "browser_click" -> "点击网页「${target.orEmpty().take(40)}」"
         "browser_type" -> "填写网页 ${target.orEmpty().take(40)}（内容已隐藏）"
         "browser_scroll" -> "滚动网页 ${target ?: "forward"}"
@@ -75,6 +76,7 @@ data class AgentAction(
           {"name":"app_func","description":"在 Android 16+ 且系统已授权时调用目标应用公开的 AppFunction；target 格式为 package/functionId，text 为 JSON 参数。调用前必须向用户确认。不可用时改走界面操作。","parameters":{"type":"object","properties":{"target":{"type":"string"},"text":{"type":"string"}},"required":["target"]}},
           {"name":"browser_open","description":"在可见的持久浏览器会话中打开 HTTP/HTTPS 网页，保留登录 Cookie","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}},
           {"name":"browser_read","description":"读取当前网页标题、网址和正文","parameters":{"type":"object","properties":{"maxChars":{"type":"integer"}}}},
+          {"name":"browser_screenshot","description":"截取当前网页画面（虚拟屏 GPU 离屏渲染，普通签名可用，含 WebGL/video）。返回截图文件路径；需要看画面时用，纯文字用 browser_read。","parameters":{"type":"object","properties":{}}},
           {"name":"browser_click","description":"点击网页中的按钮或链接；target 可写可见文字，或 css:<选择器>","parameters":{"type":"object","properties":{"target":{"type":"string"}},"required":["target"]}},
           {"name":"browser_type","description":"填写网页输入框；target 可写占位文字、name、aria-label，或 css:<选择器>","parameters":{"type":"object","properties":{"target":{"type":"string"},"text":{"type":"string"}},"required":["target","text"]}},
           {"name":"browser_scroll","description":"滚动当前网页","parameters":{"type":"object","properties":{"target":{"type":"string","enum":["forward","backward"]}}}},
@@ -106,7 +108,7 @@ val KNOWN_ACTIONS: Set<String> = setOf(
     "tap", "tap_node", "long_press", "input", "swipe", "scroll",
     "open", "shortcut", "component", "key", "systemop", "query",
     "done", "wait", "ask", "unable", "app_func",
-    "browser_open", "browser_read", "browser_click", "browser_type",
+    "browser_open", "browser_read", "browser_screenshot", "browser_click", "browser_type",
     "browser_scroll", "browser_back", "browser_close",
     "mcp_list", "mcp_tools", "mcp_call", "script_list", "script_run",
 )

@@ -139,6 +139,8 @@ assets/             alpine-minirootfs.tar.gz（Alpine 3.21）
 
 Cookie 由系统 CookieManager 共享，小窗与全屏切换按 `currentUrl` 续页。
 
+**虚拟屏离屏渲染（`HeadlessRenderHost`，移植自 Minis）**：后台无头 WebView 不挂任何窗口，Chromium 对软件 draw 拿不到 GPU 表面（WebGL/video 会空白）。截屏时临时给它一块**私有虚拟屏**（`VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY`，只本 App 可见、用户看不到、**无需任何权限、普通安装可用**），背后接 `ImageReader`、屏上放 `Presentation`，走正常硬件渲染管线读回一帧合成画面，再摘回 WebView。因此 `browser_screenshot` 能截到网页真实画面（含 WebGL/video），且不抢用户屏幕、不弹外部浏览器 App。`browser_open/read/click/type/scroll` 都在内置浏览器里完成；Agent 的 `open` 动作若目标带网址，会自动纠正为内置浏览器打开。
+
 ### 9. 虚拟屏执行（需平台签名）
 
 `display/VirtualDisplayHost` 探测是否持有 `ADD_TRUSTED_DISPLAY`：有则 `createVirtualDisplay` 把目标任务 App 启动到独立显示屏，操作不抢用户屏幕；没有（普通签名）自动退回「做完切回」，Guard / 确认流程不变。
