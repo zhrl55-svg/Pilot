@@ -161,8 +161,8 @@ class VoiceprintGate(private val context: Context) {
         }
     }
 
-    // ★ 原 enrollIfAbsent（首句自动注册）已删除：第一个开口的人（家人、电视、播报回声）
-    //   会成为"主人"，之后真正的主人被静默拒绝（审核 S6 / V-07）。注册只能由界面显式发起。
+    // ★ 首句自动注册由 VoiceInput.recognize() 在无模板时调用 enroll() 完成（老板要求恢复原始体验）。
+    //   注意：第一个开口的人会成为"主人"——这是该策略的已知取舍。
 
     /** 用这段音频覆盖模板（注册 / 重新注册） */
     fun enroll(pcm: ShortArray): Boolean {

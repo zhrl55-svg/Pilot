@@ -672,10 +672,9 @@ class VoiceInput(
     var onEnrollDone: (Boolean) -> Unit = {}
 
     /**
-     * 历史回调：原"首句自动注册成功"。
+     * 首句自动注册成功回调（在音频线程触发，UI 侧自行切主线程）。
      *
-     * ★ 首句自动注册已删除（审核 S6 / V-07：第一个开口的人会成为主人）。
-     *   保留属性只为兼容界面层的赋值，**现在不会再被调用**；注册结果请看 [onEnrollDone]。
+     * 还没有声纹模板时，唤醒后说的第一句会被自动注册为声纹，注册成功后回调这里。
      */
     var onEnrolled: () -> Unit = {}
 
@@ -1050,12 +1049,11 @@ class VoiceInput(
         Dbg.i(TAG, "唤醒候选「$word」，等声纹结果再决定是否进入聆听")
 
         val s = AgentSettings.load()
-        // ★ 还没有模板：**不再**拿这句唤醒词自动注册（审核 S6 / V-07——第一个开口的人
-        //   会被认成主人，之后真正的主人被静默拒绝）。照常回应唤醒，但这一轮的每句话都会
-        //   标成 SpeakerAuth.NOT_ENROLLED，读通知/个人数据等敏感能力需要解锁或先在界面里注册。
+        // ★ 还没有模板：唤醒照常响应，随后在 recognize() 里用唤醒后说的**第一句**
+        //   自动注册声纹（老板要求恢复原始体验）。注意：第一个开口的人会成为主人。
         if (!gate.hasTemplate()) {
             if (logThrottled("not-enrolled", 10 * 60_000L)) {
-                Dbg.i(TAG, "尚未注册声纹：唤醒照常响应，敏感能力需解锁或先注册声纹")
+                Dbg.i(TAG, "尚未注册声纹：唤醒照常响应，第一句话会自动注册为声纹")
             }
             wakeAuthorized = true
             acknowledgeWake(word)
@@ -1193,7 +1191,17 @@ class VoiceInput(
                 lastVerifiedAt = SystemClock.uptimeMillis()
                 val text = asr.transcribe(pcm)
                 val authorized = wakeAuthorized
-                // ★ 原"首句自动注册"已删除（审核 S6 / V-07）：注册只能由用户在界面里显式发起。
+                // ★ 首句自动注册（老板要求恢复原始体验）：还没有声纹模板时，
+                //   唤醒后说的第一句就作为注册样本。注意：第一个开口的人会成为主人。
+                if (authorized && !gate.hasTemplate()) {
+                    val ok = gate.enroll(pcm)
+                    if (ok) {
+                        Dbg.i(TAG, "首句自动注册声纹成功")
+                        main.post { runCatching { onEnrolled() } }
+                    } else {
+                        Dbg.w(TAG, "首句自动注册声纹失败：${gate.lastError}")
+                    }
+                }
                 // ★ 把识别结果写给导航界面（搜索框自动填入）
                 if (authorized && text != null) {
                     runCatching { VoiceState.write(context, VoiceState.IDLE, text) }
