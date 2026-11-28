@@ -202,6 +202,7 @@ class AgentIntentRouter(private val settingsProvider: () -> AgentSettings) {
 4. 不得操作 Pilot 自己的聊天框来重复提交用户问题；真正需要执行时只返回 agent，由执行层继续。
 5. 有歧义且可能影响设备状态时选择 agent，让执行层读取上下文后再决定。
 6. 涉及删除、支付、发送消息、提交订单等动作，执行层仍必须向用户确认。
+7. 若最近一轮回答以「任务未完成：」开头，追问「刚才那个没完成」「继续/重试」都指向该失败任务，不得答复更早成功任务的内容。
 
 ${IntentGate.SELF_KNOWLEDGE}
 """.trimIndent()

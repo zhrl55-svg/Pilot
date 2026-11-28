@@ -53,6 +53,9 @@ class LocalPlanner(private val llmProvider: () -> LocalLlm) : Planner {
 
     private fun buildPrompt(req: AgentRequest, noThink: Boolean): String {
         val history = req.history.takeLast(3).joinToString("\n") { "· $it" }
+        val chatContext = req.chatHistory.takeLast(1).joinToString("\n") { (question, answer) ->
+            "上一轮用户：${question.take(100)}\n上一轮助手：${answer.take(140)}"
+        }
         val screen = compact(req.snapshot)
         val suffix = if (noThink) "/no_think" else ""
         return buildString {
@@ -60,6 +63,9 @@ class LocalPlanner(private val llmProvider: () -> LocalLlm) : Planner {
             append(SYSTEM_PROMPT)
             append("<|im_end|>\n<|im_start|>user\n")
             append("目标：").append(req.goal).append('\n')
+            if (chatContext.isNotBlank()) {
+                append("最近一轮对话（用于理解本轮指代）：\n").append(chatContext).append('\n')
+            }
             if (history.isNotEmpty()) append("已做：\n").append(history).append('\n')
             append("屏幕：\n").append(screen).append('\n')
             append("只输出 JSON。").append(suffix)

@@ -59,6 +59,9 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
 
         /** 唤醒时的回应 */
         const val WAKE_REPLY = "我在"
+
+        /** 供多轮上下文识别未完成任务的内部标记。 */
+        const val FAILED_TASK_CONTEXT_PREFIX = "任务未完成："
     }
 
     var settings by mutableStateOf(AgentSettings.load())
@@ -1431,12 +1434,35 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         val g = goal.trim()
         if (g.isEmpty() || running) return
         reloadSettings()
+        val dispatchGoal = resolveFailedTaskFollowUp(g) ?: g
+        if (dispatchGoal != g) {
+            Dbg.i(TAG, "跟进未完成任务：原目标字符数=${dispatchGoal.length}")
+        }
         // 展示层复用遗留匹配器的等价文案（SSH 等命令），但不再执行它。
         val displayTool = AgentRuntime.localTools.match(g)
         // 语音回调、文字发送和本地工具都从这里进入。统一在同一处追加，
         // 避免操作指令被上游和 run() 各写一次而在聊天框显示两遍。
         addUserMessageIfNeeded(AgentRuntime.localTools.displayTextFor(g, displayTool))
-        dispatchRequest(g)
+        dispatchRequest(dispatchGoal)
+    }
+
+    /**
+     * 最近一次 Agent 任务失败后，用户用「刚才那个没完成」「继续/重试」指代它时，
+     * 把原目标重新送入路由。否则路由只能看到模糊追问，并可能误取更早的成功结果。
+     */
+    private fun resolveFailedTaskFollowUp(text: String): String? {
+        val (failedGoal, failure) = chatHistory.lastOrNull() ?: return null
+        if (!failure.startsWith(FAILED_TASK_CONTEXT_PREFIX)) return null
+        val t = text.trim()
+        val refersToPrevious = listOf(
+            "刚才", "刚刚", "上一个", "上次", "这个任务", "那个任务", "前一个", "那件事",
+        ).any(t::contains)
+        val asksToResume = listOf(
+            "没完成", "没有完成", "未完成", "失败", "继续", "重试", "再试", "接着",
+        ).any(t::contains)
+        val shortRetry = t in setOf("继续", "重试", "再试一次", "再试试", "接着来")
+        if ((!refersToPrevious || !asksToResume) && !shortRetry) return null
+        return failedGoal.takeIf { it.isNotBlank() }
     }
 
     /**
@@ -2081,6 +2107,13 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 refreshStatus()
             }
             is AgentEvent.Failed -> {
+                val goal = activeTaskLabel.trim()
+                if (goal.isNotBlank() && goal !in setOf("本机能力", "Agent 判断目标", "查询")) {
+                    chatHistory.addLast(
+                        goal to "$FAILED_TASK_CONTEXT_PREFIX${ev.reason.take(500)}",
+                    )
+                    while (chatHistory.size > 40) chatHistory.removeFirst()
+                }
                 add(LogEntry.Kind.ERROR, ev.reason)
                 running = false
                 justSent = false
