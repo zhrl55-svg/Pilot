@@ -124,6 +124,19 @@ class NavigationService : Service() {
             if (simulated) NLog.i(TAG, "本次请求启用模拟导航")
             currentTravelMode = travelMode
             NLog.i(TAG, "开始导航请求 mode=${travelMode.name} destination=$destination")
+            // ★ 高德 Key 由使用者自备：导航/地点搜索/算路都依赖它。两个 Key 都没有时
+            //   直接提示去设置，而不是发起必然失败的网络请求再报一堆错误码。
+            if (!NavKeys.hasWebKey(this@NavigationService) &&
+                !NavKeys.hasSdkKey(this@NavigationService)
+            ) {
+                NLog.w(TAG, "高德 Key 未配置，导航不可用")
+                currentState = State.FAILED
+                emit(
+                    jobId, "error", NavKeys.NOT_CONFIGURED_HINT,
+                    priority = 0, stateName = currentState.toString(),
+                )
+                return jobId
+            }
             currentState = State.ROUTING
 
             // ★ 先查常去地点：「回家」「去公司」这种词直接命中收藏，
@@ -193,6 +206,7 @@ class NavigationService : Service() {
                 emit(jobId, "error", msg, priority = 0, stateName = currentState.toString())
             }
             WebPoiSearch.search(
+                context = this@NavigationService,
                 keyword = destination,
                 city = loc.city,
                 currentLat = loc.lat,
@@ -364,9 +378,9 @@ class NavigationService : Service() {
                 NLog.w(TAG, "SDK 算路熔断中，${(sdkBlockedUntil - now) / 1000}s 后重试：$sdkBlockedReason")
                 return false
             }
-            val keyStatus = NavKeys.check(this)
-            if (keyStatus.contains("sdkKey=missing")) {
-                blockSdk("Android SDK Key 未注入", SDK_KEY_BACKOFF_MS)
+            NavKeys.check(this)
+            if (!NavKeys.hasSdkKey(this)) {
+                blockSdk("未配置高德 Android Key", SDK_KEY_BACKOFF_MS)
                 return false
             }
             val e = engine()
@@ -442,8 +456,8 @@ class NavigationService : Service() {
         if (now < sdkBlockedUntil) {
             NLog.w(TAG, "SDK 算路熔断中，收藏点直接回退 Web")
             false
-        } else if (NavKeys.check(this).contains("sdkKey=missing")) {
-            blockSdk("Android SDK Key 未注入", SDK_KEY_BACKOFF_MS)
+        } else if (!NavKeys.hasSdkKey(this)) {
+            blockSdk("未配置高德 Android Key", SDK_KEY_BACKOFF_MS)
             false
         } else {
             val e = engine()
@@ -510,7 +524,7 @@ class NavigationService : Service() {
     /** Web 算路器（懒初始化）。 */
     private fun webRoute(): WebRoutePlanner {
         webRoute?.let { return it }
-        return WebRoutePlanner().also { webRoute = it }
+        return WebRoutePlanner(this).also { webRoute = it }
     }
 
     /** 引导播报器（懒初始化）。 */

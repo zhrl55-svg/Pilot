@@ -15,18 +15,14 @@ android {
         applicationId = "com.pilot.agent"
         minSdk = 30
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.1"
         resourceConfigurations += listOf("zh", "en")
-        // 高德 Key（密钥，放 local.properties 不入库）。
-        // ★ local.properties 的键**不会**自动变成 gradle project property
-        //   （那是 Android Studio 的行为，命令行构建拿不到）——
-        //   必须自己读 Properties 文件，否则 manifestPlaceholder 是空串，
-        //   高德直接报 USERKEY 错误（踩过：value="" 在 aapt2 dump 里看出来的）。
-        // 高德 Key：优先用 pilot 专属的（AMAP_KEY_PILOT），没配就回退老的
-        // （老 Key 绑在 nav-agent 包名下，SDK 算路会被拒，但 POI/定位还能用）
-        manifestPlaceholders["AMAP_KEY"] =
-            localProp("AMAP_KEY_PILOT").ifBlank { localProp("AMAP_KEY") }
+        // ★ 高德 Key 不再在构建期注入。
+        //   公开版本不能内置作者个人的 Key（否则别人使用会消耗作者的配额）。
+        //   Android / Web Key 一律由使用者在 App 内「设置 → 导航与地图」填写，
+        //   运行时通过 AMapNavi / MapsInitializer / AMapLocationClient /
+        //   ServiceSettings 的 setApiKey 注入（见 NavKeys.applySdkKey）。
 
         // ★ 只打 arm64-v8a。
         //   原来四个架构全打：arm64 52MB + x86 14MB + x86_64 14MB + v7a 11MB（压缩后），

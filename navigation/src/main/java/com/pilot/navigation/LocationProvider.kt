@@ -94,8 +94,16 @@ class LocationProvider(private val context: Context) {
     // ------------------------------------------------------------ 通道 1：高德
 
     private fun startAmapLocation() {
+        // ★ 公开版本不内置高德 Key：没有用户自己的 Android Key 就不启动高德定位，
+        //   只用系统定位兜底（精度差一点，但不依赖任何 Key）。
+        if (!NavKeys.hasSdkKey(context)) {
+            NLog.w(TAG, "未配置高德 Android Key，跳过高德定位，改用系统定位")
+            return
+        }
         runCatching {
             AmapNaviEngine.agreePrivacy(context)
+            // AMapLocationClient 创建前注入用户 Key。
+            NavKeys.applySdkKey(context)
             val option = AMapLocationClientOption().apply {
                 setLocationMode(AMapLocationClientOption.AMapLocationMode.Hight_Accuracy)
                 setOnceLocation(false)

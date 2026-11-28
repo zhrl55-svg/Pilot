@@ -45,9 +45,10 @@ class WeatherTool : QueryTool {
     }
 
     override suspend fun execute(goal: String): String = withContext(Dispatchers.IO) {
-        val key = NavKeys.webKey()
+        val key = NavKeys.webKey(PilotApp.instance)
         if (key.isBlank()) {
-            return@withContext "天气查询还没配置高德 Web Key，请在 local.properties 里设置 AMAP_WEB_KEY。"
+            // Key 由使用者自备；给出明确设置入口，而不是让用户去改 local.properties。
+            return@withContext NavKeys.NOT_CONFIGURED_HINT
         }
 
         val cityName = cityFromGoal(goal)
@@ -140,7 +141,7 @@ class WeatherTool : QueryTool {
             .mapNotNull { runCatching { lm.getLastKnownLocation(it) }.getOrNull() }
             .filter { it.latitude != 0.0 && it.longitude != 0.0 }
             .maxByOrNull { it.time }
-        val adcode = loc?.let { GeoCoder.adcodeOf(it.latitude, it.longitude) }
+        val adcode = loc?.let { GeoCoder.adcodeOf(ctx, it.latitude, it.longitude) }
         if (adcode != null) return adcode
         Dbg.w(TAG, "定位反查 adcode 失败")
         return null

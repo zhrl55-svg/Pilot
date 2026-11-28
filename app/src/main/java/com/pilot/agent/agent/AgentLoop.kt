@@ -1350,20 +1350,32 @@ class AgentLoop(
             "navigate" -> {
                 // 导航：高德 SDK 在 :navigation 进程，主进程只发指令 + 收播报。
                 val ctx = com.pilot.agent.PilotApp.instance
-                val jobId = com.pilot.agent.navigation.NavigationClient.startNavi(ctx, arg)
-                if (jobId == 0L) {
-                    emit(AgentEvent.Observe("导航服务没连上"))
-                    false
-                } else {
-                    // ★ 导航播报要**抢占**普通播报：「前方 200 米右转」不能等
-                    //   前面那句说完。onAnnounce 里用 speakPriority。
-                    com.pilot.agent.navigation.NavigationClient.onAnnounce = { text, priority ->
-                        com.pilot.agent.runtime.AgentRuntime.speaker.speakPriority(
-                            text, priority >= 1,
-                        )
-                    }
-                    emit(AgentEvent.Observe("开始导航去 $arg"))
+                // ★ 公开版本不内置高德 Key：未配置时直接告诉用户去设置，
+                //   不发起必然失败的调用（导航服务的 error 事件目前不回传界面）。
+                if (!com.pilot.agent.navigation.NavigationClient.isConfigured(ctx)) {
+                    emit(
+                        AgentEvent.Observe(
+                            "高德服务还没配置。请到「设置 → 导航与地图」填入你自己申请的高德 Key" +
+                                "（lbs.amap.com 可免费申请）；未配置时导航不可用。",
+                        ),
+                    )
                     true
+                } else {
+                    val jobId = com.pilot.agent.navigation.NavigationClient.startNavi(ctx, arg)
+                    if (jobId == 0L) {
+                        emit(AgentEvent.Observe("导航服务没连上"))
+                        false
+                    } else {
+                        // ★ 导航播报要**抢占**普通播报：「前方 200 米右转」不能等
+                        //   前面那句说完。onAnnounce 里用 speakPriority。
+                        com.pilot.agent.navigation.NavigationClient.onAnnounce = { text, priority ->
+                            com.pilot.agent.runtime.AgentRuntime.speaker.speakPriority(
+                                text, priority >= 1,
+                            )
+                        }
+                        emit(AgentEvent.Observe("开始导航去 $arg"))
+                        true
+                    }
                 }
             }
 

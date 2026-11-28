@@ -59,6 +59,17 @@ object NavigationClient {
         }
     }
 
+    /**
+     * 导航是否可用：至少配置了一个高德 Key（Android 或 Web）。
+     *
+     * 公开版本不内置 Key，未配置时直接给用户可执行的提示，
+     * 不必发起一次注定失败的 binder 调用。
+     */
+    fun isConfigured(context: Context): Boolean = runCatching {
+        val nav = com.pilot.navigation.NavigationSettings.load(context.applicationContext)
+        nav.amapSdkKey.isNotBlank() || nav.amapWebKey.isNotBlank()
+    }.getOrDefault(false)
+
     /** 开始导航。返回 jobId，0 = 失败（服务不可用）。 */
     suspend fun startNavi(context: Context, destination: String, strategy: Int = 0): Long {
         val svc = ensureBound(context) ?: return 0L

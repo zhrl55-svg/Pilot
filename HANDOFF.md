@@ -301,12 +301,21 @@ Speaker.speakNav（不可打断）
 | 22 | INVALID_USER_SCODE | **安全码格式**：高德控制台要求**带冒号**的 SHA1 | 填 `26:F6:15:CD:A0:6C:...` |
 | 6 | ERROR_ENDPOINT | POI 坐标是**停车场中心/建筑内部**，不在道路上 | 用 `NaviPoi(poiId, LatLng, name)` 传 **POI ID** |
 
-**Key 管理**
-- `local.properties`（不入库）：`AMAP_KEY_PILOT`（SDK Key，绑 com.pilot.agent）、
-  `AMAP_WEB_KEY`（Web Key，地点搜索/算路/逆地理编码）
-- ★ 坑：`local.properties` 的键**不会**自动变成 gradle project property
-  （那是 Android Studio 的行为），命令行构建拿到空串。
-  必须自己读 `Properties` 文件——`aapt2 dump` 看到 `value=""` 才发现
+**Key 管理（2026-11-28 起不再内置）**
+- 高德 Key 由使用者在 App 内「设置 → 导航与地图」填写，存本机私有文件
+  `nav_settings.json`（`NavigationSettings`）。
+  - Android 平台 Key：导航/定位 SDK，绑包名 `com.pilot.agent` + **当前安装包签名 SHA1**
+    （设置页直接显示，复制去高德控制台填）。
+  - Web 服务 Key：天气、地点搜索、路线规划、逆地理编码。
+- 运行时通过 `AMapNavi.setApiKey` / `MapsInitializer.setApiKey` /
+  `AMapLocationClient.setApiKey` / `ServiceSettings.setApiKey` 注入（`NavKeys.applySdkKey`），
+  必须在创建任何 SDK 组件之前调用。
+- 公开版本**不内置作者 Key**：旧的 `AMAP_KEY_PILOT` / `AMAP_WEB_KEY` 构建期注入
+  （manifest placeholder / BuildConfig）已移除。
+- 未配置时：两个 Key 都无 → 导航直接提示去设置；只有 Web Key → 走 Web 算路 + 语音引导
+  （无地图渲染）；只有 Android Key → SDK 算路可用，但 Web 天气/地点搜索不可用。
+- ★ 历史坑：`local.properties` 的键**不会**自动变成 gradle project property
+  （那是 Android Studio 的行为），命令行构建拿到空串——这也是改成运行时配置的原因之一。
 
 **地图相关**
 - 地图停在北京市：两个原因叠加 —— ① `startService` 是**异步**的；

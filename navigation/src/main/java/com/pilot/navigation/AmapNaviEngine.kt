@@ -128,7 +128,17 @@ class AmapNaviEngine(
      */
     fun init() {
         if (started) return
+        // ★ 公开版本不内置高德 Key：没有用户自己的 Android Key 就不初始化 SDK，
+        //   由上层（NavigationService）降级到 Web 通道，或在都未配置时提示去设置。
+        if (!NavKeys.hasSdkKey(context)) {
+            NLog.w(TAG, "未配置高德 Android Key，跳过 SDK 导航（可在 设置→导航与地图 填写）")
+            onStateChange("未配置高德 Android Key")
+            return
+        }
         agreePrivacy(context)
+        // ★ 必须在 AMapNavi.getInstance 和 NavActivity 创建 AMapNaviView **之前**
+        //   把用户的 Key 注入各 SDK；否则 SDK 以空 Key 初始化后不会再读。
+        NavKeys.applySdkKey(context)
         // 先把导航界面拉起来（它内部会创建 AMapNaviView）
         runCatching { NavActivity.show(context, pendingDestination ?: "") }
         runCatching {

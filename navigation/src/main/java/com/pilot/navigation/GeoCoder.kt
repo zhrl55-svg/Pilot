@@ -1,5 +1,6 @@
 package com.pilot.navigation
 
+import android.content.Context
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -25,9 +26,9 @@ object GeoCoder {
      *
      * @return 形如「甘肃省张掖市甘州区南街街道县府街36号」；失败返回 null
      */
-    fun reverse(lat: Double, lon: Double): String? {
+    fun reverse(context: Context, lat: Double, lon: Double): String? {
         if (lat == 0.0 || lon == 0.0) return null
-        val key = NavKeys.webKey()
+        val key = NavKeys.webKey(context)
         if (key.isBlank()) {
             NLog.w(TAG, "Web Key 没配，无法反查地址")
             return null
@@ -77,9 +78,9 @@ object GeoCoder {
      * 反查城市 adcode（高德天气接口只认 adcode，不认城市名）。
      * 同步调用，调用方放子线程。失败返回 null。
      */
-    fun adcodeOf(lat: Double, lon: Double): String? {
+    fun adcodeOf(context: Context, lat: Double, lon: Double): String? {
         if (lat == 0.0 || lon == 0.0) return null
-        val key = NavKeys.webKey()
+        val key = NavKeys.webKey(context)
         if (key.isBlank()) return null
         return runCatching {
             val tail = "?key=$key&location=$lon,$lat&extensions=base&batch=false"
@@ -103,12 +104,12 @@ object GeoCoder {
      * 反查地址，失败时退回「附近的路名或 POI 名」。
      * 给 UI 直接显示用，保证不会出现纯经纬度。
      */
-    fun describe(lat: Double, lon: Double, fallback: String = "当前位置"): String {
-        val addr = reverse(lat, lon)
+    fun describe(context: Context, lat: Double, lon: Double, fallback: String = "当前位置"): String {
+        val addr = reverse(context, lat, lon)
         if (!addr.isNullOrBlank()) return addr
         // 反查失败：用附近的 POI 名兜底
         val near = runCatching {
-            WebPoiSearch.searchBlocking("附近", null, lat, lon, 1).firstOrNull()
+            WebPoiSearch.searchBlocking(context, "附近", null, lat, lon, 1).firstOrNull()
         }.getOrNull()
         return near?.name ?: fallback
     }

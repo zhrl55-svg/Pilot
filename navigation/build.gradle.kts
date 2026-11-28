@@ -17,10 +17,9 @@ android {
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
-        // 高德 Web Key（地点搜索用，不绑包名）。密钥放 local.properties 不入库。
-        // ★ 同 app 模块：local.properties 的键不会自动进 project property，
-        //   必须自己读 Properties 文件。
-        buildConfigField("String", "AMAP_WEB_KEY", "\"${localProp("AMAP_WEB_KEY")}\"")
+        // 高德 Web Key 不再编进 BuildConfig：公开版本不内置作者个人的 Key。
+        // Key 由使用者在 App 内设置里填写，运行时从 NavigationSettings 读取
+        // （见 NavKeys.webKey）。
     }
 
     buildFeatures {

@@ -1,5 +1,6 @@
 package com.pilot.navigation
 
+import android.content.Context
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -24,7 +25,7 @@ import java.net.URL
  * 「进入某一步时播 + 距离递减到阈值再播下一条」的方式生成播报，
  * 简化版：每一步开始时播该步的 instruction，重要转折提前 200 米提醒。
  */
-class WebRoutePlanner {
+class WebRoutePlanner(private val context: Context) {
 
     companion object {
         private const val BASE_DRIVE = "https://restapi.amap.com/v3/direction/driving"
@@ -65,8 +66,15 @@ class WebRoutePlanner {
         onResult: (Route) -> Unit,
         onError: (String) -> Unit,
     ) {
+        // ★ Key 由使用者自备；未配置时明确提示，不要拿空 Key 去请求。
+        val key = NavKeys.webKey(context)
+        if (key.isBlank()) {
+            NLog.w(TAG, "未配置高德 Web 服务 Key，算路不可用")
+            onError(NavKeys.NOT_CONFIGURED_HINT)
+            return
+        }
         val tail = buildString {
-            append("?key=").append(NavKeys.webKey())
+            append("?key=").append(key)
             // 高德的经纬度顺序是「经度,纬度」
             append("&origin=").append("$fromLon,$fromLat")
             append("&destination=").append("$toLon,$toLat")

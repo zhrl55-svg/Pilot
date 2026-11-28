@@ -185,10 +185,10 @@
             android:noHistory="true"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
-        <!-- 高德 Key：绑定包名（com.pilot.agent），从 local.properties 注入 -->
-        <meta-data
-            android:name="com.amap.api.v2.apikey"
-            android:value="${AMAP_KEY}" />
+        <!-- 高德 Key 不再写进 manifest：公开版本不内置任何 Key。
+             Android / Web Key 由使用者自己在「设置 → 导航与地图」填写，
+             运行时通过 AMapNavi / MapsInitializer / AMapLocationClient /
+             ServiceSettings 的 setApiKey 注入（见 NavKeys.applySdkKey）。 -->
 
         <!--
           高德定位的辅助服务。高德 navi SDK 是纯 jar（不是 aar），

@@ -227,7 +227,7 @@ class SearchPanel(
         val city = loc?.city
         Thread {
             val list = runCatching {
-                WebPoiSearch.searchBlocking(q, city, lat, lon, limit = 10)
+                WebPoiSearch.searchBlocking(activity, q, city, lat, lon, limit = 10)
             }.getOrDefault(emptyList())
             // 距离安全阀：超过 50km 的丢掉（防止搜出外地同名地点）
             val near = if (lat != 0.0) {

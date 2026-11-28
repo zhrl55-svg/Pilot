@@ -9,7 +9,7 @@ Pilot 不是「聊天框里接一个大模型」，而是一个能自主执行�
 | 项目 | 值 |
 |---|---|
 | 包名 | `com.pilot.agent` |
-| 版本 | 0.1.0（versionCode 1） |
+| 版本 | 0.1.1（versionCode 2） |
 | 最低系统 | Android 11（minSdk 30） |
 | 目标系统 | Android 15（targetSdk 35） |
 | 模块 | `:app`（应用）、`:navigation`（高德导航库） |
@@ -228,8 +228,13 @@ Release 强制平台签名：需要 `keystore/platform.jks` 与环境变量 `PIL
 | 端侧 ASR（SenseVoice int8，约 239 MB） | `filesDir/models/asr-sensevoice/` |
 | 端侧 LLM（优先 Pocket-0.3B 164 MB，回退 Qwen3-0.6B 335 MB） | `filesDir/models/mnn-llm-0.3b/` 或 `mnn-llm/` |
 | 声纹（WeSpeaker，约 25 MB） | `filesDir/models/voiceprint/` |
-| 高德 Key / Brave Key / 云端模型 Key | 设置界面，Keystore 加密存本机 |
-| 构建期密钥（`AMAP_KEY*`、`sdk.dir`、签名密码） | `local.properties`（不入库） |
+| 高德 Key（使用者自备）/ Brave Key / 云端模型 Key | 设置界面，存本机私有数据 |
+| 构建期密钥（`sdk.dir`、签名密码） | `local.properties`（不入库） |
+
+> 高德导航是**可选能力**：公开版本不内置作者的 Key。需要导航/天气/地点搜索时，
+> 请在「设置 → 导航与地图」填入你自己在 [lbs.amap.com](https://lbs.amap.com) 申请的
+> Android 平台 Key（绑定包名 `com.pilot.agent` 与设置页显示的签名 SHA1）和 Web 服务 Key。
+> 未配置时相关能力会明确提示不可用，其它功能不受影响。
 
 模型推送方法见 `HANDOFF.md`；`models/` 在 `.gitignore` 中。
 

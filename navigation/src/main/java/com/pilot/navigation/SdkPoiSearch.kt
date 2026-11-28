@@ -10,9 +10,9 @@ import com.amap.api.services.poisearch.PoiSearch
  * SDK 版 POI 搜索（走 Android 平台 Key，认包名+签名）。
  *
  * ## 为什么要有这个（Web API 在设备上被拒）
- * 高德有两种 Key：
- * - **Android 平台 Key**（我们用的 AMAP_KEY）：给 SDK 用，认包名+签名
- * - **Web Key**（AMAP_WEB_KEY）：给 REST 用，有些是绑了 IP 白名单的
+ * 高德有两种 Key（现在都由使用者自备，见 NavKeys）：
+ * - **Android 平台 Key**：给 SDK 用，认包名+签名
+ * - **Web 服务 Key**：给 REST 用，有些是绑了 IP 白名单的
  *
  * 实测（这台设备）：Web Key 在开发机上 curl 正常，**在设备上直接
  * `INVALID_USER_KEY code=10001`**——IP 白名单不含设备出口 IP。
@@ -78,8 +78,16 @@ class SdkPoiSearch(private val context: Context) {
             onError("目的地为空")
             return
         }
+        // ★ 公开版本不内置 Key：没有用户 Android Key 时 SDK 搜索直接不可用。
+        if (!NavKeys.hasSdkKey(context)) {
+            NLog.w(TAG, "未配置高德 Android Key，SDK POI 搜索不可用")
+            onError(NavKeys.NOT_CONFIGURED_HINT)
+            return
+        }
         runCatching {
             AmapNaviEngine.agreePrivacy(context)
+            // PoiSearch 创建前注入用户 Key。
+            NavKeys.applySdkKey(context)
             val query = PoiSearch.Query(q, "", city ?: "")
             query.pageNum = 1
             query.pageSize = 10

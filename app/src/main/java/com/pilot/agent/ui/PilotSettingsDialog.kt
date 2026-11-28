@@ -157,6 +157,13 @@ private enum class SettingsPage(
         "语音识别与快路径小模型的下载、校验和删除",
         Color(0xFFB58CFF),
     ),
+    MAP(
+        SettingsGlyph.TEXT,
+        "MAP",
+        "导航与地图",
+        "高德 Key（自备）、导航与天气",
+        Color(0xFF5EC8B8),
+    ),
 }
 
 /** 语速按 0.05 一档量化，避免滑杆产生 1.0499999 这类值。 */
@@ -196,6 +203,10 @@ private class SettingsDraft(initial: AgentSettings) {
     var musicBaseUrl by mutableStateOf(initial.musicBaseUrl)
     var musicFallbackUrl by mutableStateOf(initial.musicFallbackUrl)
     var sandboxIdleMinutes by mutableStateOf(initial.sandboxIdleMinutes.toString())
+
+    // 高德 Key 存在导航设置里（跨进程文件），不在 AgentSettings 中。
+    var amapSdkKey by mutableStateOf("")
+    var amapWebKey by mutableStateOf("")
 
     fun saveFrom(base: AgentSettings): AgentSettings = base.copy(
         baseUrl = baseUrl.trim(),
@@ -245,7 +256,13 @@ internal fun PilotSettingsDialog(
     onDismiss: () -> Unit,
 ) {
     val context = LocalContext.current
-    val draft = remember { SettingsDraft(vm.settings) }
+    val draft = remember {
+        SettingsDraft(vm.settings).also { d ->
+            val nav = com.pilot.navigation.NavigationSettings.load(context)
+            d.amapSdkKey = nav.amapSdkKey
+            d.amapWebKey = nav.amapWebKey
+        }
+    }
     var page by remember { mutableStateOf<SettingsPage?>(null) }
     var toolPolicyDraft by remember { mutableStateOf(vm.toolPolicies) }
     val homeListState = rememberLazyListState()
@@ -317,6 +334,17 @@ internal fun PilotSettingsDialog(
                             vm.setToolPolicy(group, policy)
                         }
                         AgentSettings.save(draft.saveFrom(vm.settings))
+                        // 高德 Key 存在导航设置（跨进程文件）里，单独保存。
+                        runCatching {
+                            val nav = com.pilot.navigation.NavigationSettings.load(context)
+                            com.pilot.navigation.NavigationSettings.save(
+                                context,
+                                nav.copy(
+                                    amapSdkKey = draft.amapSdkKey.trim(),
+                                    amapWebKey = draft.amapWebKey.trim(),
+                                ),
+                            )
+                        }
                         vm.reloadSettings()
                         vm.refreshStatus()
                         onDismiss()
@@ -545,6 +573,20 @@ private fun SettingsHome(
                 },
                 statusActive = installed > 0,
                 onClick = { onOpen(SettingsPage.ONDEVICE) },
+            )
+        }
+        item {
+            SettingsCategoryCard(
+                page = SettingsPage.MAP,
+                status = when {
+                    draft.amapSdkKey.isNotBlank() && draft.amapWebKey.isNotBlank() ->
+                        "已配置 Android 与 Web Key"
+                    draft.amapSdkKey.isNotBlank() -> "已配置 Android Key · Web 未配置"
+                    draft.amapWebKey.isNotBlank() -> "已配置 Web Key · 导航 SDK 未配置"
+                    else -> "未配置 · 导航、天气和地点搜索不可用"
+                },
+                statusActive = draft.amapSdkKey.isNotBlank() || draft.amapWebKey.isNotBlank(),
+                onClick = { onOpen(SettingsPage.MAP) },
             )
         }
 
@@ -836,6 +878,7 @@ private fun SettingsPageContent(
         )
         SettingsPage.SANDBOX -> SandboxSettingsPage(vm, draft)
         SettingsPage.ONDEVICE -> OnDeviceSettingsPage()
+        SettingsPage.MAP -> MapSettingsPage(draft)
     }
 }
 
@@ -1169,6 +1212,55 @@ private fun AiSettingsPage(draft: SettingsDraft) {
                     value = draft.webSearchApiKey,
                     onValueChange = { draft.webSearchApiKey = it },
                 )
+            }
+        }
+    }
+}
+
+/**
+ * 当前安装包签名 SHA1（高德 Android Key 申请时要填）。
+ *
+ * 注意：这是**当前安装包**的签名，不是作者的。用户自己申请 Key 时填包名
+ * com.pilot.agent + 这个 SHA1，Key 就归用户自己的高德账号，配额也由用户掌控。
+ */
+private fun signingSha1(context: Context): String = runCatching {
+    val info = context.packageManager.getPackageInfo(
+        context.packageName,
+        android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES,
+    )
+    val signer = info.signingInfo?.apkContentsSigners?.firstOrNull()
+        ?: return "未获取（无签名信息）"
+    java.security.MessageDigest.getInstance("SHA-1")
+        .digest(signer.toByteArray())
+        .joinToString(":") { "%02X".format(it.toInt() and 0xFF) }
+}.getOrDefault("未获取")
+
+@Composable
+private fun MapSettingsPage(draft: SettingsDraft) {
+    val context = LocalContext.current
+    val sha1 = remember(context) { signingSha1(context) }
+    SettingsPageList {
+        item {
+            SettingsSectionCard(
+                title = "高德服务（可选）",
+                description = "Pilot 不内置任何高德 Key。导航、天气、地点搜索需要你用自己申请的高德 Key；" +
+                    "不配置时这些能力会提示未启用，其它功能不受影响。",
+            ) {
+                SettingsSecretField(
+                    label = "Android 平台 Key（导航 / 定位 SDK 用）",
+                    value = draft.amapSdkKey,
+                    onValueChange = { draft.amapSdkKey = it.trim() },
+                )
+                SettingsSecretField(
+                    label = "Web 服务 Key（天气 / 地点搜索 / 路线规划用）",
+                    value = draft.amapWebKey,
+                    onValueChange = { draft.amapWebKey = it.trim() },
+                )
+                InfoLine("申请地址：https://lbs.amap.com → 控制台 → 应用管理 → 创建应用，再分别添加 Key。")
+                InfoLine("Android Key 需填写包名 com.pilot.agent 和下面的签名 SHA1。")
+                InfoLine("当前签名 SHA1：$sha1")
+                InfoLine("只配 Web Key：可用天气、地点搜索和语音路线引导，但没有高德地图渲染与车道级导航。")
+                InfoLine("两个 Key 都属于你自己的高德账号，配额由你自己控制。")
             }
         }
     }

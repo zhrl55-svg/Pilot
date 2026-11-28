@@ -176,9 +176,11 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
         }
 
         // ★ 高德合规接口：必须在任何 SDK 调用之前（不调会崩/不给数据）
+        //   同时把用户自己配置的 Key 注入各 SDK（公开版本不内置 Key）。
         runCatching {
             MapsInitializer.updatePrivacyShow(this, true, true)
             MapsInitializer.updatePrivacyAgree(this, true)
+            NavKeys.applySdkKey(this)
             MapsInitializer.initialize(this)
         }.onFailure { NLog.w(TAG, "Maps 初始化失败 ${it.message}") }
 
@@ -1479,7 +1481,7 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
                 Thread {
                     val loc = NavigationService.peekLocationProvider()
                     val list = runCatching {
-                        WebPoiSearch.searchBlocking(q, loc?.city, loc?.lat ?: 0.0, loc?.lon ?: 0.0, 10)
+                        WebPoiSearch.searchBlocking(this@NavActivity, q, loc?.city, loc?.lat ?: 0.0, loc?.lon ?: 0.0, 10)
                     }.getOrDefault(emptyList())
                         .filter { it.distance <= WebPoiSearch.MAX_SANE_DISTANCE_M || it.distance == 0 }
                         .take(8)
@@ -1529,7 +1531,7 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
         toast("正在解析地址…")
         Thread {
             // 反查人类可读地址（失败退回附近 POI 名，绝不显示经纬度）
-            val addr = GeoCoder.describe(lat, lon, fallback = "当前位置附近")
+            val addr = GeoCoder.describe(this@NavActivity, lat, lon, fallback = "当前位置附近")
             NLog.i(TAG, "当前位置解析为：$addr")
             runOnUiThread {
                 askFavoriteLabel(

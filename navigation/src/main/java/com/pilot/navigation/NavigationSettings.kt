@@ -113,6 +113,9 @@ class NavigationSettings(private val context: Context) {
                 travelMode = o.optInt("travelMode", TravelMode.DRIVE.value),
                 favorites = favs,
                 history = hist,
+                // 高德 Key 由用户自己在设置里填写；旧版本文件里没有这些字段时为空。
+                amapSdkKey = o.optString("amapSdkKey"),
+                amapWebKey = o.optString("amapWebKey"),
             )
         }
 
@@ -124,6 +127,9 @@ class NavigationSettings(private val context: Context) {
             o.put("avoidJam", s.avoidJam)
             o.put("autoZoom", s.autoZoom)
             o.put("travelMode", s.travelMode)
+            // 注意：Key 只写入本机私有文件，绝不写日志。
+            o.put("amapSdkKey", s.amapSdkKey)
+            o.put("amapWebKey", s.amapWebKey)
             o.put("favorites", JSONArray().apply {
                 for (f in s.favorites) {
                     put(JSONObject().apply {
@@ -203,5 +209,15 @@ class NavigationSettings(private val context: Context) {
         val travelMode: Int = TravelMode.DRIVE.value,
         val favorites: List<Favorite> = emptyList(),
         val history: List<HistoryEntry> = emptyList(),
+        /**
+         * 用户自己创建的高德 Android 平台 Key（导航/定位 SDK 用）。
+         * 空串 = 未配置。公开版本不内置任何 Key，必须由使用者自备。
+         */
+        val amapSdkKey: String = "",
+        /**
+         * 用户自己创建的高德 Web 服务 Key（天气/地点搜索/路线规划用）。
+         * 空串 = 未配置。公开版本不内置任何 Key，必须由使用者自备。
+         */
+        val amapWebKey: String = "",
     )
 }

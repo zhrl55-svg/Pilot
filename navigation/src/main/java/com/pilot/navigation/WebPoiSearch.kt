@@ -1,5 +1,6 @@
 package com.pilot.navigation
 
+import android.content.Context
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -42,6 +43,7 @@ object WebPoiSearch {
      * 所以不需要 latch。给搜索面板这种「子线程里顺序取结果」的场景用。
      */
     fun searchBlocking(
+        context: Context,
         keyword: String,
         city: String?,
         currentLat: Double,
@@ -50,6 +52,7 @@ object WebPoiSearch {
     ): List<SdkPoiSearch.Candidate> {
         var out: List<SdkPoiSearch.Candidate> = emptyList()
         search(
+            context = context,
             keyword = keyword,
             city = city,
             currentLat = currentLat,
@@ -66,6 +69,7 @@ object WebPoiSearch {
      * @param onResult 回调（子线程）
      */
     fun search(
+        context: Context,
         keyword: String,
         city: String?,
         currentLat: Double,
@@ -78,8 +82,15 @@ object WebPoiSearch {
             onError("目的地为空")
             return
         }
+        // ★ Key 由使用者自备；未配置时明确提示，不要拿空 Key 去请求。
+        val key = NavKeys.webKey(context)
+        if (key.isBlank()) {
+            NLog.w(TAG, "未配置高德 Web 服务 Key，地点搜索不可用")
+            onError(NavKeys.NOT_CONFIGURED_HINT)
+            return
+        }
         val tail = buildString {
-            append("?key=").append(NavKeys.webKey())
+            append("?key=").append(key)
             append("&keywords=").append(java.net.URLEncoder.encode(q, "UTF-8"))
             // extensions=base：省 60% 流量（all 会带回 photos/featured_reviews）
             append("&extensions=base")
