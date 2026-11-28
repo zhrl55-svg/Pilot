@@ -42,6 +42,17 @@
     <!-- ========== 系统能力直调：音量 / 亮度 / 电话 / 联系人 ========== -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.CALL_PHONE" />
+    <!--
+      虚拟屏执行（把其它 App 的界面拉到独立虚拟屏上操作，不抢用户主屏）。
+      这两项是 signature|privileged：只有平台签名 / priv-app 才授得了；普通安装声明了也拿不到，
+      VirtualDisplayHost.isAvailable() 会返回 false 并自动退回「做完切回」。
+      注意：普通 App 只能把**自己的**内容（内置浏览器 WebView）放到私有虚拟屏（已实现，无需权限）；
+      把**别的 App** 放上虚拟屏必须有 ADD_TRUSTED_DISPLAY，这是 Android 的安全边界。
+    -->
+    <uses-permission android:name="android.permission.ADD_TRUSTED_DISPLAY"
+        tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.CAPTURE_VIDEO_OUTPUT"
+        tools:ignore="ProtectedPermissions" />
     <!-- 电话是可选的（平板/无通话硬件设备也要能装），声明为非必需。 -->
     <uses-feature android:name="android.hardware.telephony" android:required="false" />
     <uses-permission android:name="android.permission.READ_CONTACTS" />

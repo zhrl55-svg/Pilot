@@ -6,6 +6,7 @@ import android.graphics.Bitmap
 import android.os.Handler
 import android.os.Looper
 import android.view.ViewGroup
+import android.widget.FrameLayout
 import android.webkit.CookieManager
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -78,6 +79,11 @@ object BrowserEngine {
         val h = holder ?: return
         main.post {
             runCatching {
+                // 还原 mini 缩放，无头提取/截图按原尺寸进行。
+                wv.scaleX = 1f
+                wv.scaleY = 1f
+                wv.pivotX = 0f
+                wv.pivotY = 0f
                 (wv.parent as? ViewGroup)?.removeView(wv)
                 h.removeView(wv)
                 h.addView(wv, ViewGroup.LayoutParams(h.width, h.height))
@@ -147,9 +153,42 @@ object BrowserEngine {
     /** 把 WebView 放进指定容器（悬浮窗）。必须在主线程。 */
     fun attachTo(container: ViewGroup) {
         val wv = webView ?: return
+        // 重置可能的 mini 缩放（小窗缩小显示后会切到全屏/无头，必须还原）。
+        wv.scaleX = 1f
+        wv.scaleY = 1f
+        wv.pivotX = 0f
+        wv.pivotY = 0f
         (wv.parent as? ViewGroup)?.removeView(wv)
         container.removeView(wv)
         container.addView(wv, ViewGroup.LayoutParams(-1, -1))
+    }
+
+    /**
+     * 把 WebView 挂到小窗并**缩小显示**：按整机逻辑宽度 [logicalW] 渲染，再整体缩放到容器宽度，
+     * 于是小窗里看到的是「整页按比例缩小的预览」，而不是内容被挤成同样字号。
+     * 容器还没测量时会 post 到布局完成后再缩。
+     */
+    fun attachToMini(container: ViewGroup, logicalW: Int) {
+        val wv = webView ?: return
+        if (logicalW <= 0) { attachTo(container); return }
+        (wv.parent as? ViewGroup)?.removeView(wv)
+        container.removeView(wv)
+        container.addView(wv, FrameLayout.LayoutParams(logicalW, logicalW))
+        val apply = Runnable {
+            val cw = container.width
+            val ch = container.height
+            if (cw <= 0 || ch <= 0) return@Runnable
+            val scale = cw.toFloat() / logicalW
+            val logicalH = (ch / scale).toInt().coerceAtLeast(1)
+            // ★ 父容器是 FrameLayout，必须用 FrameLayout.LayoutParams（MarginLayoutParams），
+            //   用裸 ViewGroup.LayoutParams 会在 measure 时 ClassCastException 闪退。
+            wv.layoutParams = FrameLayout.LayoutParams(logicalW, logicalH)
+            wv.pivotX = 0f
+            wv.pivotY = 0f
+            wv.scaleX = scale
+            wv.scaleY = scale
+        }
+        if (container.width > 0 && container.height > 0) apply.run() else container.post(apply)
     }
 
     suspend fun load(ctx: Context, url: String): BrowserResult = withContext(Dispatchers.Main) {

@@ -6,6 +6,7 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
+import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
 import android.view.MotionEvent
@@ -32,6 +33,9 @@ object BrowserOverlay {
 
     private const val TAG = "PilotBrowserWin"
 
+    /** 空闲多久自动收起小窗（毫秒）。老板要求：用完不要一直常驻主屏。 */
+    private const val IDLE_CLOSE_MS = 15_000L
+
     private var wm: WindowManager? = null
     private var root: FrameLayout? = null
     private var column: LinearLayout? = null
@@ -40,6 +44,10 @@ object BrowserOverlay {
     private var params: WindowManager.LayoutParams? = null
     private var minimizeBtn: View? = null
     private var appCtx: Context? = null
+
+    /** 空闲自动关闭：小窗用完一段时间没人碰就收起，不常驻主屏。 */
+    private val main = Handler(Looper.getMainLooper())
+    private var idleClose: Runnable? = null
 
     @Volatile
     private var showing = false
@@ -56,7 +64,6 @@ object BrowserOverlay {
         }
         if (showing && root != null) {
             unminimize()
-            content?.let { BrowserEngine.takeWebView()?.let { wv -> BrowserEngine.attachTo(it) } }
             return true
         }
         if (!canShow(context)) return false
@@ -66,8 +73,9 @@ object BrowserOverlay {
             val w = app.getSystemService(Context.WINDOW_SERVICE) as WindowManager
             val screenW = app.resources.displayMetrics.widthPixels
             val screenH = app.resources.displayMetrics.heightPixels
-            val winW = (screenW * 0.9f).toInt()
-            val winH = (screenH * 0.62f).toInt()
+            // ★ 默认就是小窗口（老板要求：不要一上来占满屏），点标题栏放大到全屏。
+            val winW = (screenW * 0.58f).toInt()
+            val winH = (screenH * 0.36f).toInt()
 
             val frame = FrameLayout(app)
             val col = LinearLayout(app).apply { orientation = LinearLayout.VERTICAL }
@@ -79,7 +87,7 @@ object BrowserOverlay {
                 setPadding(dp(app, 12), dp(app, 6), dp(app, 6), dp(app, 6))
             }
             val title = TextView(app).apply {
-                text = "PILOT 小窗"
+                text = "PILOT 小窗 · 点标题放大"
                 setTextColor(Color.rgb(96, 165, 250))
                 textSize = 13f
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
@@ -97,8 +105,12 @@ object BrowserOverlay {
                 close()
                 onClose()
             })
-            // 拖动：整个顶栏作为把手
-            header.setOnTouchListener(makeDragListener())
+            // 拖动：整个顶栏作为把手；不移动的单击（tap）= 放大到全屏。
+            header.setOnTouchListener(makeDragListener(onTap = {
+                val url = BrowserEngine.currentUrl
+                hide(keepEngine = true)
+                onExpand(url)
+            }))
             col.addView(header, LinearLayout.LayoutParams(winW, ViewGroup.LayoutParams.WRAP_CONTENT))
 
             val contentBox = FrameLayout(app).apply { setBackgroundColor(Color.rgb(8, 10, 15)) }
@@ -134,17 +146,20 @@ object BrowserOverlay {
             ).apply {
                 gravity = Gravity.TOP or Gravity.START
                 x = (screenW - winW) / 2
-                y = (screenH * 0.18f).toInt()
+                y = (screenH * 0.45f).toInt()
             }
             w.addView(frame, p)
+            // 任何触摸都重置空闲计时（返回 false 不消费事件，WebView 仍能正常交互）。
+            frame.setOnTouchListener { _, _ -> resetIdle(); false }
 
             wm = w
             root = frame
             column = col
             params = p
             showing = true
+            resetIdle()
 
-            BrowserEngine.takeWebView()?.let { BrowserEngine.attachTo(contentBox) }
+            BrowserEngine.takeWebView()?.let { BrowserEngine.attachToMini(contentBox, screenW) }
             true
         } catch (t: Throwable) {
             Dbg.w(TAG, "小窗创建失败：${t.message}")
@@ -158,6 +173,7 @@ object BrowserOverlay {
     /** 隐藏小窗但保留引擎（之后仍可无头提取）。 */
     fun hide(keepEngine: Boolean = true) {
         if (Looper.myLooper() != Looper.getMainLooper()) return
+        cancelIdle()
         val r = root ?: return
         runCatching { wm?.removeView(r) }
         root = null
@@ -173,6 +189,24 @@ object BrowserOverlay {
     fun close() {
         hide(keepEngine = false)
         BrowserEngine.close()
+    }
+
+    /** 重置空闲关闭计时：小窗显示期间每次交互都续命。 */
+    private fun resetIdle() {
+        cancelIdle()
+        val r = Runnable {
+            if (showing) {
+                Dbg.i(TAG, "小窗空闲 ${IDLE_CLOSE_MS / 1000}s，自动收起")
+                hide(keepEngine = true)
+            }
+        }
+        idleClose = r
+        main.postDelayed(r, IDLE_CLOSE_MS)
+    }
+
+    private fun cancelIdle() {
+        idleClose?.let { main.removeCallbacks(it) }
+        idleClose = null
     }
 
     private fun minimize() {
@@ -202,19 +236,20 @@ object BrowserOverlay {
         column?.visibility = View.VISIBLE
         bubble?.visibility = View.GONE
         minimizeBtn?.visibility = View.VISIBLE
-        p.width = (screenW * 0.9f).toInt()
-        p.height = (screenH * 0.62f).toInt()
+        p.width = (screenW * 0.58f).toInt()
+        p.height = (screenH * 0.36f).toInt()
         p.x = (screenW - p.width) / 2
-        p.y = (screenH * 0.18f).toInt()
+        p.y = (screenH * 0.5f).toInt()
         runCatching { w.updateViewLayout(frame, p) }
-        content?.let { BrowserEngine.takeWebView()?.let { wv -> BrowserEngine.attachTo(it) } }
+        content?.let { BrowserEngine.takeWebView()?.let { wv -> BrowserEngine.attachToMini(it, screenW) } }
     }
 
-    private fun makeDragListener(): View.OnTouchListener {
+    private fun makeDragListener(onTap: (() -> Unit)? = null): View.OnTouchListener {
         var downX = 0f
         var downY = 0f
         var startX = 0
         var startY = 0
+        var moved = false
         return View.OnTouchListener { _, e ->
             val p = params ?: return@OnTouchListener false
             val frame = root ?: return@OnTouchListener false
@@ -222,12 +257,21 @@ object BrowserOverlay {
             when (e.action) {
                 MotionEvent.ACTION_DOWN -> {
                     downX = e.rawX; downY = e.rawY; startX = p.x; startY = p.y
+                    moved = false
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
+                    if (Math.abs(e.rawX - downX) > dp(frame.context, 8) ||
+                        Math.abs(e.rawY - downY) > dp(frame.context, 8)
+                    ) moved = true
                     p.x = startX + (e.rawX - downX).toInt()
                     p.y = startY + (e.rawY - downY).toInt()
                     runCatching { w.updateViewLayout(frame, p) }
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    // 没有拖动 = 单击：放大到全屏。
+                    if (!moved) onTap?.invoke()
                     true
                 }
                 else -> false

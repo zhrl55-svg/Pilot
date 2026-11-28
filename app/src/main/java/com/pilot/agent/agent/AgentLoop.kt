@@ -1577,7 +1577,10 @@ class AgentLoop(
 
     /** 这一步动作是否「本来就应该让界面变化」。不改变界面的动作（wait 等）不参与无效动作判定。 */
     private fun uiAffecting(a: AgentAction): Boolean = when (a.action) {
-        "tap", "tap_node", "long_press", "input", "swipe", "scroll", "key", "open", "shortcut", "component" -> true
+        "tap", "tap_node", "long_press", "input", "swipe", "scroll", "key", "shortcut", "component" -> true
+        // 目标带网址时 open 会被纠正为内置浏览器（虚拟屏后台，不改主屏）→ 不算界面变化，
+        // 否则会被判「连续 3 步无变化」而中止。
+        "open" -> browserUrlInGoal() == null
         else -> false
     }
 
