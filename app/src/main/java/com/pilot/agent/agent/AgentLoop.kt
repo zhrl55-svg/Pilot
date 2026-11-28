@@ -335,6 +335,16 @@ class AgentLoop(
                         emit(AgentEvent.Finished(answer))
                         return
                     }
+                    // ★ 内置数据源没有结果 → 先让云端直接作答（知识/常识类查询，如“某地多少人口”）。
+                    //   否则会掉进下面的屏幕操作循环，模型点半天没进展后被“连续 3 步无变化”中止。
+                    if (settings.cloudReady) {
+                        Dbg.i(TAG, "内置查询无匹配，云端直接作答：goalChars=${goal.length}")
+                        val fallback = cloudFallbackAnswer(goal, settings, chatHistory)
+                        if (!fallback.isNullOrBlank()) {
+                            emit(AgentEvent.Finished(fallback))
+                            return
+                        }
+                    }
                     if (settings.mode == AssistantMode.AGENT) {
                         val reason = com.pilot.agent.query.QueryEngine.lastFailure
                             ?.takeIf { it.isNotBlank() }
@@ -700,6 +710,7 @@ class AgentLoop(
                     "system",
                     "你是手机助手 Pilot 的云端兜底。本机的规则和端侧模型都没有完成这条请求。" +
                         "现在是 $now。$memoryPrompt" +
+                        IntentGate.SELF_KNOWLEDGE +
                         "如果这是可以凭知识或常识回答的问题，直接给出准确、简短的回答；" +
                         "如果这是需要操作手机的请求而本机没有完成，如实说明未能完成，不要声称已经执行。" +
                         "回答口语化，一到三句，不要用列表。",

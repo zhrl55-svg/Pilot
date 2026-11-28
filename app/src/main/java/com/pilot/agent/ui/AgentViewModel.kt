@@ -1497,6 +1497,14 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 return
             }
         }
+        // 2.5) 声纹注册指令：本地直接触发引导式注册，不要进 Agent 系统操作（否则会「系统操作没能完成」）。
+        if (listOf("注册声纹", "声纹注册", "录入声纹", "登记声纹", "注册一下声纹", "注册下声纹", "重新注册声纹")
+                .any { g.contains(it) }
+        ) {
+            add(LogEntry.Kind.OBSERVE, "开始声纹注册：请按提示连说 3 句口令")
+            startEnrollGuide()
+            return
+        }
         // 3) 浏览器任务（含网址+打开/截屏等操作，或「浏览器」+操作）直接交给 Agent：
         //    绕过快路径、本地工具、强查询、意图路由的层层误判——实测「用浏览器打开
         //    https://www.qq.com 并截图」会被本地工具当成「打开网页 App」或被强查询当成

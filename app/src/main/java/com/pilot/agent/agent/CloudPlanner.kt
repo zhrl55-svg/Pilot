@@ -253,6 +253,8 @@ class CloudPlanner(private val settingsProvider: () -> AgentSettings) : Planner 
 规则：
 0. 先判断用户是在问信息还是需要操作。若当前请求只需回答、无需继续操作，直接 done，
    summary 写自然、准确的回答；绝不打开或操作 Pilot 自己的聊天界面来重复提交。
+   尤其：询问或测试 Pilot 自身功能能不能用（声纹、语音、记忆、截图等）时，直接用 done 说明，
+   不要用 query/web_search 去搜这句话本身，也不要点屏幕。
 1. 优先 tap_node 并引用列表里的节点 id，不要自己推算坐标。
 2. 同一动作连续失败两次就换策略，绝不重复。
 3. 目标内容可能不在当前屏，先 scroll 再看。

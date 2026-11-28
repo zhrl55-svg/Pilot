@@ -34,8 +34,15 @@ class PlannerRouter(
                 // 或命中确定性系统直调时优先兜底。
                 if (deterministic) add(onDevice)
                 if (s.cloudReady) add(cloud)
-                if (!deterministic) add(onDevice)
-                if (s.enableLocalModel) add(local)
+                if (!deterministic) {
+                    // ★ 闲聊/自身能力类目标（IntentGate 判 CHAT）不要交给端侧规则/小模型「动手」：
+                    //   实测「那现在测试一下声纹其他功能能不能用」被端侧小模型接成 web_search，
+                    //   把整句话当关键词做了全局搜索。云端可用时只走云端；云端答不了会由
+                    //   AgentLoop 的 unable 分支升级云端对话直接回答。云端不可用时仍保留端侧兜底。
+                    val chatLike = s.cloudReady && IntentGate.classify(goal) == IntentGate.Kind.CHAT
+                    if (!chatLike) add(onDevice)
+                    if (s.enableLocalModel && !chatLike) add(local)
+                }
                 return@buildList
             }
             add(onDevice)
