@@ -335,11 +335,33 @@ class AgentLoop(
                         emit(AgentEvent.Finished(answer))
                         return
                     }
-                    // ★ 强查询（新闻/网页搜索等）没有结果时，如实说没查到，**不要**转去打开浏览器执行——
-                    //   这正是「搜索新闻」被当成操作手机去打开网页的根因。
-                    Dbg.i(TAG, "查询无结果，如实结束，不转浏览器：goalChars=${goal.length}")
-                    emit(AgentEvent.Finished("没查到「$goal」的最新结果，可能是网络不可用或暂时没有相关内容。"))
-                    return
+                    if (settings.mode == AssistantMode.AGENT) {
+                        val reason = com.pilot.agent.query.QueryEngine.lastFailure
+                            ?.takeIf { it.isNotBlank() }
+                        Dbg.i(
+                            TAG,
+                            "内置查询未回答，交给 Agent 扩展查询：" +
+                                (reason ?: "没有匹配的内置数据源"),
+                        )
+                        emit(
+                            AgentEvent.Observe(
+                                if (reason == null) {
+                                    "内置查询没有匹配的数据源，Agent 将继续查找"
+                                } else {
+                                    "内置查询未成功（${reason.take(120)}），Agent 将继续查找"
+                                },
+                            ),
+                        )
+                    } else {
+                        // 助理模式不擅自启动 Agent 扩展查询，保留明确的失败反馈。
+                        Dbg.i(TAG, "查询无结果，结束：goalChars=${goal.length}")
+                        emit(
+                            AgentEvent.Finished(
+                                "没查到「$goal」的最新结果，可能是网络不可用或暂时没有相关内容。",
+                            ),
+                        )
+                        return
+                    }
                 }
                 // 明确要读网页/用 MCP 的查询，才继续用浏览器或 MCP。
                 emit(AgentEvent.Observe("内置查询不适用，使用浏览器或 MCP 继续查找"))

@@ -389,9 +389,6 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         return created != null
     }
 
-    var foreground by mutableStateOf("")
-        private set
-
     // 端侧能力状态，给状态卡片用
     var asrReady by mutableStateOf(false)
         private set
@@ -580,9 +577,6 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
                 // 300ms 对播放条 UI 足够跟手，负载降 2/3。
                 delay(300)
             }
-        }
-        viewModelScope.launch {
-            AgentRuntime.foreground.collect { foreground = it }
         }
         refreshStatus()
         // 后台预热 ASR：模型加载 2.5 秒，别等用户按麦才付这个时间。
@@ -1613,6 +1607,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         val current = AgentSettings.load()
+        AgentRuntime.speaker.speak("我先判断一下怎么处理，请稍等。")
         if (!current.cloudReady) {
             Dbg.i(TAG, "agent router fallback: cloud unavailable")
             fallbackAgentDispatch(text, fallbackKind)
@@ -1678,6 +1673,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         activeTaskLabel = "查询"
         publishNotificationStatus()
         add(LogEntry.Kind.THINK, "正在查询…")
+        AgentRuntime.speaker.speak("我查一下，请稍等。")
         dispatchJob = viewModelScope.launch {
             val answer = try {
                 com.pilot.agent.query.QueryEngine.handle(text)

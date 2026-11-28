@@ -813,14 +813,13 @@ private fun Header(
     var menuExpanded by remember { mutableStateOf(false) }
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
         // ★ 老板要求：标题左侧不要圆点
-        Column(Modifier.weight(1f)) {
-            Text("Pilot", fontSize = 20.sp, fontWeight = FontWeight.Medium, color = colors.onBackground)
-            Text(
-                if (vm.foreground.isNotEmpty()) "当前 ${vm.foreground}" else "系统级手机助理",
-                fontSize = 12.sp,
-                color = colors.onSurfaceVariant,
-            )
-        }
+        Text(
+            "Pilot",
+            fontSize = 20.sp,
+            fontWeight = FontWeight.Medium,
+            color = colors.onBackground,
+            modifier = Modifier.weight(1f),
+        )
         Row(verticalAlignment = Alignment.CenterVertically) {
             // ★ 导航入口（老板要求）：直接进高德导航界面。
             //   放标题栏而不是输入栏——放输入栏会把输入框挤窄
