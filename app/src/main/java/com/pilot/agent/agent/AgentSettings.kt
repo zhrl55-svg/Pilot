@@ -102,6 +102,12 @@ data class AgentSettings(
      * ROUTE 的能力，任何一步不成立都回落原链路，所以默认开不会改变失败行为。
      */
     val assistantFastPath: Boolean = true,
+    /**
+     * 明暗主题：auto（跟随系统）/ light（明色暖白纸感）/ dark（暗色深空聚焦）。
+     *
+     * 存在普通 SharedPreferences 里（非凭据），改完立刻生效，不需要重启。
+     */
+    val themeMode: String = THEME_AUTO,
 ) {
     val cloudReady: Boolean get() = apiKey.isNotBlank() && baseUrl.isNotBlank()
 
@@ -161,6 +167,14 @@ data class AgentSettings(
 
         const val DEFAULT_WAKE_WORDS = "小派,小派小派,你好小派"
 
+        /** 明暗主题：跟随系统 */
+        const val THEME_AUTO = "auto"
+        /** 明色 · 暖白纸感 */
+        const val THEME_LIGHT = "light"
+        /** 暗色 · 深空聚焦 */
+        const val THEME_DARK = "dark"
+        val THEME_MODES = listOf(THEME_AUTO, THEME_LIGHT, THEME_DARK)
+
         /** 自建 NeteaseCloudMusicApi 地址（部署在 buntu:3001） */
         const val DEFAULT_MUSIC_URL = "http://100.95.180.77:3001"
         const val DEFAULT_MUSIC_FALLBACK_URL = "http://192.168.2.102:3001"
@@ -199,6 +213,7 @@ data class AgentSettings(
         private const val K_MUSIC_FALLBACK_URL = "music_fallback_url"
         private const val K_NETEASE_COOKIE = "netease_cookie"
         private const val K_ASSISTANT_FAST_PATH = "assistant_fast_path"
+        private const val K_THEME_MODE = "theme_mode"
 
         /**
          * v2 迁移：把「待命」默认改成**开**（进 App 就开麦）。
@@ -330,6 +345,9 @@ data class AgentSettings(
                     ?: DEFAULT_MUSIC_FALLBACK_URL,
                 neteaseCookie = readMigratedSecret(p, K_NETEASE_COOKIE, failures),
                 assistantFastPath = p.getBoolean(K_ASSISTANT_FAST_PATH, true),
+                themeMode = p.getString(K_THEME_MODE, null)
+                    ?.takeIf { it in THEME_MODES }
+                    ?: THEME_AUTO,
             )
         }
 
@@ -385,6 +403,10 @@ data class AgentSettings(
                 .putString(K_MUSIC_URL, s.musicBaseUrl)
                 .putString(K_MUSIC_FALLBACK_URL, s.musicFallbackUrl)
                 .putBoolean(K_ASSISTANT_FAST_PATH, s.assistantFastPath)
+                .putString(
+                    K_THEME_MODE,
+                    s.themeMode.takeIf { it in THEME_MODES } ?: THEME_AUTO,
+                )
                 .apply()
             val problems = mutableListOf<String>()
             persistSecret(p, K_WEB_SEARCH_KEY, s.webSearchApiKey, hasLegacyPlaintext = false, label = "搜索 API Key", problems = problems)

@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="pilot_bg">#FF0E1116</color>
-    <color name="pilot_accent">#FF6FD3C0</color>
+    <!-- 明色 · 暖白纸感（方案 B）—— 默认（非 night）资源 -->
+    <color name="pilot_bg">#FFFCFAF7</color>
+    <color name="pilot_accent">#FFC2643F</color>
 </resources>

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 暗色 · 深空聚焦（方案 C） -->
+    <color name="pilot_bg">#FF111318</color>
+    <color name="pilot_accent">#FF6E8BFF</color>
+</resources>

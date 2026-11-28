@@ -100,6 +100,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -162,7 +163,11 @@ class MainActivity : ComponentActivity() {
             calendarPermission.launch(permissions)
         }
         setContent {
-            PilotTheme {
+            // 主题模式来自设置（自动/明/暗）；settings 是 Compose 状态，保存后原地切换。
+            PilotTheme(themeMode = vm.settings.themeMode) {
+                // 强制明/暗时，系统栏图标要跟着走；否则亮底配白图标会看不见。
+                val darkBars = pilotColors.isDark
+                LaunchedEffect(darkBars) { applySystemBarIcons(darkBars) }
                 AgentScreen(vm, onRequestMic = { micPermission.launch(android.Manifest.permission.RECORD_AUDIO) })
             }
         }
@@ -172,6 +177,29 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         com.pilot.agent.action.CalendarPermissions.detach()
         super.onDestroy()
+    }
+
+    /**
+     * 系统栏图标明暗：明色主题用深色图标，暗色主题用浅色图标。
+     *
+     * XML 的 `windowLightStatusBar` 只能跟系统深浅色走；用户在设置里强制明/暗时，
+     * 必须运行期改一次，否则会出现「亮底白图标」看不清的情况。
+     */
+    private fun applySystemBarIcons(darkTheme: Boolean) {
+        runCatching {
+            // 状态栏是透明的，透出来的其实是 **窗口背景**。XML 里的 pilot_bg 只跟系统深浅色走，
+            // 用户在设置里强制暗色时必须运行期改一次，否则会出现「暗界面 + 亮状态栏」。
+            val palette = if (darkTheme) PilotDarkColors else PilotLightColors
+            window.setBackgroundDrawable(
+                android.graphics.drawable.ColorDrawable(palette.background.toArgb()),
+            )
+            val controller = androidx.core.view.WindowCompat.getInsetsController(
+                window,
+                window.decorView,
+            )
+            controller.isAppearanceLightStatusBars = !darkTheme
+            controller.isAppearanceLightNavigationBars = !darkTheme
+        }
     }
 
     private fun requestMic() {
@@ -625,6 +653,7 @@ private fun ModelReasoningChips(
             }
             DropdownMenu(
                 expanded = reasoningExpanded,
+                containerColor = pilotColors.surface,
                 onDismissRequest = { reasoningExpanded = false },
                 modifier = Modifier.width(132.dp),
             ) {
@@ -703,6 +732,7 @@ private fun SessionMenuButton(
         }
         DropdownMenu(
             expanded = expanded,
+            containerColor = pilotColors.surface,
             onDismissRequest = { expanded = false },
             modifier = Modifier.width(248.dp),
         ) {
@@ -824,12 +854,14 @@ private fun Header(
     val colors = MaterialTheme.colorScheme
     var menuExpanded by remember { mutableStateOf(false) }
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-        // ★ 老板要求：标题左侧不要圆点
+        // 字标：方案里 Pilot 用强调色（明·陶土橙 / 暗·亮蓝），
+        // 靠 Bold + 负字距建立识别，与设计稿一致。
         Text(
             "Pilot",
-            fontSize = 20.sp,
-            fontWeight = FontWeight.Medium,
-            color = colors.onBackground,
+            fontSize = 21.sp,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = (-0.9).sp,
+            color = pilotColors.accent,
             modifier = Modifier.weight(1f),
         )
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -850,6 +882,7 @@ private fun Header(
                 }
                 DropdownMenu(
                     expanded = menuExpanded,
+                    containerColor = pilotColors.surface,
                     onDismissRequest = { menuExpanded = false },
                 ) {
                     DropdownMenuItem(
@@ -1019,6 +1052,7 @@ private fun MusicBar(vm: AgentViewModel) {
                 }
                 DropdownMenu(
                     expanded = showRecommendations,
+                    containerColor = pilotColors.surface,
                     onDismissRequest = { showRecommendations = false },
                 ) {
                     MusicListMenuItem("最近播放", "播放最近", vm) { showRecommendations = false }
@@ -1181,6 +1215,7 @@ private fun MusicBar(vm: AgentViewModel) {
                 }
                 DropdownMenu(
                     expanded = showQueue,
+                    containerColor = pilotColors.surface,
                     onDismissRequest = { showQueue = false },
                 ) {
                     vm.musicQueue.forEachIndexed { index, entry ->
@@ -1320,6 +1355,7 @@ private fun MusicModeChip(text: String, active: Boolean, onClick: () -> Unit) {
 @Composable
 private fun MusicPlayButton(playing: Boolean, onClick: () -> Unit) {
     val colors = MaterialTheme.colorScheme
+    val iconColor = colors.onPrimary
     Box(
         Modifier
             .size(36.dp)
@@ -1334,13 +1370,13 @@ private fun MusicPlayButton(playing: Boolean, onClick: () -> Unit) {
                 val barHeight = size.height * 0.72f
                 val top = (size.height - barHeight) / 2f
                 drawRoundRect(
-                    color = Color.White,
+                    color = iconColor,
                     topLeft = Offset(size.width * 0.22f, top),
                     size = Size(barWidth, barHeight),
                     cornerRadius = CornerRadius(2.dp.toPx()),
                 )
                 drawRoundRect(
-                    color = Color.White,
+                    color = iconColor,
                     topLeft = Offset(size.width * 0.54f, top),
                     size = Size(barWidth, barHeight),
                     cornerRadius = CornerRadius(2.dp.toPx()),
@@ -1352,7 +1388,7 @@ private fun MusicPlayButton(playing: Boolean, onClick: () -> Unit) {
                     lineTo(size.width * 0.28f, size.height * 0.84f)
                     close()
                 }
-                drawPath(path, Color.White)
+                drawPath(path, iconColor)
             }
         }
     }
@@ -1459,6 +1495,10 @@ private fun LogRow(
     val colors = MaterialTheme.colorScheme
     val isUser = entry.kind == LogEntry.Kind.USER
     val textColor = if (entry.kind == LogEntry.Kind.ERROR) colors.error else colors.onBackground
+    // 选中高亮与拖拽手柄跟随主题强调色：暗色主题用亮蓝、明色主题用陶土橙，
+    // 避免明色界面上出现蓝底白字这种与本主题不搭的选中态。
+    val selectionColors = pilotColors.accent to pilotColors.onAccent
+    val handleColor = pilotColors.accent
 
     val chunks = remember(entry.text) { splitBySeparator(entry.text) }
     val ranges = remember(chunks) {
@@ -1521,8 +1561,8 @@ private fun LogRow(
         if (selection != null) {
             addStyle(
                 androidx.compose.ui.text.SpanStyle(
-                    background = androidx.compose.ui.graphics.Color(0xFF2B5FA8),
-                    color = androidx.compose.ui.graphics.Color(0xFFFFFFFF),
+                    background = androidx.compose.ui.graphics.Color(selectionColors.first.value),
+                    color = androidx.compose.ui.graphics.Color(selectionColors.second.value),
                 ),
                 selection.first, selection.last + 1,
             )
@@ -1666,7 +1706,7 @@ private fun LogRow(
                     val r = rangeNow.value ?: return@Canvas
                     val a = l.getBoundingBox(r.first)
                     val b = l.getBoundingBox(r.last.coerceAtMost(entry.text.length - 1))
-                    val hc = androidx.compose.ui.graphics.Color(0xFF4A90E2)
+                    val hc = handleColor
                     val w = 2.dp.toPx()
                     drawLine(hc, Offset(a.left, a.top), Offset(a.left, a.bottom), w)
                     drawLine(hc, Offset(b.right, b.top), Offset(b.right, b.bottom), w)
@@ -1708,10 +1748,10 @@ private fun LogRow(
             ) {
                 Surface(
                     // ★ 深灰底：聊天区是纯黑，菜单必须一眼能分辨出来。
-                    color = Color(0xFF35373D),
+                    color = pilotColors.surfaceRaised,
                     shape = RoundedCornerShape(16.dp),
                     shadowElevation = 8.dp,
-                    border = BorderStroke(1.dp, Color(0x33FFFFFF)),
+                    border = BorderStroke(1.dp, pilotColors.line),
                     modifier = Modifier.widthIn(max = 330.dp),
                 ) {
                     Row(
@@ -1787,7 +1827,7 @@ private fun MenuChip(label: String, onClick: () -> Unit) {
     Text(
         label,
         fontSize = 12.sp,
-        color = androidx.compose.ui.graphics.Color(0xFFEEEEEE),
+        color = pilotColors.onSurface,
         textAlign = TextAlign.Center,
         modifier = Modifier
             .clickable(onClick = onClick)
@@ -2062,6 +2102,8 @@ private fun InputBar(
         }
 
         Spacer(Modifier.width(8.dp))
+        val stopContent = colors.onError
+        val planeColor = colors.onPrimary
         Button(
             onClick = when {
                 speaking -> onStopSpeaking       // 播报中：闭嘴 + 停任务
@@ -2073,22 +2115,16 @@ private fun InputBar(
             shape = RoundedCornerShape(14.dp),
             contentPadding = PaddingValues(0.dp),
             colors = ButtonDefaults.buttonColors(
-                containerColor = if (showStop) {
-                    androidx.compose.ui.graphics.Color(0xFFE53935)   // 明确的正红
-                } else {
-                    colors.primary.copy(alpha = 0.12f)
-                },
-                contentColor = if (showStop) {
-                    androidx.compose.ui.graphics.Color(0xFFFFFFFF)
-                } else {
-                    colors.primary
-                },
+                // 与设计稿一致：发送键是实心强调色 + onPrimary 图标；
+                // 停止态换成语义危险色，图标仍取 onError。
+                containerColor = if (showStop) pilotColors.danger else colors.primary,
+                contentColor = if (showStop) stopContent else colors.onPrimary,
             ),
         ) {
             Canvas(Modifier.size(20.dp)) {
                 if (showStop) {
                     drawRoundRect(
-                        color = androidx.compose.ui.graphics.Color(0xFFFFFFFF),
+                        color = stopContent,
                         topLeft = Offset(size.width * 0.26f, size.height * 0.26f),
                         size = androidx.compose.ui.geometry.Size(size.width * 0.48f, size.height * 0.48f),
                         cornerRadius = CornerRadius(size.width * 0.08f),
@@ -2102,7 +2138,7 @@ private fun InputBar(
                         lineTo(size.width * 0.44f, size.height * 0.58f)
                         close()
                     }
-                    drawPath(p, color = androidx.compose.ui.graphics.Color(colors.primary.value))
+                    drawPath(p, color = planeColor)
                 }
             }
         }
@@ -2118,7 +2154,7 @@ private fun MemoryListDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
     }
     AlertDialog(
         onDismissRequest = onDismiss,
-        containerColor = Color(0xFF000000),
+        containerColor = pilotColors.surface,
         title = { Text("长期记忆 ${vm.memoryList.size} 条", fontSize = 16.sp) },
         text = {
             if (vm.memoryList.isEmpty()) {

@@ -87,12 +87,36 @@ import com.pilot.agent.tool.ToolPolicy
 import com.pilot.agent.voice.OnDeviceModelManager
 import kotlinx.coroutines.delay
 
-private val SettingsBlack = Color(0xFF000000)
-private val SettingsCard = Color(0xFF0D1118)
-private val SettingsCardRaised = Color(0xFF121824)
-private val SettingsLine = Color(0xFF223047)
-private val SettingsBlue = Color(0xFF78A9FF)
-private val SettingsMuted = Color(0xFF94A3B8)
+// 设置面板的配色全部走主题语义色板，明暗切换时自动跟随。
+// 这些名字保留是为了让既有调用点零改动。
+private val SettingsBlack: Color
+    @Composable get() = pilotColors.background
+
+private val SettingsCard: Color
+    @Composable get() = pilotColors.surface
+
+private val SettingsCardRaised: Color
+    @Composable get() = pilotColors.surfaceRaised
+
+private val SettingsLine: Color
+    @Composable get() = pilotColors.line
+
+private val SettingsBlue: Color
+    @Composable get() = pilotColors.accent
+
+private val SettingsMuted: Color
+    @Composable get() = pilotColors.muted
+
+/**
+ * 分类页的强调色。
+ *
+ * 分类色是固定的饱和色（给 8 个入口各自一个身份色），在近黑底上很跳；
+ * 放到暖白底上对比度不够，所以在明色主题里统一压暗一点再用。
+ */
+@Composable
+private fun accentOn(page: SettingsPage): Color =
+    if (pilotColors.isDark) page.accent
+    else androidx.compose.ui.graphics.lerp(page.accent, Color.Black, 0.34f)
 
 private enum class SettingsGlyph {
     TEXT,
@@ -108,6 +132,13 @@ private enum class SettingsPage(
     val subtitle: String,
     val accent: Color,
 ) {
+    APPEARANCE(
+        SettingsGlyph.TEXT,
+        "◐",
+        "外观",
+        "明暗主题：跟随系统 / 明色 / 暗色",
+        Color(0xFF8E9BFF),
+    ),
     VOICE(
         SettingsGlyph.SPEAKER,
         "",
@@ -203,6 +234,7 @@ private class SettingsDraft(initial: AgentSettings) {
     var musicBaseUrl by mutableStateOf(initial.musicBaseUrl)
     var musicFallbackUrl by mutableStateOf(initial.musicFallbackUrl)
     var sandboxIdleMinutes by mutableStateOf(initial.sandboxIdleMinutes.toString())
+    var themeMode by mutableStateOf(initial.themeMode)
 
     // 高德 Key 存在导航设置里（跨进程文件），不在 AgentSettings 中。
     var amapSdkKey by mutableStateOf("")
@@ -247,6 +279,8 @@ private class SettingsDraft(initial: AgentSettings) {
         musicFallbackUrl = musicFallbackUrl.trim().trimEnd('/'),
         sandboxIdleMinutes =
             sandboxIdleMinutes.toIntOrNull()?.coerceIn(0, 120) ?: 5,
+        themeMode = themeMode.takeIf { it in AgentSettings.THEME_MODES }
+            ?: AgentSettings.THEME_AUTO,
     )
 }
 
@@ -509,6 +543,18 @@ private fun SettingsHome(
     ) {
         item {
             SettingsCategoryCard(
+                page = SettingsPage.APPEARANCE,
+                status = when (draft.themeMode) {
+                    AgentSettings.THEME_LIGHT -> "明色 · 暖白纸感"
+                    AgentSettings.THEME_DARK -> "暗色 · 深空聚焦"
+                    else -> "跟随系统 · 自动切换"
+                },
+                statusActive = true,
+                onClick = { onOpen(SettingsPage.APPEARANCE) },
+            )
+        }
+        item {
+            SettingsCategoryCard(
                 page = SettingsPage.VOICE,
                 status = when (draft.ttsEngine) {
                     AgentSettings.TTS_MINIMAX -> "MiniMax 播报"
@@ -618,7 +664,7 @@ private fun SettingsHome(
 
 @Composable
 private fun StatusPill(text: String, active: Boolean) {
-    val color = if (active) Color(0xFF59D6A8) else SettingsMuted
+    val color = if (active) pilotColors.success else SettingsMuted
     Surface(
         shape = RoundedCornerShape(50),
         color = color.copy(alpha = 0.12f),
@@ -641,6 +687,7 @@ private fun SettingsCategoryCard(
     onClick: () -> Unit,
 ) {
     val colors = MaterialTheme.colorScheme
+    val accent = accentOn(page)
     Surface(
         modifier = Modifier
             .fillMaxWidth()
@@ -658,10 +705,10 @@ private fun SettingsCategoryCard(
                 modifier = Modifier
                     .size(40.dp)
                     .clip(RoundedCornerShape(13.dp))
-                    .background(page.accent.copy(alpha = 0.13f))
+                    .background(accent.copy(alpha = 0.13f))
                     .border(
                         1.dp,
-                        page.accent.copy(alpha = 0.24f),
+                        accent.copy(alpha = 0.24f),
                         RoundedCornerShape(13.dp),
                     ),
                 contentAlignment = Alignment.Center,
@@ -687,24 +734,25 @@ private fun SettingsCategoryCard(
                 Text(
                     status,
                     fontSize = 9.sp,
-                    color = if (statusActive) page.accent else SettingsMuted,
+                    color = if (statusActive) accent else SettingsMuted,
                     maxLines = 1,
                 )
             }
             Spacer(Modifier.width(8.dp))
-            Text("›", fontSize = 24.sp, color = page.accent.copy(alpha = 0.85f))
+            Text("›", fontSize = 24.sp, color = accent.copy(alpha = 0.85f))
         }
     }
 }
 
 @Composable
 private fun SettingsCategoryGlyph(page: SettingsPage) {
+    val accent = accentOn(page)
     if (page.glyph == SettingsGlyph.TEXT) {
         Text(
             page.marker,
             fontSize = if (page.marker.length > 1) 11.sp else 16.sp,
             fontWeight = FontWeight.Bold,
-            color = page.accent,
+            color = accent,
         )
         return
     }
@@ -712,7 +760,7 @@ private fun SettingsCategoryGlyph(page: SettingsPage) {
     Canvas(Modifier.size(25.dp)) {
         val w = size.width
         val h = size.height
-        val color = page.accent
+        val color = accent
         val stroke = 1.9.dp.toPx()
 
         when (page.glyph) {
@@ -867,6 +915,7 @@ private fun SettingsPageContent(
     onToolPolicyChange: (ToolGroup, ToolPolicy) -> Unit,
 ) {
     when (page) {
+        SettingsPage.APPEARANCE -> AppearanceSettingsPage(draft)
         SettingsPage.VOICE -> VoiceSettingsPage(vm, draft)
         SettingsPage.AI -> AiSettingsPage(draft)
         SettingsPage.AGENT -> AgentSettingsPage(vm, draft)
@@ -879,6 +928,120 @@ private fun SettingsPageContent(
         SettingsPage.SANDBOX -> SandboxSettingsPage(vm, draft)
         SettingsPage.ONDEVICE -> OnDeviceSettingsPage()
         SettingsPage.MAP -> MapSettingsPage(draft)
+    }
+}
+
+@Composable
+private fun AppearanceSettingsPage(draft: SettingsDraft) {
+    SettingsPageList {
+        item {
+            SettingsSectionCard(
+                title = "明暗主题",
+                description = "「跟随系统」会随手机深浅色开关自动切换；也可以固定成明色或暗色。" +
+                    "保存后立即生效，不用重启。",
+            ) {
+                SegmentChoice(
+                    value = draft.themeMode,
+                    options = listOf(
+                        AgentSettings.THEME_AUTO to "自动",
+                        AgentSettings.THEME_LIGHT to "明色",
+                        AgentSettings.THEME_DARK to "暗色",
+                    ),
+                    onSelect = { draft.themeMode = it },
+                )
+                Text(
+                    when (draft.themeMode) {
+                        AgentSettings.THEME_LIGHT -> "当前选择：明色 · 暖白纸感"
+                        AgentSettings.THEME_DARK -> "当前选择：暗色 · 深空聚焦"
+                        else -> "当前选择：自动 · 跟随系统深浅色"
+                    },
+                    fontSize = 10.sp,
+                    color = SettingsMuted,
+                )
+            }
+        }
+
+        item {
+            SettingsSectionCard(
+                title = "配色预览",
+                description = "两套主题共用同一套语义色：强调色只用于可点元素与字标，" +
+                    "成功/警告/错误各有独立语义色。",
+            ) {
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    ThemePreviewCard(
+                        name = "明 · 暖白纸感",
+                        palette = PilotLightColors,
+                        modifier = Modifier.weight(1f),
+                        highlighted = draft.themeMode == AgentSettings.THEME_LIGHT,
+                    )
+                    ThemePreviewCard(
+                        name = "暗 · 深空聚焦",
+                        palette = PilotDarkColors,
+                        modifier = Modifier.weight(1f),
+                        highlighted = draft.themeMode == AgentSettings.THEME_DARK,
+                    )
+                }
+                InfoLine(
+                    "自动模式由系统「深色模式」决定；Pilot 不单独维护第三套配色，避免两边不一致。",
+                )
+            }
+        }
+    }
+}
+
+/** 主题预览小卡：字标 + 一张次级卡 + 三个语义点。 */
+@Composable
+private fun ThemePreviewCard(
+    name: String,
+    palette: PilotColors,
+    modifier: Modifier = Modifier,
+    highlighted: Boolean,
+) {
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(14.dp))
+            .background(palette.background)
+            .border(
+                if (highlighted) 2.dp else 1.dp,
+                if (highlighted) palette.accent else palette.line,
+                RoundedCornerShape(14.dp),
+            )
+            .padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(7.dp),
+    ) {
+        Text(
+            "Pilot",
+            fontSize = 15.sp,
+            fontWeight = FontWeight.Bold,
+            color = palette.accent,
+        )
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(9.dp))
+                .background(palette.surface)
+                .border(1.dp, palette.line, RoundedCornerShape(9.dp))
+                .padding(horizontal = 8.dp, vertical = 7.dp),
+            verticalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
+            Text("正文文字", fontSize = 9.sp, color = palette.onSurface)
+            Text("次要说明", fontSize = 8.sp, color = palette.muted)
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+            for (dot in listOf(palette.accent, palette.success, palette.danger)) {
+                Box(
+                    Modifier
+                        .size(10.dp)
+                        .clip(CircleShape)
+                        .background(dot),
+                )
+            }
+        }
+        Text(
+            name,
+            fontSize = 9.sp,
+            color = palette.muted,
+        )
     }
 }
 
@@ -1040,7 +1203,7 @@ private fun VoiceSettingsPage(vm: AgentViewModel, draft: SettingsDraft) {
                     Text(
                         if (vm.voiceprintEnrolled) "已注册声纹模板" else "尚未注册声纹",
                         fontSize = 11.sp,
-                        color = if (vm.voiceprintEnrolled) Color(0xFF59D6A8) else SettingsMuted,
+                        color = if (vm.voiceprintEnrolled) pilotColors.success else SettingsMuted,
                         modifier = Modifier.weight(1f),
                     )
                     if (vm.voiceprintEnrolled) {
@@ -1371,9 +1534,9 @@ private fun AgentSettingsPage(vm: AgentViewModel, draft: SettingsDraft) {
                         val (ownerText, ownerColor) = when (owner) {
                             com.pilot.agent.assistant.routing.FastPathOwner.LEGACY -> "遗留" to SettingsMuted
                             com.pilot.agent.assistant.routing.FastPathOwner.SHADOW ->
-                                "影子" to Color(0xFFE0B34C)
+                                "影子" to pilotColors.warning
                             com.pilot.agent.assistant.routing.FastPathOwner.ROUTE ->
-                                "接管" to Color(0xFF59D6A8)
+                                "接管" to pilotColors.success
                         }
                         Text(ownerText, fontSize = 11.sp, color = ownerColor)
                     }
@@ -1425,7 +1588,7 @@ private fun AgentSettingsPage(vm: AgentViewModel, draft: SettingsDraft) {
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(12.dp))
-                                .background(Color.Black.copy(alpha = 0.18f))
+                                .background(pilotColors.surfaceRaised)
                                 .padding(horizontal = 11.dp, vertical = 9.dp),
                         ) {
                             Column(Modifier.weight(1f)) {
@@ -1747,7 +1910,7 @@ private fun SandboxSettingsPage(vm: AgentViewModel, draft: SettingsDraft) {
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(13.dp))
-                                .background(Color.Black.copy(alpha = 0.2f))
+                                .background(pilotColors.surfaceRaised)
                                 .padding(start = 12.dp, end = 4.dp, top = 10.dp, bottom = 10.dp),
                         ) {
                             Column(Modifier.weight(1f)) {
@@ -2096,7 +2259,7 @@ private fun SegmentChoice(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(13.dp))
-            .background(Color.Black.copy(alpha = 0.25f))
+            .background(pilotColors.line.copy(alpha = 0.35f))
             .padding(3.dp),
         horizontalArrangement = Arrangement.spacedBy(3.dp),
     ) {
@@ -2115,7 +2278,7 @@ private fun SegmentChoice(
                     label,
                     fontSize = 10.sp,
                     fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
-                    color = if (active) Color(0xFF071321) else SettingsMuted,
+                    color = if (active) pilotColors.onAccent else SettingsMuted,
                     maxLines = 1,
                 )
             }
@@ -2253,7 +2416,7 @@ private fun PermissionActionRow(
             Text(
                 state,
                 fontSize = 9.sp,
-                color = if (active) Color(0xFF59D6A8) else SettingsMuted,
+                color = if (active) pilotColors.success else SettingsMuted,
             )
         }
         TextButton(
@@ -2305,7 +2468,7 @@ private fun FilledAction(
         shape = RoundedCornerShape(10.dp),
         colors = ButtonDefaults.buttonColors(
             containerColor = SettingsBlue,
-            contentColor = Color(0xFF06111F),
+            contentColor = pilotColors.onAccent,
         ),
         contentPadding = PaddingValues(horizontal = 12.dp),
     ) {
@@ -2354,7 +2517,7 @@ private fun EmptySettingsState(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(14.dp))
-            .background(Color.Black.copy(alpha = 0.2f))
+            .background(pilotColors.surfaceRaised)
             .border(1.dp, SettingsLine.copy(alpha = 0.55f), RoundedCornerShape(14.dp))
             .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -2395,7 +2558,7 @@ private fun SettingsSaveBar(onSave: () -> Unit) {
             shape = RoundedCornerShape(13.dp),
             colors = ButtonDefaults.buttonColors(
                 containerColor = SettingsBlue,
-                contentColor = Color(0xFF06111F),
+                contentColor = pilotColors.onAccent,
             ),
         ) {
             Text(

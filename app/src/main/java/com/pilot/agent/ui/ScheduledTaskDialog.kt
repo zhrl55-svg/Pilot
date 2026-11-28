@@ -48,7 +48,7 @@ fun ScheduledTaskDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        containerColor = Color(0xFF000000),
+        containerColor = pilotColors.surface,
         title = { Text("定时任务 ${vm.scheduledTaskList.size} 条", fontSize = 16.sp) },
         text = {
             if (vm.scheduledTaskList.isEmpty()) {
@@ -121,7 +121,7 @@ fun ScheduledTaskDialog(vm: AgentViewModel, onDismiss: () -> Unit) {
     pendingDelete?.let { task ->
         AlertDialog(
             onDismissRequest = { pendingDelete = null },
-            containerColor = Color(0xFF000000),
+            containerColor = pilotColors.surface,
             title = { Text("删除这个定时任务？") },
             text = { Text("${task.goal}\n${if (task.daily) "每天 " else ""}${formatTaskTime(task.at)}") },
             confirmButton = {
@@ -162,7 +162,7 @@ private fun TaskEditDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        containerColor = Color(0xFF000000),
+        containerColor = pilotColors.surface,
         title = { Text(title, fontSize = 16.sp) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {

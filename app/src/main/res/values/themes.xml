@@ -1,11 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!--
+        DayNight 父主题 + 明/暗两套 color / bool 资源：
+        系统深浅色切换时，窗口底色与系统栏图标自动跟着变。
+        用户在设置里选「明色 / 暗色」时，由 Compose 侧的 PilotTheme 决定界面配色；
+        这里负责的是启动瞬间和应用外框（窗口背景、状态栏图标）不要闪错色。
+    -->
     <style name="Theme.Pilot" parent="android:Theme.DeviceDefault.DayNight">
         <item name="android:windowNoTitle">true</item>
         <item name="android:windowBackground">@color/pilot_bg</item>
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
-        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightStatusBar">@bool/pilot_light_system_bars</item>
+        <item name="android:windowLightNavigationBar">@bool/pilot_light_system_bars</item>
     </style>
 
     <style name="Theme.Pilot.Transparent" parent="android:Theme.Translucent.NoTitleBar">
