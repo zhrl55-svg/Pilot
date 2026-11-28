@@ -287,19 +287,30 @@ private fun AgentScreen(vm: AgentViewModel, onRequestMic: () -> Unit) {
             },
             onScheduledTasksOpen = { vm.openScheduledTasks() },
             onNavOpen = {
-                // 直接拉起导航界面（NavActivity 在 :navigation 进程）
-                runCatching {
-                    ctx.startActivity(
-                        Intent().apply {
-                            setClassName(ctx.packageName, "com.pilot.navigation.NavActivity")
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        },
-                    )
-                }.onFailure {
+                // ★ 公开版本不内置高德 Key：没有用户自己的 Key 时直接提示去设置，
+                //   不要拉起 NavActivity —— 那是高德 AMapNaviView 的宿主，
+                //   未配 Key（或 SDK 未初始化）时进去也没有地图，还可能触发 SDK 崩溃。
+                if (!com.pilot.agent.navigation.NavigationClient.isConfigured(ctx)) {
                     android.widget.Toast.makeText(
-                        ctx, "打不开导航界面：${it.message}",
-                        android.widget.Toast.LENGTH_SHORT,
+                        ctx,
+                        "高德服务还没配置。请到「设置 → 导航与地图」填入你自己的高德 Key（lbs.amap.com 可免费申请）",
+                        android.widget.Toast.LENGTH_LONG,
                     ).show()
+                } else {
+                    // 直接拉起导航界面（NavActivity 在 :navigation 进程）
+                    runCatching {
+                        ctx.startActivity(
+                            Intent().apply {
+                                setClassName(ctx.packageName, "com.pilot.navigation.NavActivity")
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            },
+                        )
+                    }.onFailure {
+                        android.widget.Toast.makeText(
+                            ctx, "打不开导航界面：${it.message}",
+                            android.widget.Toast.LENGTH_SHORT,
+                        ).show()
+                    }
                 }
             },
         )

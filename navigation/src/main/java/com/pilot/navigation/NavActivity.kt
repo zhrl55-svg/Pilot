@@ -160,6 +160,21 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
         NLog.i(TAG, "NavActivity onCreate")
         travelMode = TravelMode.fromValue(NavigationSettings.load(this).travelMode)
 
+        // ★ 公开版本不内置高德 Key：两个 Key 都没有时不要创建 AMapNaviView——
+        //   没有底图数据的地图界面没有意义，还可能因 SDK 初始化失败把
+        //   :navigation 进程带崩（native 层 SIGABRT，runCatching 都拦不住）。
+        //   正常使用入口（主界面按钮 / 语音指令）已在拉起前拦过，这里是兜底。
+        if (!NavKeys.hasSdkKey(this) && !NavKeys.hasWebKey(this)) {
+            NLog.w(TAG, "高德 Key 未配置，关闭导航界面")
+            android.widget.Toast.makeText(
+                this,
+                NavKeys.NOT_CONFIGURED_HINT,
+                android.widget.Toast.LENGTH_LONG,
+            ).show()
+            finish()
+            return
+        }
+
         // ★ 保证 NavigationService 在跑。
         //   从主界面「导航」进来时，主进程可能还没 bind 过导航服务，
         //   这时 NavigationService.instance 是 null → 搜索面板选定地点后
@@ -1481,9 +1496,12 @@ class NavActivity : androidx.activity.ComponentActivity(), AMapNaviViewListener 
                 Thread {
                     val loc = NavigationService.peekLocationProvider()
                     val list = runCatching {
-                        WebPoiSearch.searchBlocking(this@NavActivity, q, loc?.city, loc?.lat ?: 0.0, loc?.lon ?: 0.0, 10)
+                        // 手动搜常去地点：放开 50km 限制，允许用户添加外地地点。
+                        WebPoiSearch.searchBlocking(
+                            this@NavActivity, q, loc?.city, loc?.lat ?: 0.0, loc?.lon ?: 0.0, 10,
+                            maxDistanceMeters = Int.MAX_VALUE,
+                        )
                     }.getOrDefault(emptyList())
-                        .filter { it.distance <= WebPoiSearch.MAX_SANE_DISTANCE_M || it.distance == 0 }
                         .take(8)
                     runOnUiThread {
                         if (list.isEmpty()) {

@@ -30,10 +30,19 @@
 -dontwarn com.amap.**
 -dontwarn com.autonavi.**
 -dontwarn net.jafama.**
-# 高德靠反射找入口，类名不能被改
--keep class com.amap.api.** { *; }
+# ★★ 高德 SDK 的 native 库（libapssdk.so 等）在 JNI_OnLoad 里用
+#   FindClass("com/amap/location/...") 按**原始全限定名**找类；
+#   R8 把类改名后 FindClass 返回 null → GetStaticMethodID 收到 null
+#   → JNI DETECTED ERROR / SIGABRT，整个 :navigation 进程直接崩。
+#   真机实测：release 包点导航即崩，配不配 Key 都崩（debug 不混淆则正常）。
+#   所以 com.amap.** 全包（含 location/a/a/*、navi、api）必须 keep 类名和方法名。
+-keep class com.amap.** { *; }
 -keep class com.autonavi.** { *; }
--keep class com.amap.navi.** { *; }
+# ★ 高德导航内置语音（NUI）依赖阿里 idst 库，native 层按原始方法名回调 Java
+#   （如 NativeNui.onFileTransEventCallback_）。R8 混淆方法名后 native 找不到
+#   → SIGABRT（真机实测 tombstone: NoSuchMethodError ... NativeNui）。整个包原样保留。
+-dontwarn com.alibaba.idst.**
+-keep class com.alibaba.idst.** { *; }
 
 # ---------------------------------------------------------------- MNN / sherpa（JNI 反射调用）
 -keep class com.alibaba.mnnllm.android.** { *; }

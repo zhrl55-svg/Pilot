@@ -227,13 +227,16 @@ class SearchPanel(
         val city = loc?.city
         Thread {
             val list = runCatching {
-                WebPoiSearch.searchBlocking(activity, q, city, lat, lon, limit = 10)
+                // ★ 手动搜索框：用户主动搜外地地点是正常需求，放开 50km 安全阀。
+                //   50km 阀是给「语音说个地名就导航」用的（防张掖搜西湖导航到杭州），
+                //   不该让手动搜索只能搜到本地。
+                WebPoiSearch.searchBlocking(
+                    activity, q, city, lat, lon, limit = 10,
+                    maxDistanceMeters = Int.MAX_VALUE,
+                )
             }.getOrDefault(emptyList())
-            // 距离安全阀：超过 50km 的丢掉（防止搜出外地同名地点）
-            val near = if (lat != 0.0) {
-                list.filter { it.distance in 1..WebPoiSearch.MAX_SANE_DISTANCE_M }
-                    .ifEmpty { list.take(3) }
-            } else list
+            // 手动搜索不再按距离过滤，直接把高德排好序的结果给用户看。
+            val near = list
             activity.runOnUiThread {
                 if (version != queryVersion) {
                     NLog.i(TAG, "丢弃过期搜索结果「$q」version=$version（当前 $queryVersion）")

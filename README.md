@@ -9,7 +9,7 @@ Pilot 不是「聊天框里接一个大模型」，而是一个能自主执行�
 | 项目 | 值 |
 |---|---|
 | 包名 | `com.pilot.agent` |
-| 版本 | 0.1.1（versionCode 2） |
+| 版本 | 0.1.2（versionCode 3） |
 | 最低系统 | Android 11（minSdk 30） |
 | 目标系统 | Android 15（targetSdk 35） |
 | 模块 | `:app`（应用）、`:navigation`（高德导航库） |

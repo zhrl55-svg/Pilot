@@ -49,6 +49,7 @@ object WebPoiSearch {
         currentLat: Double,
         currentLon: Double,
         limit: Int = 10,
+        maxDistanceMeters: Int = MAX_SANE_DISTANCE_M,
     ): List<SdkPoiSearch.Candidate> {
         var out: List<SdkPoiSearch.Candidate> = emptyList()
         search(
@@ -57,6 +58,7 @@ object WebPoiSearch {
             city = city,
             currentLat = currentLat,
             currentLon = currentLon,
+            maxDistanceMeters = maxDistanceMeters,
             onResult = { out = it },
             onError = { NLog.w("PilotNavWebPoi", "同步搜索失败：$it") },
         )
@@ -74,6 +76,12 @@ object WebPoiSearch {
         city: String?,
         currentLat: Double,
         currentLon: Double,
+        /**
+         * 距离安全阀上限（米）。语音导航场景用默认 50km 防止「张掖搜西湖」
+         * 被导航到杭州；但**手动搜索框**要允许用户主动搜外地地点，传
+         * [Int.MAX_VALUE] 放开限制。
+         */
+        maxDistanceMeters: Int = MAX_SANE_DISTANCE_M,
         onResult: (List<SdkPoiSearch.Candidate>) -> Unit,
         onError: (String) -> Unit,
     ) {
@@ -164,11 +172,21 @@ object WebPoiSearch {
         val withDist = all.map { c ->
             c.copy(distance = distanceMeters(currentLat, currentLon, c.lat, c.lon))
         }
-        val near = withDist.filter { it.distance <= MAX_SANE_DISTANCE_M }
+        val near = withDist.filter { it.distance <= maxDistanceMeters }
         if (near.isEmpty()) {
+            // ★ 本地 50km 内没有 → 不再报「附近没有」并降级 SDK。
+            //   高德 Web API 的 city 偏置已经保证本地同名地点排在最前；
+            //   本地真的没有时（张掖搜「天安门」），用户多半就是要去外地，
+            //   直接给高德排好序的结果，比报错后 SDK 兜底报 1008 强得多。
+            //   实测坑：语音说「导航去天安门」→ Web 被距离阀判「附近没有」→
+            //   降级 SDK 搜「天安门」→ code=1008 检索词歧义 → 导航彻底失败。
             val nearestKm = withDist.minOf { it.distance } / 1000.0
-            NLog.w(TAG, "「$q」最近的候选在 ${nearestKm.toInt()}km 外，判定为不在附近")
-            onError("附近没有「$q」，最近的同名地点在 ${nearestKm.toInt()} 公里外")
+            NLog.w(
+                TAG,
+                "「$q」本地 ${maxDistanceMeters / 1000}km 内没有，最近 ${nearestKm.toInt()}km；" +
+                    "按高德排序返回外地候选（${withDist.size} 条）",
+            )
+            onResult(withDist)
             return
         }
         onResult(near)
